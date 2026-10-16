@@ -1,123 +1,113 @@
-import { BatchStorage } from "./storage.js";
-import { OpenRouterBatchClient, saveBatchResultsToDisk } from "./client.js";
-import { normalizeBatchModelSlug } from "./models.js";
-import type { BatchJob } from "./types.js";
+import type { BatchService, ReconcileOutcome } from "./service.js";
+import type { JobManifest } from "./types.js";
+import { ACTIVE_STATUSES } from "./state.js";
 
-export type StatusChangeCallback = (badgeText: string, activeCount: number) => void;
-export type BatchCompletedCallback = (job: BatchJob) => void;
+export type BadgeCallback = (badgeText: string | undefined) => void;
 
-interface GlobalWithTimers {
-  setInterval?: (callback: () => void, ms?: number) => unknown;
-  clearInterval?: (handle: unknown) => void;
-}
+/** How often the scheduler wakes to look for due jobs; each job's own nextPollAt decides whether it is polled. */
+const TICK_MS = 15_000;
 
+/**
+ * In-session scheduler. Non-blocking: work runs on timers, never inside a
+ * command handler unless the user asked (`/batch check`). Jobs are reconciled
+ * sequentially to keep provider traffic low; per-job file locks prevent
+ * overlap with other Pi processes on the same project.
+ */
 export class BatchPoller {
-  private timer: unknown = null;
-  private isChecking = false;
+  private timer: ReturnType<typeof setTimeout> | null = null;
+  private running: Promise<ReconcileOutcome[]> | null = null;
+  private stopped = true;
 
   constructor(
-    private storage: BatchStorage,
-    private getApiKeyForJob: (job: BatchJob) => Promise<string>,
-    private onStatusChange?: StatusChangeCallback,
-    private onBatchCompleted?: BatchCompletedCallback
+    private readonly getService: () => BatchService | null,
+    private readonly isEnabled: () => boolean,
+    private readonly onBadge?: BadgeCallback,
   ) {}
 
   public start(): void {
-    if (this.timer) return;
-    const interval = Math.max(10000, this.storage.getConfig().pollIntervalMs);
-    const timers = globalThis as GlobalWithTimers;
-    if (typeof timers.setInterval === "function") {
-      this.timer = timers.setInterval(() => {
-        void this.checkNow();
-      }, interval);
-    }
-    void this.checkNow();
+    this.stopped = false;
+    this.schedule(0);
   }
 
   public stop(): void {
-    if (this.timer) {
-      const timers = globalThis as GlobalWithTimers;
-      if (typeof timers.clearInterval === "function") {
-        timers.clearInterval(this.timer);
-      }
+    this.stopped = true;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = null;
+  }
+
+  private schedule(delayMs: number): void {
+    if (this.stopped) return;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = setTimeout(() => {
       this.timer = null;
+      if (!this.isEnabled()) {
+        this.updateBadge();
+        this.schedule(TICK_MS);
+        return;
+      }
+      void this.checkNow(false).finally(() => this.schedule(TICK_MS));
+    }, delayMs);
+    // Never keep Pi alive just for polling.
+    (this.timer as { unref?: () => void }).unref?.();
+  }
+
+  /**
+   * Reconcile jobs. `force` ignores nextPollAt (used by /batch check).
+   * Concurrent calls share or follow the in-flight pass instead of overlapping.
+   */
+  public async checkNow(force = true): Promise<ReconcileOutcome[]> {
+    if (this.running) {
+      const current = await this.running;
+      if (!force) return current;
+    }
+    const pass = this.runPass(force);
+    this.running = pass;
+    try {
+      return await pass;
+    } finally {
+      if (this.running === pass) this.running = null;
+      this.updateBadge();
     }
   }
 
-  public async checkNow(): Promise<void> {
-    if (this.isChecking) return;
-    this.isChecking = true;
-
-    try {
-      const activeJobs = this.storage.getActiveJobs();
-      if (activeJobs.length === 0) {
-        this.updateBadge();
-        return;
+  private async runPass(force: boolean): Promise<ReconcileOutcome[]> {
+    const service = this.getService();
+    if (!service) return [];
+    const outcomes: ReconcileOutcome[] = [];
+    for (const job of service.jobsNeedingReconcile()) {
+      try {
+        outcomes.push(await service.reconcile(job.localId, { force }));
+      } catch (err) {
+        // A bug or corrupt manifest for one job must not stop the others; it stays visible via /batch list.
+        outcomes.push({ localId: job.localId, status: job.localStatus, polled: false, error: (err as Error).message });
       }
-
-      const config = this.storage.getConfig();
-
-      for (const job of activeJobs) {
-        try {
-          const apiKey = await this.getApiKeyForJob(job);
-          if (!apiKey) continue;
-
-          const client = new OpenRouterBatchClient(apiKey);
-          const detail = await client.getBatch(job.id);
-          const wasCompleted = job.status !== "completed" && detail.status === "completed";
-
-          job.status = detail.status;
-          job.totalRequests = detail.request_counts.total;
-          job.completedRequests = detail.request_counts.completed;
-          job.failedRequests = detail.request_counts.failed;
-          job.finalizedAt = detail.finalized_at;
-          job.costUsd = detail.usage?.cost;
-
-          if (detail.status === "completed" && detail.results && !job.resultsSaved) {
-            if (config.autoSaveResults) {
-              const outDir = saveBatchResultsToDisk(job, detail.results, config.outputBaseDir);
-              job.outputDir = outDir;
-              job.resultsSaved = true;
-            }
-          }
-
-          this.storage.saveJob(job);
-
-          if (wasCompleted) {
-            this.onBatchCompleted?.(job);
-          }
-        } catch {
-          // Keep checking next jobs on single-job error
-        }
-      }
-
-      this.updateBadge();
-    } finally {
-      this.isChecking = false;
     }
+    return outcomes;
   }
 
   public updateBadge(): void {
-    const active = this.storage.getActiveJobs();
-    if (active.length === 0) {
-      const all = this.storage.getJobs();
-      const recentDone = all.find((j) => j.status === "completed" && Date.now() - (j.finalizedAt ?? j.createdAt) < 300000);
-      if (recentDone) {
-        this.onStatusChange?.("📦 Batch finished", 0);
-      } else {
-        this.onStatusChange?.("", 0);
-      }
-      return;
+    const service = this.getService();
+    if (!service) return this.onBadge?.(undefined);
+    let jobs: JobManifest[];
+    try {
+      jobs = service.registry.list().jobs;
+    } catch {
+      return this.onBadge?.(undefined);
     }
-
-    let completedSum = 0;
-    let totalSum = 0;
-    for (const j of active) {
-      completedSum += j.completedRequests;
-      totalSum += j.totalRequests;
-    }
-
-    const text = `📦 Batch: ${active.length} active (${completedSum}/${totalSum})`;
-    this.onStatusChange?.(text, active.length);
+    this.onBadge?.(badgeText(jobs));
   }
+}
+
+/** e.g. "📦 Batch: 2 active | 3 ready | 1 attention" — only non-zero parts, cleared when nothing to show. */
+export function badgeText(jobs: readonly JobManifest[]): string | undefined {
+  const active = jobs.filter((j) => ACTIVE_STATUSES.has(j.localStatus)).length;
+  const ready = jobs.filter((j) => j.localStatus === "ready" && !j.injectedAt).length;
+  const attention = jobs.filter(
+    (j) => (j.localStatus === "partial" || j.localStatus === "corrupt" || (ACTIVE_STATUSES.has(j.localStatus) && j.lastPollError)) && !j.injectedAt,
+  ).length;
+  const parts: string[] = [];
+  if (active) parts.push(`${active} active`);
+  if (ready) parts.push(`${ready} ready`);
+  if (attention) parts.push(`${attention} attention`);
+  return parts.length ? `📦 Batch: ${parts.join(" | ")}` : undefined;
 }

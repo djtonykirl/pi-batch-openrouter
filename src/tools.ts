@@ -1,156 +1,106 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import type { BatchStorage } from "./storage.js";
-import type { BatchPoller } from "./poller.js";
-import { OpenRouterBatchClient } from "./client.js";
-import { normalizeBatchModelSlug, resolveApiKeyForProvider } from "./models.js";
-import type { BatchJob } from "./types.js";
+import type { BatchRuntime } from "./runtime.js";
+import { formatIsoShort } from "./time.js";
 
-export function registerBatchTools(
-  pi: ExtensionAPI,
-  storage: BatchStorage,
-  poller: BatchPoller,
-  getCtx: () => ExtensionContext | null
-): void {
-  pi.registerTool({
+/**
+ * Model-callable tools. They go through exactly the same packaging, exclusion,
+ * secret-scanning and duplicate checks as `/batch ask`. They cannot apply
+ * results to files; reading a result is done via its artefact path.
+ */
+export function registerBatchTools(rt: BatchRuntime): void {
+  rt.pi.registerTool({
     name: "batch_submit_goal",
     label: "Batch Submit Goal",
-    description: "Offloads a heavy autonomous coding or review goal to an OpenRouter Batch API job at 50% discount.",
+    description:
+      "Offloads a heavy review/analysis goal to an OpenRouter Batch job (typically ~50% cheaper, results within 24h). " +
+      "Returns immediately with a local job ID once OpenRouter accepts it. Files are checked against exclusion rules and scanned for secrets first.",
     promptSnippet: "Use batch_submit_goal to run non-blocking heavy codebase audits, reviews, or long analyses.",
     promptGuidelines: [
-      "Call batch_submit_goal when user wants an asynchronous or batch goal executed offline",
+      "Call batch_submit_goal only when the user wants work deferred/offloaded to a batch job",
+      "Pass relevant workspace files explicitly in `files`; never include credentials",
+      "Batch output is advisory: never apply it to files without the user asking",
     ],
     parameters: Type.Object({
-      prompt: Type.String({ description: "Detailed task instructions or goal prompt" }),
-      model: Type.Optional(Type.String({ description: "OpenRouter model override (e.g. anthropic/claude-opus-5.5)" })),
-      provider: Type.Optional(Type.String({ description: "Provider account alias (e.g. openrouter, openrouter-default, openrouter-soukr)" })),
-      title: Type.Optional(Type.String({ description: "Short descriptive title for the batch job" })),
+      prompt: Type.String({ description: "Detailed task instructions / objective" }),
+      files: Type.Optional(Type.Array(Type.String(), { description: "Workspace-relative text files to include as context" })),
+      model: Type.Optional(Type.String({ description: "OpenRouter model slug override (e.g. anthropic/claude-opus-5.5)" })),
+      provider: Type.Optional(Type.String({ description: "Pi account/provider alias for the API key (e.g. openrouter, openrouter-work)" })),
+      title: Type.Optional(Type.String({ description: "Deprecated; ignored (the prompt is the objective)" })),
     }),
-    execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
-      if (signal?.aborted) {
-        throw new Error("Batch submission aborted");
-      }
-
-      const prov = params.provider || storage.getConfig().defaultProvider;
-      const effectiveCtx = ctx || getCtx();
-      if (!effectiveCtx) {
-        throw new Error("ExtensionContext not available");
-      }
-
-      const apiKey = await resolveApiKeyForProvider(effectiveCtx, prov);
-      if (!apiKey) {
-        throw new Error(`Missing API key for provider ${prov}. Check auth.json or OPENROUTER_API_KEY.`);
-      }
-
-      const rawModel = params.model || storage.getConfig().defaultModel;
-      const model = normalizeBatchModelSlug(rawModel);
-      const title = params.title || params.prompt.slice(0, 50);
-
-      const client = new OpenRouterBatchClient(apiKey);
-      const res = await client.submitBatch(model, [
-        {
-          custom_id: "batch-req-1",
-          body: {
-            messages: [
-              {
-                role: "system",
-                content: "You are an expert autonomous software engineer executing an offline batch goal. Provide a thorough, structured, complete solution with all necessary code, architecture decisions, and diffs.",
-              },
-              {
-                role: "user",
-                content: params.prompt,
-              },
-            ],
-            max_tokens: 16000,
-          },
-        },
-      ]);
-
-      const newJob: BatchJob = {
-        id: res.id,
-        title,
-        model,
-        provider: prov,
-        status: res.status,
-        createdAt: Date.now(),
-        totalRequests: 1,
-        completedRequests: 0,
-        failedRequests: 0,
-        resultsSaved: false,
-        items: [
-          {
-            customId: "batch-req-1",
-            prompt: params.prompt,
-          },
-        ],
-      };
-
-      storage.saveJob(newJob);
-      poller.updateBadge();
-
+    execute: async (_toolCallId, params, signal) => {
+      if (signal?.aborted) throw new Error("Batch submission aborted");
+      const service = rt.requireService();
+      const prepared = await service.prepare({
+        objective: params.prompt,
+        files: params.files ?? [],
+        contexts: [],
+        model: params.model,
+        account: params.provider,
+        format: "markdown",
+        includeInstructions: true,
+      });
+      // Throws SubmissionBlockedError / DuplicateActiveRequestError -> failed tool result (no secret values in the message).
+      const job = await service.createJob(prepared, { previewOnly: false });
+      rt.poller.updateBadge();
+      if (job.localStatus !== "submitted") throw new Error(`Batch job ${job.localId} ${job.localStatus}: ${job.error?.message ?? "unknown error"}`);
       return {
         content: [
           {
             type: "text",
-            text: `Batch job successfully queued.\nBatch ID: ${res.id}\nProvider: ${prov}\nModel: ${model}\nStatus: ${res.status}\nResults will be saved to disk automatically upon completion. User can track progress with /batch view or /batch list.`,
+            text:
+              `Batch job accepted by OpenRouter (status: ${job.providerStatus}; queued, not completed).\n` +
+              `Local job ID: ${job.localId}\nProvider batch ID: ${job.providerBatchId}\nModel: ${job.model}\n` +
+              `Files: ${job.context.fileCount}, characters: ${job.context.characters}\n` +
+              `The user can track it with /batch show ${job.localId} and bring the result into this conversation with /batch inject ${job.localId}.`,
           },
         ],
-        details: { batchId: res.id, status: res.status, model, provider: prov },
+        details: { localId: job.localId, providerBatchId: job.providerBatchId, status: job.localStatus, model: job.model },
       };
     },
   });
 
-  pi.registerTool({
+  rt.pi.registerTool({
     name: "batch_check_jobs",
     label: "Batch Check Jobs",
-    description: "Inspects status and results of recent or active OpenRouter batch jobs.",
+    description: "Reports status of deferred OpenRouter batch jobs from local state, reconciling active ones with OpenRouter first.",
     promptSnippet: "Use batch_check_jobs to see if an offloaded batch job has finished.",
-    promptGuidelines: [
-      "Call batch_check_jobs when user asks about batch status or progress",
-    ],
+    promptGuidelines: ["Call batch_check_jobs when the user asks about batch status or progress"],
     parameters: Type.Object({
-      batch_id: Type.Optional(Type.String({ description: "Specific batch ID to query" })),
+      batch_id: Type.Optional(Type.String({ description: "Local job ID (B-YYYYMMDD-XXXX, or unique suffix) or provider batch ID" })),
     }),
     execute: async (_toolCallId, params): Promise<{ content: Array<{ type: "text"; text: string }>; details: Record<string, unknown> }> => {
-      await poller.checkNow();
-      poller.updateBadge();
-
+      const service = rt.requireService();
+      await rt.poller.checkNow(true);
       if (params.batch_id) {
-        const job = storage.getJob(params.batch_id);
-        if (!job) {
-          throw new Error(`Batch job not found: ${params.batch_id}`);
-        }
+        const id = service.registry.resolveId(params.batch_id);
+        const job = service.registry.read(id);
+        const resultPath = job.localStatus === "ready" || job.localStatus === "partial" ? service.registry.artefact(id, "resultMd") : undefined;
         return {
           content: [
             {
               type: "text",
-              text: `Batch ID: ${job.id}\nProvider: ${job.provider}\nStatus: ${job.status}\nProgress: ${job.completedRequests}/${job.totalRequests} completed (${job.failedRequests} failed)\nTitle: ${job.title}\nSaved to: ${job.outputDir || "pending"}`,
+              text: [
+                `Job: ${job.localId}`,
+                `Provider batch: ${job.providerBatchId ?? "-"}`,
+                `Local status: ${job.localStatus}`,
+                `Provider status: ${job.providerStatus ?? "-"}`,
+                `Objective: ${job.objective.slice(0, 200)}`,
+                job.error ? `Error: [${job.error.code}] ${job.error.message}` : "",
+                job.lastPollError ? `Last poll error: ${job.lastPollError.category}: ${job.lastPollError.message}` : "",
+                resultPath ? `Result (advisory, read-only): ${resultPath}` : "",
+              ]
+                .filter(Boolean)
+                .join("\n"),
             },
           ],
-          details: {
-            queriedId: params.batch_id,
-            found: true,
-            jobStatus: job.status,
-            provider: job.provider,
-          },
+          details: { localId: job.localId, localStatus: job.localStatus, providerStatus: job.providerStatus, found: true },
         };
       }
-
-      const jobs = storage.getJobs();
-      const summary = jobs.map((j) => `- [${j.id}] [${j.provider}] (${j.status}) ${j.completedRequests}/${j.totalRequests}: ${j.title}`).join("\n");
-
+      const jobs = service.registry.list().jobs.slice(0, 20);
+      const summary = jobs.map((j) => `- ${j.localId} [${j.localStatus}] ${formatIsoShort(j.createdAt)} ${j.objective.replace(/\s+/g, " ").slice(0, 60)}`).join("\n");
       return {
-        content: [
-          {
-            type: "text",
-            text: `Recorded Batch Jobs (${jobs.length}):\n${summary || "None"}`,
-          },
-        ],
-        details: {
-          queriedId: "",
-          found: false,
-          totalJobs: jobs.length,
-        },
+        content: [{ type: "text", text: `Batch jobs (${jobs.length} most recent):\n${summary || "None"}` }],
+        details: { totalJobs: jobs.length, found: false },
       };
     },
   });

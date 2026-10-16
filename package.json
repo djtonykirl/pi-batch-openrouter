@@ -33,9 +33,9 @@
     ]
   },
   "scripts": {
-    "check": "tsc --noEmit",
+    "check": "tsc --noEmit && tsc -p tsconfig.test.json --noEmit",
     "build": "tsc",
-    "test": "node --test test/**/*.test.js"
+    "test": "tsc -p tsconfig.test.json && node --test --test-timeout=30000 --test-reporter=spec \".test-build/test/**/*.test.js\""
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

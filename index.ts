@@ -1,61 +1,38 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { BatchStorage } from "./src/storage.js";
-import { BatchPoller } from "./src/poller.js";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Box, Text } from "@earendil-works/pi-tui";
 import { registerBatchCommand } from "./src/commands.js";
+import { BatchRuntime, INJECTED_MESSAGE_TYPE } from "./src/runtime.js";
 import { registerBatchTools } from "./src/tools.js";
-import { resolveApiKeyForProvider } from "./src/models.js";
-
-const unsubs: Array<() => void> = [];
 
 export default function (pi: ExtensionAPI): void {
-  const storage = new BatchStorage();
+  // No timers/IO here: Pi may load extensions without starting a session.
+  const rt = new BatchRuntime(pi);
 
-  let activeCtx: ExtensionContext | null = null;
+  registerBatchCommand(rt);
+  registerBatchTools(rt);
 
-  const poller = new BatchPoller(
-    storage,
-    async (job) => {
-      if (!activeCtx) return "";
-      return resolveApiKeyForProvider(activeCtx, job.provider);
-    },
-    (badgeText) => {
-      if (activeCtx?.hasUI) {
-        if (badgeText) {
-          activeCtx.ui.setStatus("pi-batch", badgeText);
-        } else {
-          activeCtx.ui.setStatus("pi-batch", undefined);
-        }
-      }
-    },
-    (job) => {
-      if (activeCtx?.hasUI) {
-        activeCtx.ui.notify(
-          `📦 Batch completed: ${job.title} [${job.provider}]\nSaved to: ${job.outputDir || "results"}\nInspect with /batch view`,
-          "info"
-        );
-      }
-    }
-  );
+  // Injected results render compactly in the transcript; the full text is what the model receives.
+  pi.registerMessageRenderer<{ localId?: string; bounded?: boolean; characters?: number }>(INJECTED_MESSAGE_TYPE, (message, { expanded, outputPad }, theme) => {
+    const content = typeof message.content === "string" ? message.content : message.content.map((c) => ("text" in c ? c.text : "")).join("");
+    const d = message.details;
+    const header = theme.fg("accent", `📦 Batch result ${d?.localId ?? ""} injected`) + theme.fg("dim", ` (${d?.characters ?? content.length} chars${d?.bounded ? ", bounded excerpt" : ""})`);
+    const body = expanded ? content : content.split("\n").slice(0, 8).join("\n") + (content.split("\n").length > 8 ? theme.fg("dim", "\n… (expand to see all)") : "");
+    const box = new Box(outputPad, 1, (t) => theme.bg("customMessageBg", t));
+    box.addChild(new Text(`${header}\n${body}`, 0, 0));
+    return box;
+  });
 
-  registerBatchCommand(pi, storage, poller, () => activeCtx);
-  registerBatchTools(pi, storage, poller, () => activeCtx);
+  pi.on("session_start", (_event, ctx) => {
+    // Rebind storage + config to this session's project, then recover/reconcile
+    // any jobs left from previous runs (restart-safe; runs on timers, non-blocking).
+    rt.poller.stop();
+    rt.bind(ctx);
+    rt.poller.start();
+    rt.poller.updateBadge();
+  });
 
-  unsubs.push(
-    pi.on("session_start", (_event, ctx) => {
-      activeCtx = ctx;
-      // Rebind the config cascade to this session's project layer.
-      storage.setCwd(ctx.cwd);
-      poller.start();
-      poller.updateBadge();
-    })
-  );
-
-  unsubs.push(
-    pi.on("session_shutdown", () => {
-      poller.stop();
-      while (unsubs.length > 0) {
-        unsubs.pop()?.();
-      }
-    })
-  );
+  pi.on("session_shutdown", () => {
+    // Idempotent. Job state is already durable on disk; nothing to flush.
+    rt.poller.stop();
+  });
 }
