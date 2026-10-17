@@ -3,8 +3,8 @@ import test from "node:test";
 import { normaliseBatchResult } from "../src/openrouter/normalise-result.js";
 import { BYOK_USAGE, batchObject, completed, failedItem, successItem } from "./fixtures/openrouter.js";
 
-const CID = "B-20261016-A7C2:request-001";
-const CID2 = "B-20261016-A7C2:request-002";
+const CID = "B-20261016-A7C2_request-001";
+const CID2 = "B-20261016-A7C2_request-002";
 const expect1 = { localJobId: "B-20261016-A7C2", providerBatchId: "batch_123", expectedCustomIds: [CID] };
 const expect2 = { ...expect1, expectedCustomIds: [CID, CID2] };
 const run = (obj: unknown, e = expect1) => normaliseBatchResult(JSON.stringify(obj), e);

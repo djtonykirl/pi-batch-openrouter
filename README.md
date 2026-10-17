@@ -109,7 +109,7 @@ Everything is project-local in `.pi/batches/`. A `.gitignore` containing `*` is 
 - There are three distinct identifiers:
   - local ID: `B-YYYYMMDD-XXXX`, allocated by exclusive `mkdir`
   - OpenRouter batch ID: `batch_…`
-  - request `custom_id`: `<local ID>:request-001`
+  - request `custom_id`: `<local ID>_request-001` (only `[A-Za-z0-9_-]`, which some upstream batch backends require)
 - **Duplicate protection:** submitting a request identical to an *active* job (compared by canonical request hash with `custom_id` masked) is refused. `/batch retry` deliberately bypasses this. This is local protection only; OpenRouter documents no server-side idempotency.
 
 **Why files rather than SQLite:** `better-sqlite3` is a native addon that must match Pi's Node ABI, and it needs prebuilt-binary downloads that corporate Windows networks often block. `node:sqlite` prints an `ExperimentalWarning` to stderr on the Node versions Pi supports, which would corrupt the TUI. The registry interface (`src/registry.ts`) is narrow enough to swap later.

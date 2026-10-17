@@ -5,7 +5,7 @@ import test from "node:test";
 import { parseArgs, tokenize } from "../src/args.js";
 import { DEFAULT_CONFIG, loadConfig, projectConfigPath, saveConfigUpdate, validateConfig } from "../src/config.js";
 import { atomicWriteFile, isInside, tryAcquireLock, writeOnce } from "../src/fsutil.js";
-import { customIdFor, isLocalJobId, newLocalJobId } from "../src/ids.js";
+import { CUSTOM_ID_PATTERN, customIdFor, isLocalJobId, newLocalJobId } from "../src/ids.js";
 import { buildSubmitBody } from "../src/openrouter/types.js";
 import { rm, tempWorkspace, writeFiles } from "./helpers.js";
 
@@ -33,9 +33,16 @@ test("local IDs are well-formed and unique-ish; custom_id embeds the local ID", 
   const id = newLocalJobId(new Date("2026-10-16T10:00:00Z"));
   assert.match(id, /^B-20261016-[0-9A-Z]{4}$/);
   assert.ok(isLocalJobId(id));
-  assert.equal(customIdFor(id, 0), `${id}:request-001`);
+  assert.equal(customIdFor(id, 0), `${id}_request-001`);
   const many = new Set(Array.from({ length: 200 }, () => newLocalJobId()));
   assert.ok(many.size > 190);
+});
+
+test("regression: custom_id uses only [A-Za-z0-9_-], <= 64 chars (Anthropic batch rejected : with HTTP 422)", () => {
+  const longest = newLocalJobId(new Date("2026-10-16T10:00:00Z"), 8);
+  for (const id of [newLocalJobId(), longest]) {
+    for (const i of [0, 998]) assert.match(customIdFor(id, i), CUSTOM_ID_PATTERN);
+  }
 });
 
 test("submit body keeps OpenRouter's required field order (requests last)", () => {

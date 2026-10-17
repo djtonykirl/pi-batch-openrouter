@@ -4,8 +4,14 @@ import * as crypto from "node:crypto";
  * Three distinct identifiers (never conflate them):
  *   local job ID          B-20261016-A7C2              (ours; directory name)
  *   provider batch ID     batch_xxxxx                  (OpenRouter's)
- *   request custom_id     B-20261016-A7C2:request-001  (correlates request <-> result)
+ *   request custom_id     B-20261016-A7C2_request-001  (correlates request <-> result)
  */
+
+/**
+ * Some upstream batch backends (Anthropic, verified live 2026-10-17: HTTP 422) only accept
+ * custom_id characters in [A-Za-z0-9_-] and at most 64 characters, so no ':' or '.'.
+ */
+export const CUSTOM_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 
 // Crockford base32 without I, L, O, U — unambiguous when read aloud or retyped.
 const ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
@@ -26,5 +32,5 @@ export function isLocalJobId(value: string): boolean {
 }
 
 export function customIdFor(localId: string, index: number): string {
-  return `${localId}:request-${String(index + 1).padStart(3, "0")}`;
+  return `${localId}_request-${String(index + 1).padStart(3, "0")}`;
 }

@@ -102,7 +102,7 @@ test(
     assert.equal(posted.body, preserved);
     const body = JSON.parse(preserved);
     assert.deepEqual(Object.keys(body), ["endpoint", "model", "completion_window", "requests"]);
-    assert.equal(body.requests[0].custom_id, `${job.localId}:request-001`);
+    assert.equal(body.requests[0].custom_id, `${job.localId}_request-001`);
     assert.match(fs.readFileSync(reg.artefact(job.localId, "requestSha"), "utf8"), new RegExp(`^${job.requestSha256}`));
     assert.equal(job.providerBatchId, "batch_123");
     assert.equal(job.providerStatus, "validating");
@@ -320,7 +320,7 @@ test(
     const parentBody = JSON.parse(fs.readFileSync(service.registry.artefact(job.localId, "submittedRequest"), "utf8"));
     const childBody = JSON.parse(fs.readFileSync(service.registry.artefact(child.localId, "submittedRequest"), "utf8"));
     assert.deepEqual(childBody.requests[0].body, parentBody.requests[0].body);
-    assert.equal(childBody.requests[0].custom_id, `${child.localId}:request-001`);
+    assert.equal(childBody.requests[0].custom_id, `${child.localId}_request-001`);
     assert.equal(childBody.model, "openai/gpt-5-mini");
     // Original manifest unchanged; only an event was appended.
     assert.equal(fs.readFileSync(path.join(service.registry.jobDir(job.localId), "manifest.json"), "utf8"), before);
@@ -335,7 +335,7 @@ test(
     const fake = new FakeOpenRouter();
     const service = makeService(root, fake);
     const job = await submitOne(service, fake);
-    fake.getReplies = [{ status: 200, body: completed([successItem("someone-else:request-001")]) }];
+    fake.getReplies = [{ status: 200, body: completed([successItem("someone-else_request-001")]) }];
     await service.reconcile(job.localId, { force: true });
     const m = service.registry.read(job.localId);
     assert.equal(m.localStatus, "corrupt");
@@ -476,10 +476,10 @@ test(
     const job = await submitOne(service, fake);
     // Simulate a two-request job (Release 2 shape) to exercise partial.
     service.registry.update(job.localId, (u) => {
-      u.manifest.customIds.push(`${job.localId}:request-002`);
+      u.manifest.customIds.push(`${job.localId}_request-002`);
       u.manifest.requestCount = 2;
     });
-    fake.getReplies = [{ status: 200, body: completed([successItem(job.customIds[0]!, "half"), failedItem(`${job.localId}:request-002`)]) }];
+    fake.getReplies = [{ status: 200, body: completed([successItem(job.customIds[0]!, "half"), failedItem(`${job.localId}_request-002`)]) }];
     await service.reconcile(job.localId, { force: true });
     assert.equal(service.registry.read(job.localId).localStatus, "partial");
     const inj = service.buildInjection(job.localId, "default");
