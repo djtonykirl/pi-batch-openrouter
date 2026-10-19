@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
+import { registerArtifactCommand } from "./src/artifact-commands.js";
 import { registerBatchCommand } from "./src/commands.js";
 import { BatchRuntime, INJECTED_MESSAGE_TYPE } from "./src/runtime.js";
 import { registerBatchTools } from "./src/tools.js";
@@ -9,6 +10,7 @@ export default function (pi: ExtensionAPI): void {
   const rt = new BatchRuntime(pi);
 
   registerBatchCommand(rt);
+  registerArtifactCommand(rt);
   registerBatchTools(rt);
 
   // Injected results render compactly in the transcript; the full text is what the model receives.

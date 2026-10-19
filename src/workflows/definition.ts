@@ -43,6 +43,11 @@ export interface WorkflowDefinition {
   output: { type: "markdown" } | { type: "json"; schema: Record<string, unknown> };
   synthesis: { enabled: boolean };
   limits: { maxRequests?: number; maxRows?: number; maxCharactersPerItem?: number; maxTotalCharacters?: number };
+  /**
+   * Release 4: the artifact this workflow's jobs can produce on request. Never generated
+   * automatically; `/batch artifact <job>` uses it when no format/template/--out is given.
+   */
+  artifact?: { template?: string; format: "markdown" | "html" | "pdf" | "text"; filename: string };
 }
 
 export interface Diagnostic {
@@ -122,6 +127,17 @@ const DEFINITION_SCHEMA = {
       type: "object",
       additionalProperties: false,
       properties: { maxRequests: POSITIVE, maxRows: POSITIVE, maxCharactersPerItem: POSITIVE, maxTotalCharacters: POSITIVE },
+    },
+    artifact: {
+      type: "object",
+      additionalProperties: false,
+      required: ["format", "filename"],
+      properties: {
+        template: { type: "string", pattern: "^[a-z0-9][a-z0-9-]{0,62}$" },
+        format: { enum: ["markdown", "html", "pdf", "text"] },
+        // A workspace-relative path; containment and extension are checked again when rendering.
+        filename: { type: "string", minLength: 1, maxLength: 200, pattern: "^(?![\\\\/])(?![A-Za-z]:)(?!.*(^|[\\\\/])\\.\\.([\\\\/]|$))[^\\u0000-\\u001f]+$" },
+      },
     },
   },
 } as const;
@@ -203,6 +219,8 @@ function resolveDefinition(raw: Record<string, unknown>): WorkflowDefinition {
     output,
     synthesis: { enabled: r.synthesis?.enabled ?? false },
     limits: { ...(r.limits ?? {}) },
+    // Only present when declared, so the resolved hash of workflows without it is unchanged.
+    ...((raw as { artifact?: WorkflowDefinition["artifact"] }).artifact ? { artifact: { ...(raw as { artifact: NonNullable<WorkflowDefinition["artifact"]> }).artifact } } : {}),
   };
 }
 

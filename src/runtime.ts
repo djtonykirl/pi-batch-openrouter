@@ -5,6 +5,8 @@ import { FileLogger, type Logger } from "./logger.js";
 import { resolveApiKeyForProvider } from "./models.js";
 import { BatchPoller } from "./poller.js";
 import { JobRegistry } from "./registry.js";
+import { ArtifactService } from "./artifacts/service.js";
+import { ArtifactStore } from "./artifacts/store.js";
 import { BatchService } from "./service.js";
 import type { JobManifest } from "./types.js";
 
@@ -19,6 +21,7 @@ export class BatchRuntime {
   public ctx: ExtensionContext | null = null;
   public loaded: LoadedConfig = loadConfig();
   public service: BatchService | null = null;
+  public artifacts: ArtifactService | null = null;
   public readonly poller: BatchPoller;
   private logger: Logger | null = null;
   private apiKeyCache = new Map<string, string>();
@@ -47,6 +50,7 @@ export class BatchRuntime {
     this.loaded = loadConfig(this.cwd);
     if (!this.cwd) {
       this.service = null;
+      this.artifacts = null;
       return;
     }
     const storage = path.resolve(this.cwd, this.loaded.config.storagePath);
@@ -60,9 +64,20 @@ export class BatchRuntime {
       logger: this.logger,
       onSettled: (job) => this.onSettled(job),
     });
+    this.artifacts = new ArtifactService({
+      batch: this.service,
+      workspaceRoot: this.cwd,
+      getConfig: () => this.loaded.config,
+      store: new ArtifactStore(path.join(storage, "artifacts")),
+    });
     if (this.loaded.errors.length > 0) {
       this.logger.log("warn", "config_errors", { errors: this.loaded.errors });
     }
+  }
+
+  public requireArtifacts(): ArtifactService {
+    if (!this.artifacts) throw new Error("No active Pi session/workspace; artifact storage is unavailable.");
+    return this.artifacts;
   }
 
   public requireService(): BatchService {
@@ -86,9 +101,11 @@ export class BatchRuntime {
     if (!this.loaded.config.notifyOnComplete) return;
     const objective = job.objective.replace(/\s+/g, " ").slice(0, 60);
     const multi = job.requestCount > 1;
+    const available = this.artifacts?.availableDefault(job);
+    const artifactHint = available ? `\nArtifact available (not generated): /batch artifact ${job.localId}   → ${available.format} ${available.filename}` : "";
     if (job.localStatus === "ready") {
       this.notify(
-        `📦 Batch ${job.localId} ready${multi ? ` (${job.requestCount}/${job.requestCount} items)` : ""}: ${objective}\n/batch read ${job.localId}  ·  /batch inject ${job.localId}${multi ? `  ·  /batch items ${job.localId}` : ""}`,
+        `📦 Batch ${job.localId} ready${multi ? ` (${job.requestCount}/${job.requestCount} items)` : ""}: ${objective}\n/batch read ${job.localId}  ·  /batch inject ${job.localId}${multi ? `  ·  /batch items ${job.localId}` : ""}${artifactHint}`,
         "info",
       );
     } else if (job.localStatus === "partial") {

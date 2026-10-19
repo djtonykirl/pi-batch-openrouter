@@ -7,6 +7,8 @@ import { discoverBatchModels } from "./models.js";
 import { INJECTED_MESSAGE_TYPE, type BatchRuntime } from "./runtime.js";
 import { jobItems, sourceLabel } from "./items.js";
 import { CHECK_LOCK_WAIT_MS, DuplicateActiveRequestError, SubmissionBlockedError, formatUsage, itemCounts, type InjectMode, type PreparedAsk, type PreparedDatasetRun, type PreparedPlan, type PreparedSynthesis } from "./service.js";
+import { cmdBatchArtifact } from "./artifact-commands.js";
+import { ArtifactError } from "./artifacts/service.js";
 import { formatLegacyInventory } from "./legacy.js";
 import { BUILTIN_WORKFLOWS, WorkflowNotFoundError, discoverWorkflows, findWorkflow, formatDiagnostics, validateWorkflowFile } from "./workflows/definition.js";
 import { ACTIVE_STATUSES, LOCAL_STATUSES, TERMINAL_STATUSES, type LocalStatus } from "./state.js";
@@ -28,6 +30,7 @@ const SUBCOMMANDS: Record<string, { desc: string; nonTerminal: boolean }> = {
   run: { desc: "Run a workflow: run <project-workflow> --input data.csv [--preview] | run map-files --file a --prompt \"...\"", nonTerminal: true },
   workflow: { desc: "Project workflows: workflow list | show <name> | validate <name> | validate --file <path>", nonTerminal: true },
   export: { desc: "Export a finished job's results: export <id> --format jsonl|csv [--out path] [--overwrite]", nonTerminal: true },
+  artifact: { desc: "Write a controlled file from a validated result: artifact <id> [--synthesis|--item n] --format markdown|html|pdf|text [--template t] [--out path]", nonTerminal: true },
   "import-legacy": { desc: "Inventory a pre-Release-1 jobs.json (read-only): import-legacy <path> --preview", nonTerminal: true },
   items: { desc: "List a job's request items", nonTerminal: true },
   item: { desc: "Inspect one item: item <id> <n|custom_id|path> [--text] [--raw]", nonTerminal: true },
@@ -51,6 +54,7 @@ const ID_COMMANDS: Record<string, (j: JobManifest) => boolean> = {
   "retry-items": (j) => TERMINAL_STATUSES.has(j.localStatus),
   synthesize: (j) => j.kind !== "synthesis" && (j.localStatus === "ready" || j.localStatus === "partial"),
   export: (j) => TERMINAL_STATUSES.has(j.localStatus),
+  artifact: (j) => j.localStatus === "ready" || j.localStatus === "partial",
 };
 
 const HELP = `/batch — deferred OpenRouter Batch goals
@@ -69,6 +73,9 @@ const HELP = `/batch — deferred OpenRouter Batch goals
       --model  --account  --provider  --preview
   export <id> --format jsonl|csv [--out <path>] [--overwrite] [--job-only]
                                      write results with provenance (default: job's exports/ folder)
+  artifact <id> [--synthesis|--item <sel>] --format markdown|html|pdf|text [--template <name>]
+      [--out <path>] [--overwrite] [--allow-partial]
+                                     controlled file from validated results (see /artifact help)
   import-legacy <jobs.json> --preview
                                      read-only inventory of pre-Release-1 jobs (import itself is deferred)
   run map-files [options] --prompt "<objective>"
@@ -184,7 +191,7 @@ export function registerBatchCommand(rt: BatchRuntime): void {
         await dispatch(rt, args, ctx);
       } catch (err) {
         const e = err as Error;
-        const level = err instanceof SubmissionBlockedError || err instanceof DuplicateActiveRequestError || err instanceof WorkflowNotFoundError ? "warning" : "error";
+        const level = err instanceof SubmissionBlockedError || err instanceof DuplicateActiveRequestError || err instanceof WorkflowNotFoundError || err instanceof ArtifactError ? "warning" : "error";
         rt.notify(e.message, level);
       }
     },
@@ -216,6 +223,8 @@ async function dispatch(rt: BatchRuntime, args: string, ctx: ExtensionCommandCon
       return cmdWorkflow(rt, rest, ctx);
     case "export":
       return cmdExport(rt, rest);
+    case "artifact":
+      return cmdBatchArtifact(rt, rest);
     case "import-legacy":
       return cmdImportLegacy(rt, rest, ctx);
     case "items":
@@ -418,6 +427,11 @@ async function cmdShow(rt: BatchRuntime, rest: string[], ctx: ExtensionCommandCo
   const { retries, syntheses } = service.linkedJobs(id);
   for (const r of retries) lines.push(`  Linked retry:     ${r.localId} (${r.localStatus}, ${r.retryMode === "items" ? `${r.requestCount} item(s)` : "full re-run"})`);
   for (const s of syntheses) lines.push(`  Linked synthesis: ${s.localId} (${s.localStatus})`);
+  const artifacts = rt.artifacts?.list({ jobId: id }) ?? [];
+  for (const a of artifacts.slice(0, 10)) lines.push(`  Artifact:         ${a.artifactId} ${a.format} ${a.status} -> ${a.output?.path ?? "-"} (${a.source.state})`);
+  if (artifacts.length > 10) lines.push(`  … ${artifacts.length - 10} more artifacts (/artifact list --job ${id})`);
+  const available = rt.artifacts?.availableDefault(job);
+  if (available && !artifacts.some((a) => a.output?.path === available.filename)) lines.push(`  Artifact available (not generated): /batch artifact ${id}   -> ${available.format} ${available.filename}`);
   if (job.synthesis) {
     lines.push(
       "",

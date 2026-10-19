@@ -1,5 +1,6 @@
 import { Type } from "typebox";
 import type { BatchRuntime } from "./runtime.js";
+import { describeArtifact } from "./artifact-commands.js";
 import { formatIsoShort } from "./time.js";
 import { BUILTIN_WORKFLOWS, discoverWorkflows, findWorkflow, formatDiagnostics, validateWorkflowFile } from "./workflows/definition.js";
 
@@ -227,6 +228,69 @@ export function registerBatchTools(rt: BatchRuntime): void {
         ],
         details: { localId: job.localId, requests: c.plannedRequests, characters: prepared.plan!.totalCharacters, model: prepared.model },
       };
+    },
+  });
+
+  rt.pi.registerTool({
+    name: "artifact_list",
+    label: "Artifact List",
+    description: "Lists artifacts (files rendered from validated batch results or local Markdown) with format, source and destination. Read-only.",
+    promptSnippet: "Use artifact_list to see which reports/files were generated from batch results.",
+    promptGuidelines: ["Artifacts are created only by the user's /batch artifact or /artifact render commands"],
+    parameters: Type.Object({ job_id: Type.Optional(Type.String({ description: "Only artifacts of this batch job" })) }),
+    execute: async (_toolCallId, params) => {
+      const art = rt.requireArtifacts();
+      const jobId = params.job_id ? rt.requireService().registry.resolveId(params.job_id) : undefined;
+      const list = art.list(jobId ? { jobId } : {}).slice(0, 50);
+      const text = list.length
+        ? list.map((a) => `- ${a.artifactId} ${a.status} ${a.format} -> ${a.output?.path ?? "-"} (source: ${a.source.type}${a.source.jobId ? ` ${a.source.jobId}` : ""}${a.source.path ? ` ${a.source.path}` : ""}; ${a.source.state})`).join("\n")
+        : "No artifacts.";
+      return { content: [{ type: "text", text }], details: { count: list.length } };
+    },
+  });
+
+  rt.pi.registerTool({
+    name: "artifact_show",
+    label: "Artifact Show",
+    description: "Shows one artifact's provenance: source job/item/synthesis or local file, source state (batch-generated or edited), hashes, template, renderer, destination. Read-only.",
+    promptSnippet: "Use artifact_show to check where a generated file came from and whether its source was edited.",
+    promptGuidelines: ["Report provenance as recorded; hashes prove byte identity, not correctness"],
+    parameters: Type.Object({ artifact_id: Type.String({ description: "Artifact ID (A-YYYYMMDD-XXXX) or unique suffix" }) }),
+    execute: async (_toolCallId, params) => {
+      const art = rt.requireArtifacts();
+      const m = art.store.read(art.store.resolveId(params.artifact_id));
+      return { content: [{ type: "text", text: describeArtifact(m).join("\n") }], details: { artifactId: m.artifactId, status: m.status } };
+    },
+  });
+
+  rt.pi.registerTool({
+    name: "artifact_plan_render",
+    label: "Artifact Plan Render",
+    description:
+      "Checks whether a workspace Markdown file can be rendered to HTML or PDF, and to which destination, without writing anything: " +
+      "runs every path, extension, overwrite and renderer check and renders in memory only. The user creates the file with /artifact render.",
+    promptSnippet: "Use artifact_plan_render to check a Markdown file before the user renders it with /artifact render.",
+    promptGuidelines: [
+      "This tool never writes files; tell the user the exact /artifact render command to run",
+      "Never propose destinations outside the workspace or executable file types",
+    ],
+    parameters: Type.Object({
+      source: Type.String({ description: "Workspace-relative Markdown file" }),
+      format: Type.Union([Type.Literal("html"), Type.Literal("pdf")]),
+      out: Type.Optional(Type.String({ description: "Workspace-relative destination the user intends to use" })),
+    }),
+    execute: async (_toolCallId, params) => {
+      const art = rt.requireArtifacts();
+      const plan = await art.planFromFile(params.source, { format: params.format, out: params.out });
+      const dest = plan.destination.kind === "out" ? plan.destination.relPath : "(internal artifact folder)";
+      const text = [
+        `OK to render (nothing was written): ${params.source} -> ${params.format} ${dest}`,
+        `Source state: ${plan.source.state}${plan.lineage.derivedFromArtifactId ? ` (derived from ${plan.lineage.derivedFromArtifactId})` : ""}`,
+        `Rendered size: ${plan.bytes.length} bytes${plan.pages ? `, ${plan.pages} page(s)` : ""}`,
+        ...plan.warnings.map((w) => `Warning: ${w}`),
+        `The user can create it with: /artifact render ${params.source} --format ${params.format}${params.out ? ` --out ${params.out}` : ""}`,
+      ].join("\n");
+      return { content: [{ type: "text", text }], details: { ok: true, bytes: plan.bytes.length } };
     },
   });
 
