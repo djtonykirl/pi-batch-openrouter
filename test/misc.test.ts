@@ -114,6 +114,80 @@ test("lock is exclusive and released", () => {
   }
 });
 
+test("stale-lock takeover: age decides (contents may be malformed); fresh locks are respected", () => {
+  const root = tempWorkspace();
+  try {
+    const p = path.join(root, ".lock");
+    const old = (ms: number) => fs.utimesSync(p, new Date(Date.now() - ms), new Date(Date.now() - ms));
+    fs.writeFileSync(p, "not json at all");
+    assert.equal(tryAcquireLock(p, 1000), null, "fresh lock with malformed contents is still a lock");
+    old(5000);
+    const a = tryAcquireLock(p, 1000);
+    assert.ok(a, "stale lock with malformed contents is taken over");
+    assert.match(fs.readFileSync(p, "utf8"), /"pid":\d+/);
+    assert.ok(!fs.existsSync(`${p}.break`), "takeover marker is removed");
+    a!.release();
+  } finally {
+    rm(root);
+  }
+});
+
+test("stale-lock takeover race: concurrent takeovers are serialised and never yield two owners", () => {
+  const root = tempWorkspace();
+  try {
+    const p = path.join(root, ".lock");
+    const makeStale = (content: string) => {
+      fs.writeFileSync(p, content);
+      fs.utimesSync(p, new Date(Date.now() - 60_000), new Date(Date.now() - 60_000));
+    };
+
+    // B tries while A is mid-takeover: B backs off; A gets the lock; later contenders see a live lock.
+    makeStale(`{"pid":1,"at":"dead owner"}`);
+    let duringA: ReturnType<typeof tryAcquireLock> = null;
+    const a = tryAcquireLock(p, 1000, { beforeStaleRemoval: () => (duringA = tryAcquireLock(p, 1000)) });
+    assert.ok(a);
+    assert.equal(duringA, null);
+    assert.equal(tryAcquireLock(p, 1000), null);
+    a!.release();
+
+    // The lock A judged stale was replaced by a live one before removal: A must not delete it.
+    makeStale(`{"pid":2,"at":"dead owner"}`);
+    const live = `{"pid":3,"at":"new live owner"}`;
+    const a2 = tryAcquireLock(p, 1000, { beforeStaleRemoval: () => fs.writeFileSync(p, live) });
+    assert.equal(a2, null);
+    assert.equal(fs.readFileSync(p, "utf8"), live, "the live lock survives");
+    assert.ok(!fs.existsSync(`${p}.break`));
+
+    // The stale owner released it during the takeover: A simply acquires.
+    makeStale(`{"pid":4,"at":"slow owner"}`);
+    const a3 = tryAcquireLock(p, 1000, { beforeStaleRemoval: () => fs.unlinkSync(p) });
+    assert.ok(a3);
+    a3!.release();
+  } finally {
+    rm(root);
+  }
+});
+
+test("stale-lock takeover: a takeover marker orphaned by a crash is cleared, then takeover proceeds", () => {
+  const root = tempWorkspace();
+  try {
+    const p = path.join(root, ".lock");
+    const ago = new Date(Date.now() - 60_000);
+    fs.writeFileSync(p, `{"pid":1}`);
+    fs.utimesSync(p, ago, ago);
+    fs.writeFileSync(`${p}.break`, "");
+    assert.equal(tryAcquireLock(p, 1000), null, "a recent marker means a takeover is in progress");
+    fs.utimesSync(`${p}.break`, ago, ago);
+    assert.equal(tryAcquireLock(p, 1000), null, "this attempt clears the orphaned marker");
+    assert.ok(!fs.existsSync(`${p}.break`));
+    const a = tryAcquireLock(p, 1000);
+    assert.ok(a);
+    a!.release();
+  } finally {
+    rm(root);
+  }
+});
+
 test("isInside handles .. prefixes and other drives", () => {
   const base = path.resolve("/work/repo");
   assert.ok(isInside(base, path.join(base, "..foo")));

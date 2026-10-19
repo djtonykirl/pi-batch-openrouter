@@ -139,13 +139,34 @@ export class BatchDashboardComponent implements Component {
         lines.push(...wrapTextWithAnsi(`   ${String(it.ordinal).padStart(3, "0")} ${it.status.padEnd(10)} ${src}`, width));
       }
       if (job.items.length > 20) lines.push(`   … ${job.items.length - 20} more (/batch items ${job.localId})`);
-      lines.push("", `  \x1b[90m/batch items ${job.localId}  ·  /batch retry-items ${job.localId} --failed  ·  /batch synthesize ${job.localId}\x1b[0m`);
+      // Wrapped, not truncated: a cut-off hint (e.g. without --allow-partial) would be a different command.
+      lines.push("", ...wrapTextWithAnsi(`  \x1b[90m${detailCommandHints(job).join("  ·  ")}\x1b[0m`, width));
     }
     lines.push(hr);
     if (this.flash) lines.push(`\x1b[33m${this.flash}\x1b[0m`);
     lines.push("\x1b[90m[o] Read  [i] Inject  [c] Cancel  [Enter/b/Esc] Back  [q] Close\x1b[0m");
     return lines;
   }
+}
+
+/**
+ * Follow-up commands for a multi-item job, offered only when the command would be accepted
+ * in the job's current state (mirrors the guards in retryItems / prepareSynthesis).
+ */
+export function detailCommandHints(job: JobManifest): string[] {
+  const id = job.localId;
+  const hints = [`/batch items ${id}`];
+  const items = job.items ?? [];
+  const retryable = new Set<LocalStatus>(["partial", "failed", "corrupt", "expired", "cancelled"]);
+  // A possibly-accepted submission must be checked on OpenRouter first, so no retry is suggested.
+  const unknownSubmission = job.error?.code === "submission_unknown";
+  const hasUnusable = job.localStatus === "partial" ? items.some((i) => i.status !== "completed") : items.length > 0;
+  if (retryable.has(job.localStatus) && hasUnusable && !unknownSubmission) hints.push(`/batch retry-items ${id} --failed`);
+  if (job.kind !== "synthesis" && items.some((i) => i.status === "completed")) {
+    if (job.localStatus === "ready") hints.push(`/batch synthesize ${id}`);
+    else if (job.localStatus === "partial") hints.push(`/batch synthesize ${id} --allow-partial`);
+  }
+  return hints;
 }
 
 /** Shared by `/batch show` and the dashboard detail view. Only fields actually known are shown. */

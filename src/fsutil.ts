@@ -120,17 +120,34 @@ export interface FileLock {
   release(): void;
 }
 
+/** A takeover marker older than this was left by a process that died mid-takeover (which takes milliseconds). */
+const BREAK_STALE_MS = 10_000;
+
+/** Test seam: runs after a lock is judged stale and before it is removed. */
+export interface LockTestHooks {
+  beforeStaleRemoval?: () => void;
+}
+
 /**
  * Cross-process advisory lock via exclusive file creation. Prevents two Pi
  * processes (or two overlapping polls) from reconciling the same job at once.
  * A lock older than `staleMs` is assumed abandoned (crash) and taken over.
+ *
+ * Takeover is serialised through an exclusive `<lock>.break` marker, and the
+ * lock is re-read before removal: otherwise two processes that both judged the
+ * same lock stale could each remove it, the second deleting the first's fresh
+ * lock, leaving two owners.
+ *
+ * Owner liveness (PID checks) is deliberately not used: a workspace may be shared
+ * across PID spaces (WSL and Windows, containers, synced or network folders), where
+ * a live owner's PID can look dead. The age timeout is the only takeover rule.
  */
-export function tryAcquireLock(lockPath: string, staleMs = 120_000): FileLock | null {
+export function tryAcquireLock(lockPath: string, staleMs = 120_000, hooks: LockTestHooks = {}): FileLock | null {
   fs.mkdirSync(path.dirname(lockPath), { recursive: true });
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const fd = fs.openSync(lockPath, "wx");
-      fs.writeSync(fd, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+      fs.writeSync(fd, JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token: crypto.randomBytes(8).toString("hex") }));
       fs.closeSync(fd);
       let released = false;
       return {
@@ -146,16 +163,56 @@ export function tryAcquireLock(lockPath: string, staleMs = 120_000): FileLock | 
       };
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      let judged: string;
       try {
-        const age = Date.now() - fs.statSync(lockPath).mtimeMs;
-        if (age <= staleMs) return null;
-        fs.unlinkSync(lockPath);
+        judged = fs.readFileSync(lockPath, "utf8");
+        if (Date.now() - fs.statSync(lockPath).mtimeMs <= staleMs) return null;
       } catch {
-        return null;
+        continue; // released between our create attempt and the read: try again
       }
+      if (!removeStaleLock(lockPath, judged, hooks)) return null;
     }
   }
   return null;
+}
+
+/** Removes `lockPath` only if it still holds exactly the stale content judged, with takeovers serialised. */
+function removeStaleLock(lockPath: string, judged: string, hooks: LockTestHooks): boolean {
+  const breakPath = `${lockPath}.break`;
+  let fd: number;
+  try {
+    fd = fs.openSync(breakPath, "wx");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    // Another process is taking over right now. A marker this old was orphaned by a crash mid-takeover.
+    try {
+      if (Date.now() - fs.statSync(breakPath).mtimeMs > BREAK_STALE_MS) fs.unlinkSync(breakPath);
+    } catch {
+      // gone already
+    }
+    return false;
+  }
+  try {
+    fs.closeSync(fd);
+    hooks.beforeStaleRemoval?.();
+    let current: string;
+    try {
+      current = fs.readFileSync(lockPath, "utf8");
+    } catch {
+      return true; // already released: the caller retries the exclusive create
+    }
+    // Replaced since it was judged (e.g. another takeover completed): it is a live lock now.
+    if (current !== judged) return false;
+    fs.unlinkSync(lockPath);
+    return true;
+  } finally {
+    try {
+      fs.unlinkSync(breakPath);
+    } catch {
+      // Already removed by an orphan sweep (only possible if this takeover stalled > BREAK_STALE_MS).
+      // Even then the re-read above keeps a replaced (live) lock from being deleted.
+    }
+  }
 }
 
 /** Acquire with short synchronous retries; for user commands that must not silently skip. */
