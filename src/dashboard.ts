@@ -2,7 +2,8 @@ import type { Component } from "@earendil-works/pi-tui";
 import { matchesKey, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { ACTIVE_STATUSES, type LocalStatus } from "./state.js";
 import { formatIsoShort } from "./time.js";
-import type { JobManifest } from "./types.js";
+import { sourceLabel } from "./items.js";
+import { isDatasetWorkflow, type JobManifest } from "./types.js";
 
 export interface DashboardActions {
   refresh(): Promise<JobManifest[]>;
@@ -135,7 +136,7 @@ export class BatchDashboardComponent implements Component {
     if (job.items && job.items.length > 1) {
       lines.push("", "  Items:");
       for (const it of job.items.slice(0, 20)) {
-        const src = it.source.path ?? it.source.paths?.join(", ") ?? it.source.label ?? "";
+        const src = sourceLabel(it);
         lines.push(...wrapTextWithAnsi(`   ${String(it.ordinal).padStart(3, "0")} ${it.status.padEnd(10)} ${src}`, width));
       }
       if (job.items.length > 20) lines.push(`   … ${job.items.length - 20} more (/batch items ${job.localId})`);
@@ -162,7 +163,8 @@ export function detailCommandHints(job: JobManifest): string[] {
   const unknownSubmission = job.error?.code === "submission_unknown";
   const hasUnusable = job.localStatus === "partial" ? items.some((i) => i.status !== "completed") : items.length > 0;
   if (retryable.has(job.localStatus) && hasUnusable && !unknownSubmission) hints.push(`/batch retry-items ${id} --failed`);
-  if (job.kind !== "synthesis" && items.some((i) => i.status === "completed")) {
+  const synthesisAllowed = !isDatasetWorkflow(job.workflow) || job.workflow.synthesisEnabled;
+  if (job.kind !== "synthesis" && synthesisAllowed && items.some((i) => i.status === "completed")) {
     if (job.localStatus === "ready") hints.push(`/batch synthesize ${id}`);
     else if (job.localStatus === "partial") hints.push(`/batch synthesize ${id} --allow-partial`);
   }
@@ -184,7 +186,8 @@ export function describeJob(job: JobManifest, storageDir?: string): string[] {
     ["Parent job", job.parentJobId],
     ["Retry count", job.retryCount || undefined],
     ["Kind", job.kind && job.kind !== "goal" ? job.kind : undefined],
-    ["Workflow", job.workflow ? `${job.workflow.name} v${job.workflow.version}${job.workflow.options.groupSize > 1 ? ` (groups of ${job.workflow.options.groupSize})` : ""}` : undefined],
+    ["Workflow", workflowCell(job)],
+    ...datasetRows(job),
     ["Synthesis of", job.synthesis ? `${job.synthesis.sourceJobId} (${job.synthesis.included.length}/${job.synthesis.expectedItems} items${job.synthesis.allowPartial ? ", partial allowed" : ""})` : undefined],
     ["Request count", job.requestCount],
     ["Items", multi ? itemSummary(job) : undefined],
@@ -216,6 +219,32 @@ export function describeJob(job: JobManifest, storageDir?: string): string[] {
   const lines = rows.filter(([, v]) => v !== undefined && v !== "").map(([k, v]) => `  ${k.padEnd(20)} ${v}`);
   for (const w of job.warnings) lines.push(`  ${"Warning".padEnd(20)} ${w}`);
   return lines;
+}
+
+function workflowCell(job: JobManifest): string | undefined {
+  const w = job.workflow;
+  if (!w) return undefined;
+  if (isDatasetWorkflow(w)) return `${w.name} (project workflow v${w.version}, definition ${w.definitionSha256.slice(0, 12)}…)`;
+  return `${w.name} v${w.version}${w.options.groupSize > 1 ? ` (groups of ${w.options.groupSize})` : ""}`;
+}
+
+/** Dataset provenance rows for Release 3 jobs; nothing for other jobs. */
+function datasetRows(job: JobManifest): Array<[string, string | number | undefined]> {
+  const w = job.workflow;
+  if (!isDatasetWorkflow(w)) return [];
+  const d = w.dataset;
+  const sel = w.selection.ids?.length
+    ? `ids ${w.selection.ids.slice(0, 5).join(", ")}${w.selection.ids.length > 5 ? ", …" : ""}`
+    : w.selection.fromRow !== undefined || w.selection.toRow !== undefined
+      ? `rows ${w.selection.fromRow ?? 1}-${w.selection.toRow ?? d.totalRows}`
+      : "all rows";
+  return [
+    ["Dataset", `${d.type} ${d.path} (sha256 ${d.sha256.slice(0, 12)}…)`],
+    ["Rows", `${job.parentJobId ? "original run: " : ""}${d.totalRows} total · ${d.selectedRows} selected (${sel}) · ${d.excludedRows} excluded · ${d.invalidRows} invalid`],
+    ["Fields sent", `${d.fields.join(", ")} (ID field: ${d.idField})`],
+    ["Output", w.output === "json" ? "json (validated against the stored JSON Schema)" : "markdown"],
+    ["Synthesis", w.synthesisEnabled ? "enabled by workflow" : "disabled by workflow"],
+  ];
 }
 
 function itemSummary(job: JobManifest): string {

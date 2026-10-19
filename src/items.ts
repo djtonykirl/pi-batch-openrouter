@@ -41,13 +41,24 @@ export function sourceLabel(item: Pick<JobItem, "source">): string {
   const s = item.source;
   if (s.kind === "file") return s.path ?? "?";
   if (s.kind === "group") return (s.paths ?? []).join(", ");
+  if (s.kind === "row") return `${s.sourceId ?? "?"}${s.row !== undefined ? ` (row ${s.row})` : s.line !== undefined ? ` (line ${s.line})` : ""}`;
   if (s.kind === "goal") return s.label ?? (s.paths?.length ? `goal (${s.paths.length} file(s))` : "goal");
   return s.label ?? s.kind;
 }
 
-/** Resolves an ordinal ("2"), exact custom_id, or unambiguous source path. */
+/**
+ * Resolves an ordinal ("2"), exact custom_id, dataset source ID, or unambiguous
+ * source path. All-digit selectors are ordinals; `id:<value>` always means a
+ * dataset source ID (use it for numeric source IDs).
+ */
 export function resolveItem(items: readonly JobItem[], selector: string): JobItem {
   const sel = selector.trim();
+  if (sel.startsWith("id:")) {
+    const wanted = sel.slice(3);
+    const hit = items.find((i) => i.source.kind === "row" && i.source.sourceId === wanted);
+    if (!hit) throw new Error(`No item has source ID ${JSON.stringify(wanted)}.`);
+    return hit;
+  }
   if (/^\d+$/.test(sel)) {
     const n = Number.parseInt(sel, 10);
     const hit = items.find((i) => i.ordinal === n);
@@ -56,6 +67,8 @@ export function resolveItem(items: readonly JobItem[], selector: string): JobIte
   }
   const byId = items.find((i) => i.customId === sel);
   if (byId) return byId;
+  const bySource = items.find((i) => i.source.kind === "row" && i.source.sourceId === sel);
+  if (bySource) return bySource;
   const norm = (p: string) => {
     const posix = p.replace(/\\/g, "/").replace(/^\.\//, "");
     return process.platform === "win32" ? posix.toLowerCase() : posix;
@@ -69,7 +82,7 @@ export function resolveItem(items: readonly JobItem[], selector: string): JobIte
   if (matches.length > 1) {
     throw new Error(`"${selector}" is ambiguous; it matches items ${matches.map((m) => m.ordinal).join(", ")}. Use the item number or custom_id.`);
   }
-  throw new Error(`No item matches "${selector}". Use an item number (see /batch items), a custom_id, or a source path.`);
+  throw new Error(`No item matches "${selector}". Use an item number (see /batch items), a custom_id, a source ID (id:<value>), or a source path.`);
 }
 
 /** Stored result text for an item, if any (Release 1 single-item jobs fall back to result/result.md). */

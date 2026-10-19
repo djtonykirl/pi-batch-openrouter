@@ -38,6 +38,10 @@ export interface BatchConfig {
     maxCharactersPerItem: number;
     maxTotalCharacters: number;
     maxSynthesisCharacters: number;
+    /** Dataset workflows: most rows one run may select (each selected row is one request). */
+    maxRowsPerRun: number;
+    /** Dataset workflows: largest dataset file read. */
+    maxDatasetBytes: number;
   };
 }
 
@@ -67,6 +71,8 @@ export const DEFAULT_CONFIG: BatchConfig = {
     maxCharactersPerItem: 500_000,
     maxTotalCharacters: 5_000_000,
     maxSynthesisCharacters: 1_000_000,
+    maxRowsPerRun: 1_000,
+    maxDatasetBytes: 20_000_000,
   },
 };
 
@@ -172,6 +178,8 @@ const SCHEMA: Record<string, Check | Record<string, Check>> = {
     maxCharactersPerItem: posInt(),
     maxTotalCharacters: posInt(),
     maxSynthesisCharacters: posInt(),
+    maxRowsPerRun: posInt(100_000),
+    maxDatasetBytes: posInt(),
   },
 };
 

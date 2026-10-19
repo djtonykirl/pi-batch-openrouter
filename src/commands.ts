@@ -1,12 +1,13 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
-import { parseArgs, tokenize } from "./args.js";
+import { parseArgs, tokenize, type ParsedArgs } from "./args.js";
 import { saveConfigUpdate } from "./config.js";
 import { BatchDashboardComponent, TextViewerComponent, describeJob, itemsCell } from "./dashboard.js";
 import { discoverBatchModels } from "./models.js";
 import { INJECTED_MESSAGE_TYPE, type BatchRuntime } from "./runtime.js";
 import { jobItems, sourceLabel } from "./items.js";
-import { CHECK_LOCK_WAIT_MS, DuplicateActiveRequestError, SubmissionBlockedError, formatUsage, itemCounts, type InjectMode, type PreparedAsk, type PreparedPlan, type PreparedSynthesis } from "./service.js";
+import { CHECK_LOCK_WAIT_MS, DuplicateActiveRequestError, SubmissionBlockedError, formatUsage, itemCounts, type InjectMode, type PreparedAsk, type PreparedDatasetRun, type PreparedPlan, type PreparedSynthesis } from "./service.js";
+import { BUILTIN_WORKFLOWS, WorkflowNotFoundError, discoverWorkflows, findWorkflow, formatDiagnostics, validateWorkflowFile } from "./workflows/definition.js";
 import { ACTIVE_STATUSES, LOCAL_STATUSES, TERMINAL_STATUSES, type LocalStatus } from "./state.js";
 import { formatIsoShort } from "./time.js";
 import type { JobManifest } from "./types.js";
@@ -23,7 +24,8 @@ const SUBCOMMANDS: Record<string, { desc: string; nonTerminal: boolean }> = {
   cancel: { desc: "Request cancellation (history kept)", nonTerminal: true },
   retry: { desc: "Re-run a finished job as a new linked job [--model slug]", nonTerminal: true },
   submit: { desc: "Submit a job created with --preview", nonTerminal: true },
-  run: { desc: 'Run a workflow: run map-files --file a --file b --prompt "..." [--preview]', nonTerminal: true },
+  run: { desc: "Run a workflow: run <project-workflow> --input data.csv [--preview] | run map-files --file a --prompt \"...\"", nonTerminal: true },
+  workflow: { desc: "Project workflows: workflow list | show <name> | validate <name> | validate --file <path>", nonTerminal: true },
   items: { desc: "List a job's request items", nonTerminal: true },
   item: { desc: "Inspect one item: item <id> <n|custom_id|path> [--text] [--raw]", nonTerminal: true },
   "retry-items": { desc: "Re-run failed/selected items as a new linked job: retry-items <id> --failed | --item n", nonTerminal: true },
@@ -54,6 +56,13 @@ const HELP = `/batch — deferred OpenRouter Batch goals
       --context <path>               include a file or directory (repeatable; excluded files skipped & listed)
       --model <slug>  --account <pi-provider-alias>  --provider <upstream-slug pin>
       --format markdown|json  --preview  --no-instructions
+  workflow list                      built-in and project workflows (.pi/batch-workflows/*.yaml)
+  workflow show <name>               definition summary, hashes, diagnostics
+  workflow validate <name> | --file <path>
+  run <workflow> --input <file> [options]
+                                     one request per dataset row (CSV/JSONL), all in ONE batch
+      --id <source-id> (repeatable)  or  --from-row <n> --to-row <m>
+      --model  --account  --provider  --preview
   run map-files [options] --prompt "<objective>"
                                      one request per file, all in ONE batch
       --file <path> (repeatable)  --context <dir>  --group-size <n>
@@ -167,7 +176,7 @@ export function registerBatchCommand(rt: BatchRuntime): void {
         await dispatch(rt, args, ctx);
       } catch (err) {
         const e = err as Error;
-        const level = err instanceof SubmissionBlockedError || err instanceof DuplicateActiveRequestError ? "warning" : "error";
+        const level = err instanceof SubmissionBlockedError || err instanceof DuplicateActiveRequestError || err instanceof WorkflowNotFoundError ? "warning" : "error";
         rt.notify(e.message, level);
       }
     },
@@ -194,6 +203,9 @@ async function dispatch(rt: BatchRuntime, args: string, ctx: ExtensionCommandCon
     case "run":
     case "plan":
       return cmdRun(rt, rest, ctx, sub === "plan");
+    case "workflow":
+    case "workflows":
+      return cmdWorkflow(rt, rest, ctx);
     case "items":
       return cmdItems(rt, rest, ctx);
     case "item":
@@ -320,6 +332,8 @@ function formatPreview(p: PreparedAsk, previewOnly: boolean): string {
 
 async function cmdSubmit(rt: BatchRuntime, rest: string[]): Promise<void> {
   const id = requireId(rt, rest, "/batch submit <id>");
+  const drift = rt.requireService().workflowDrift(id);
+  if (drift) rt.notify(`⚠ ${drift}`, "warning");
   const job = await rt.requireService().submit(id);
   rt.poller.updateBadge();
   rt.notify(
@@ -520,14 +534,16 @@ async function cmdRetry(rt: BatchRuntime, rest: string[]): Promise<void> {
 async function cmdRun(rt: BatchRuntime, rest: string[], ctx: ExtensionCommandContext, forcePreview: boolean): Promise<void> {
   const service = rt.requireService();
   const parsed = parseArgs(rest, {
-    values: ["model", "account", "provider", "format", "prompt", "group-size"],
-    repeatable: ["file", "context"],
+    values: ["model", "account", "provider", "format", "prompt", "group-size", "input", "from-row", "to-row"],
+    repeatable: ["file", "context", "id"],
     booleans: ["preview", "no-instructions"],
   });
   if (parsed.errors.length > 0) throw new Error(`/batch run: ${parsed.errors.join("; ")}`);
   const [workflow, ...words] = parsed.positionals;
-  if (!workflow) throw new Error('Usage: /batch run map-files --file <path> [--file <path> ...] --prompt "<objective>" [--preview]');
-  if (workflow.toLowerCase() !== "map-files") throw new Error(`Unknown workflow "${workflow}". Available: map-files`);
+  if (!workflow) throw new Error('Usage: /batch run <workflow> --input <file> [--preview]   or   /batch run map-files --file <path> --prompt "<objective>"');
+  if (workflow.toLowerCase() !== "map-files") return runDataset(rt, workflow, parsed, ctx, forcePreview);
+  for (const flag of ["input", "from-row", "to-row"]) if (parsed.values[flag] !== undefined) throw new Error(`--${flag} applies to dataset workflows, not map-files`);
+  if (parsed.lists.id) throw new Error("--id applies to dataset workflows, not map-files");
   const format = (parsed.values.format ?? "markdown").toLowerCase();
   if (format !== "markdown" && format !== "json") throw new Error("--format must be markdown or json");
   const objective = (parsed.values.prompt ?? words.join(" ")).trim();
@@ -572,6 +588,162 @@ async function cmdRun(rt: BatchRuntime, rest: string[], ctx: ExtensionCommandCon
   const job = await service.createWorkflowJob(plan, { previewOnly: false });
   rt.poller.updateBadge();
   notifySubmitted(rt, job, `${job.requestCount} request(s) in one batch`);
+}
+
+function positiveIntFlag(parsed: ParsedArgs, name: string): number | undefined {
+  const raw = parsed.values[name];
+  if (raw === undefined) return undefined;
+  if (!/^\d+$/.test(raw) || Number(raw) < 1) throw new Error(`--${name} must be a positive integer`);
+  return Number(raw);
+}
+
+async function runDataset(rt: BatchRuntime, workflow: string, parsed: ParsedArgs, ctx: ExtensionCommandContext, forcePreview: boolean): Promise<void> {
+  const service = rt.requireService();
+  for (const flag of ["format", "prompt", "group-size"]) if (parsed.values[flag] !== undefined) throw new Error(`--${flag} applies to map-files; a project workflow defines its own prompt and output`);
+  if (parsed.lists.file || parsed.lists.context) throw new Error("--file/--context apply to map-files; give the dataset with --input <file>");
+  if (parsed.booleans.has("no-instructions")) throw new Error("--no-instructions applies to map-files");
+  if (parsed.positionals.length > 1) throw new Error(`/batch run ${workflow}: unexpected argument ${JSON.stringify(parsed.positionals[1])}`);
+  const input = parsed.values.input;
+  if (!input) throw new Error(`Usage: /batch run ${workflow} --input <file.csv|file.jsonl> [--id <source-id> ...] [--from-row n --to-row m] [--preview]`);
+  const prepared = await service.planDataset({
+    workflow,
+    input,
+    ids: parsed.lists.id,
+    fromRow: positiveIntFlag(parsed, "from-row"),
+    toRow: positiveIntFlag(parsed, "to-row"),
+    model: parsed.values.model,
+    account: parsed.values.account,
+    providerPin: parsed.values.provider,
+  });
+  const previewOnly = forcePreview || parsed.booleans.has("preview");
+  const preview = formatDatasetPreview(prepared, previewOnly);
+  if (prepared.blockers.length > 0) {
+    throw new SubmissionBlockedError(`${preview}\n\nPLAN BLOCKED — nothing was saved or sent:\n\n${prepared.blockers.join("\n\n")}`);
+  }
+  if (previewOnly) {
+    const job = await service.createDatasetJob(prepared, { previewOnly: true });
+    rt.notify(`${preview}\n\nPlan saved as ${job.localId} (not submitted).\nInspect: ${service.registry.jobDir(job.localId)}\nSubmit:  /batch submit ${job.localId}`, "info");
+    return;
+  }
+  const config = rt.loaded.config;
+  if (config.submission.requireConfirmation && ctx.hasUI) {
+    if (!(await ctx.ui.confirm(`Submit ${prepared.plan!.items.length} request(s) as one batch?`, preview))) {
+      rt.notify("Submission cancelled; nothing was sent.", "info");
+      return;
+    }
+  } else if (config.submission.showPreview) {
+    rt.notify(preview, "info");
+  }
+  const job = await service.createDatasetJob(prepared, { previewOnly: false });
+  rt.poller.updateBadge();
+  notifySubmitted(rt, job, `${job.requestCount} request(s) in one batch`);
+}
+
+export function formatDatasetPreview(p: PreparedDatasetRun, previewOnly: boolean): string {
+  const def = p.definition;
+  const plan = p.plan;
+  const c = plan?.counts;
+  const sel = p.options.ids?.length
+    ? `--id ${p.options.ids.join(", ")}`
+    : p.options.fromRow !== undefined || p.options.toRow !== undefined
+      ? `rows ${p.options.fromRow ?? 1}-${p.options.toRow ?? "end"}`
+      : "all rows";
+  const lines = [
+    p.blockers.length > 0 ? "Dataset workflow plan (BLOCKED)" : previewOnly ? "Dataset workflow plan (not submitted)" : "Submitting dataset workflow",
+    "",
+    `Workflow:          ${p.options.workflow}${p.entry ? ` (project: ${p.entry.file})` : ""}`,
+    ...(p.entry?.definitionSha256 ? [`Definition:        sha256 ${p.entry.definitionSha256}`] : []),
+  ];
+  if (def && plan) {
+    lines.push(
+      `Dataset:           ${plan.dataset.type} ${plan.dataset.path}  (${plan.dataset.bytes} bytes, sha256 ${plan.dataset.sha256})`,
+      `Selection:         ${sel}`,
+      `Rows:              ${c!.totalRows} parsed · ${c!.selectedRows} selected · ${c!.excludedRows} excluded · ${c!.invalidRows} invalid${c!.blankLines ? ` · ${c!.blankLines} blank line(s) ignored` : ""}`,
+      `Source IDs:        field ${def.input.idField} · ${c!.missingIds} missing · ${c!.duplicateIds} duplicate`,
+      `Requests planned:  ${c!.plannedRequests}`,
+      `Fields sent:       ${def.input.fields.join(", ")}  (only these reach the model; other columns are not read into prompts)`,
+      `Model:             ${p.model}`,
+      `Account:           ${p.account}`,
+      `Provider pin:      ${p.pin ? `${p.pin.only.join(",")} (no fallbacks)` : "none"}`,
+      `Output:            ${def.output.type === "json" ? "json — validated locally against the workflow's JSON Schema; invalid output makes the item corrupt" : "markdown"}`,
+      `Characters:        ${plan.totalCharacters} provider-bound (not a token count; no cost estimate is made)`,
+      `Largest item:      ${plan.largest ? `${plan.largest.characters} characters (${plan.largest.label})` : "-"}`,
+      `Limits (local):    requests ${p.limits.maxRequests} · rows ${p.limits.maxRows} · per item ${p.limits.maxCharactersPerItem} · total ${p.limits.maxTotalCharacters} characters`,
+      `Secrets:           ${plan.secretFindings.length === 0 ? "none detected" : `${plan.secretFindings.length} potential finding(s)`} (scanned: exactly the provider-bound messages)`,
+      `Synthesis:         ${def.synthesis.enabled ? "enabled (run /batch synthesize <id> after it finishes)" : "disabled by the workflow"}`,
+      `Plan SHA-256:      ${plan.planSha256 || "-"}`,
+      `Warnings:          ${p.warnings.length === 0 ? "none" : p.warnings.join("; ")}`,
+    );
+    if (plan.items.length > 0) {
+      lines.push("", "Items:");
+      for (const it of plan.items.slice(0, 30)) lines.push(`  ${String(it.ordinal).padStart(3, "0")}  ${String(it.characters).padStart(8)} chars  ${sourceLabel(it)}`);
+      if (plan.items.length > 30) lines.push(`  … ${plan.items.length - 30} more (all listed in request/dataset.json)`);
+    }
+  }
+  return lines.join("\n");
+}
+
+// ---------------------------------------------------------------- workflow
+
+async function cmdWorkflow(rt: BatchRuntime, rest: string[], ctx: ExtensionCommandContext): Promise<void> {
+  const service = rt.requireService();
+  const parsed = parseArgs(rest, { values: ["file"] });
+  if (parsed.errors.length) throw new Error(`/batch workflow: ${parsed.errors.join("; ")}`);
+  const [action = "list", name] = parsed.positionals;
+  const root = service.workspaceRoot;
+  if (action === "list") {
+    const catalog = discoverWorkflows(root);
+    const lines = ["BUILT-IN", ...BUILTIN_WORKFLOWS.map((b) => `  ${b.name.padEnd(28)} ${b.description}`), "", `PROJECT (${catalog.dir}/)`];
+    if (catalog.entries.length === 0) lines.push("  none");
+    for (const e of catalog.entries) {
+      lines.push(`  ${e.name.padEnd(28)} ${e.valid ? "valid  " : "INVALID"} ${e.valid ? `${e.definition!.input.type} → ${e.definition!.output.type}${e.definition!.description ? `  ${e.definition!.description}` : ""}` : `${e.diagnostics.length} problem(s): /batch workflow validate ${e.name}`}`);
+    }
+    await showText(rt, ctx, "Batch workflows", lines.join("\n"));
+    return;
+  }
+  if (action === "validate") {
+    if (parsed.values.file && name) throw new Error("Use either /batch workflow validate <name> or --file <path>, not both");
+    const entry = parsed.values.file ? validateWorkflowFile(root, parsed.values.file, rt.loaded.config) : name ? findWorkflow(root, name) : undefined;
+    if (!entry) throw new Error("Usage: /batch workflow validate <name> | --file <path>");
+    const warn = entry.warnings.length ? `\nWarnings:\n${formatDiagnostics(entry.warnings)}` : "";
+    if (entry.valid) rt.notify(`✅ ${entry.file} is a valid workflow definition (${entry.name}).\nDefinition SHA-256: ${entry.definitionSha256}\nResolved SHA-256:   ${entry.resolvedSha256}${warn}`, "info");
+    else rt.notify(`❌ ${entry.file} is not a valid workflow definition:\n${formatDiagnostics(entry.diagnostics)}${warn}`, "warning");
+    return;
+  }
+  if (action === "show") {
+    if (!name) throw new Error("Usage: /batch workflow show <name>");
+    const builtin = BUILTIN_WORKFLOWS.find((b) => b.name === name);
+    if (builtin) {
+      await showText(rt, ctx, `Workflow ${name} (built-in)`, `${builtin.description}\n\nUsage: ${builtin.usage}`);
+      return;
+    }
+    const e = findWorkflow(root, name);
+    const lines = [`  File               ${e.file}`, `  Origin             project`, `  Status             ${e.valid ? "valid" : "INVALID"}`, `  Definition SHA-256 ${e.definitionSha256 ?? "-"}`];
+    if (e.valid && e.definition) {
+      const d = e.definition;
+      lines.push(
+        `  Resolved SHA-256   ${e.resolvedSha256}`,
+        `  Description        ${d.description ?? "-"}`,
+        `  Model              ${d.model.default ?? `(config default: ${rt.loaded.config.defaultModel})`}${d.model.provider ? `  pin ${d.model.provider}` : ""}`,
+        `  Input              ${d.input.type}${d.input.delimiter && d.input.delimiter !== "," ? ` (delimiter ${JSON.stringify(d.input.delimiter)})` : ""}, ID field ${d.input.idField}`,
+        `  Fields sent        ${d.input.fields.join(", ")}`,
+        `  Output             ${d.output.type}`,
+        `  Synthesis          ${d.synthesis.enabled ? "enabled" : "disabled"}`,
+        `  Limits             ${Object.keys(d.limits).length ? Object.entries(d.limits).map(([k, v]) => `${k} ${v}`).join(", ") : "config defaults"}`,
+        "",
+        "  Prompt template:",
+        ...d.request.prompt.split("\n").map((l) => `    ${l}`),
+      );
+      if (d.request.system) lines.push("", "  System prompt:", ...d.request.system.split("\n").map((l) => `    ${l}`));
+      if (d.output.type === "json") lines.push("", "  Output schema:", ...JSON.stringify(d.output.schema, null, 2).split("\n").map((l) => `    ${l}`));
+    } else {
+      lines.push("", "  Problems:", formatDiagnostics(e.diagnostics));
+    }
+    if (e.warnings.length) lines.push("", "  Warnings:", formatDiagnostics(e.warnings));
+    await showText(rt, ctx, `Workflow ${name}`, lines.join("\n"));
+    return;
+  }
+  throw new Error(`Unknown workflow action "${action}". Use: /batch workflow list | show <name> | validate <name> | validate --file <path>`);
 }
 
 function formatPlanPreview(p: PreparedPlan, previewOnly: boolean): string {

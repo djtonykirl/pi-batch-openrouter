@@ -11,15 +11,24 @@ import { normalizeBatchModelSlug } from "./models.js";
 import { OpenRouterBatchClient, OpenRouterError, type RawExchange } from "./openrouter/client.js";
 import { normaliseBatchResult, type NormalisedBatchResult } from "./openrouter/normalise-result.js";
 import { buildSubmitBody, submitBodyProblems, type BatchRequestItem, type ChatMessage, type ProviderPin, type SubmitBody } from "./openrouter/types.js";
+import { compileOutputSchema, type OutputValidator } from "./workflows/structured.js";
+import { findWorkflow, formatDiagnostics, type WorkflowDefinition, type WorkflowEntry } from "./workflows/definition.js";
+import { planDatasetRun, type DatasetPlan, type EffectiveLimits } from "./workflows/dataset-run.js";
+import { resolveWorkspaceInput } from "./workspace-paths.js";
 import { JobRegistry, JobUpdate } from "./registry.js";
 import { ACTIVE_STATUSES, POLLABLE_STATUSES, TERMINAL_STATUSES, type LocalStatus } from "./state.js";
 import { formatIsoShort, isoToEpochMs, nowIso, parseProviderTimestamp } from "./time.js";
 import {
+  DATASET_MANIFEST_SCHEMA_VERSION,
   MANIFEST_SCHEMA_VERSION,
+  isDatasetWorkflow,
+  type DatasetSelection,
+  type DatasetWorkflowInfo,
   type ItemSource,
   type JobItem,
   type JobKind,
   type JobManifest,
+  type MapFilesWorkflowInfo,
   type SynthesisLinkage,
   type WorkflowInfo,
 } from "./types.js";
@@ -72,7 +81,7 @@ export interface PlannedItem {
 }
 
 export interface PreparedPlan {
-  workflow: WorkflowInfo;
+  workflow: MapFilesWorkflowInfo;
   options: MapFilesOptions;
   model: string;
   account: string;
@@ -103,6 +112,37 @@ export interface PreparedSynthesis {
   characters: number;
   contentSha256: string;
   blockers: string[];
+}
+
+export interface DatasetRunOptions {
+  /** Project workflow name (.pi/batch-workflows/<name>.yaml). */
+  workflow: string;
+  /** Workspace-relative dataset path. */
+  input: string;
+  ids?: string[];
+  fromRow?: number;
+  toRow?: number;
+  model?: string;
+  account?: string;
+  /** Upstream provider pin; overrides the workflow's model.provider. */
+  providerPin?: string;
+}
+
+export interface PreparedDatasetRun {
+  options: DatasetRunOptions;
+  /** The catalog entry, valid or not (diagnostics are blockers). */
+  entry?: WorkflowEntry;
+  definition?: WorkflowDefinition;
+  model: string;
+  account: string;
+  pin?: ProviderPin;
+  maxTokens: number;
+  limits: EffectiveLimits;
+  plan?: DatasetPlan;
+  objective: string;
+  contentSha256: string;
+  blockers: string[];
+  warnings: string[];
 }
 
 export class SubmissionBlockedError extends Error {
@@ -151,7 +191,18 @@ interface JobDraft {
   account: string;
   pin?: ProviderPin;
   format: "markdown" | "json";
-  items: Array<{ source: ItemSource; body: BatchRequestItem["body"]; characters: number; prompt: string; replaces?: JobItem["replaces"] }>;
+  items: Array<{
+    source: ItemSource;
+    body: BatchRequestItem["body"];
+    characters: number;
+    prompt: string;
+    replaces?: JobItem["replaces"];
+    inputSha256?: string;
+    /** Extra fields for request/items/NNN/metadata.json (e.g. the selected dataset values). */
+    metadata?: Record<string, unknown>;
+  }>;
+  /** Defaults to MANIFEST_SCHEMA_VERSION; dataset jobs (and their retries) use DATASET_MANIFEST_SCHEMA_VERSION. */
+  schemaVersion?: JobManifest["schemaVersion"];
   context: JobManifest["context"];
   warnings: string[];
   parentJobId?: string;
@@ -182,6 +233,10 @@ export class BatchService {
 
   public get registry(): JobRegistry {
     return this.deps.registry;
+  }
+
+  public get workspaceRoot(): string {
+    return this.deps.workspaceRoot;
   }
 
   private client(apiKey: string): OpenRouterBatchClient {
@@ -336,12 +391,14 @@ export class BatchService {
           source: it.source,
           characters: it.characters,
           requestSha256: itemShas[i],
+          ...(it.inputSha256 ? { inputSha256: it.inputSha256 } : {}),
           ...(it.replaces ? { replaces: it.replaces } : {}),
+          ...(it.metadata ?? {}),
         });
       });
       draft.writeArtefacts(localId, customIds, itemShas);
       return {
-        schemaVersion: MANIFEST_SCHEMA_VERSION,
+        schemaVersion: draft.schemaVersion ?? MANIFEST_SCHEMA_VERSION,
         localId,
         kind: draft.kind,
         ...(draft.parentJobId ? { parentJobId: draft.parentJobId } : {}),
@@ -363,6 +420,7 @@ export class BatchService {
           source: it.source,
           requestSha256: itemShas[i],
           characters: it.characters,
+          ...(it.inputSha256 ? { inputSha256: it.inputSha256 } : {}),
           status: "planned" as const,
           ...(it.replaces ? { replaces: it.replaces } : {}),
         })),
@@ -397,7 +455,7 @@ export class BatchService {
     const account = options.account ?? config.defaultAccount;
     const pin: ProviderPin | undefined = options.providerPin ? { only: [options.providerPin], allow_fallbacks: false } : undefined;
     const groupSize = options.groupSize ?? 1;
-    const workflow: WorkflowInfo = { name: MAP_FILES.name, version: MAP_FILES.version, options: { groupSize, format: options.format, includeInstructions: options.includeInstructions } };
+    const workflow: MapFilesWorkflowInfo = { name: MAP_FILES.name, version: MAP_FILES.version, options: { groupSize, format: options.format, includeInstructions: options.includeInstructions } };
 
     const pkg = buildContextPackage({
       workspaceRoot: this.deps.workspaceRoot,
@@ -510,6 +568,204 @@ export class BatchService {
     return this.submit(job.localId, { skipDuplicateCheck: true });
   }
 
+  // ------------------------------------------------------ dataset workflows
+
+  /**
+   * Plans a project workflow over a CSV/JSONL dataset. Nothing is persisted;
+   * `blockers` must be empty to create a job. Workflow diagnostics, unsafe input
+   * paths, identity/field problems, limits and secret findings are all blockers.
+   */
+  public async planDataset(options: DatasetRunOptions): Promise<PreparedDatasetRun> {
+    const config = this.deps.getConfig();
+    const blockers: string[] = [];
+    const warnings: string[] = [];
+    const account = options.account ?? config.defaultAccount;
+    const base = {
+      options,
+      account,
+      model: normalizeBatchModelSlug(options.model ?? config.defaultModel),
+      maxTokens: config.request.maxTokens,
+      limits: {
+        maxRequests: config.workflows.maxRequestsPerBatch,
+        maxRows: config.workflows.maxRowsPerRun,
+        maxCharactersPerItem: config.workflows.maxCharactersPerItem,
+        maxTotalCharacters: config.workflows.maxTotalCharacters,
+      },
+      objective: `Workflow ${options.workflow} over ${options.input}`,
+      contentSha256: "",
+      blockers,
+      warnings,
+    };
+
+    const entry = findWorkflow(this.deps.workspaceRoot, options.workflow); // throws WorkflowNotFoundError
+    if (!entry.valid || !entry.definition) {
+      blockers.push(`workflow ${JSON.stringify(entry.name)} is invalid:\n${formatDiagnostics(entry.diagnostics)}`);
+      return { ...base, entry };
+    }
+    const def = entry.definition;
+    const model = normalizeBatchModelSlug(options.model ?? def.model.default ?? config.defaultModel);
+    const pinSlug = options.providerPin ?? def.model.provider;
+    const pin: ProviderPin | undefined = pinSlug ? { only: [pinSlug], allow_fallbacks: false } : undefined;
+    const maxTokens = def.request.maxTokens ?? config.request.maxTokens;
+    // Workflow limits can only tighten the local configuration, never loosen it.
+    const min = (a: number, b?: number) => (b === undefined ? a : Math.min(a, b));
+    const limits: EffectiveLimits = {
+      maxRequests: min(config.workflows.maxRequestsPerBatch, def.limits.maxRequests),
+      maxRows: min(config.workflows.maxRowsPerRun, def.limits.maxRows),
+      maxCharactersPerItem: min(config.workflows.maxCharactersPerItem, def.limits.maxCharactersPerItem),
+      maxTotalCharacters: min(config.workflows.maxTotalCharacters, def.limits.maxTotalCharacters),
+    };
+    const ready = { ...base, entry, definition: def, model, pin, maxTokens, limits };
+
+    const input = resolveWorkspaceInput(this.deps.workspaceRoot, options.input, config, { what: "dataset", maxBytes: config.workflows.maxDatasetBytes });
+    if (!input.ok) {
+      blockers.push(input.message);
+      return ready;
+    }
+    const ext = input.relPath.toLowerCase().split(".").pop();
+    const expected = def.input.type === "csv" ? ["csv", "tsv", "txt"] : ["jsonl", "ndjson", "txt"];
+    if (ext && !expected.includes(ext)) warnings.push(`dataset ${input.relPath} does not have a .${def.input.type} extension; parsed as ${def.input.type} because the workflow says so`);
+
+    const selection: DatasetSelection = {
+      ...(options.ids && options.ids.length ? { ids: [...options.ids] } : {}),
+      ...(options.fromRow !== undefined ? { fromRow: options.fromRow } : {}),
+      ...(options.toRow !== undefined ? { toRow: options.toRow } : {}),
+    };
+    const plan = planDatasetRun({
+      definition: def,
+      resolvedSha256: entry.resolvedSha256!,
+      dataset: { relPath: input.relPath, bytes: fs.readFileSync(input.absPath) },
+      selection,
+      model,
+      pin,
+      maxTokens,
+      limits,
+      security: { scanSecrets: config.security.scanSecrets, blockOnSecret: config.security.blockOnSecret, knownSecrets: await this.knownSecrets(account) },
+    });
+    blockers.push(...plan.blockers);
+    warnings.push(...entry.warnings.map((w) => `${w.path}: ${w.message}`), ...plan.warnings);
+    const contentSha256 = contentHash(buildSubmitBody({ model, provider: pin, requests: plan.items.map((it) => ({ custom_id: "{custom_id}", body: it.body })) }));
+    const objective = `Workflow ${def.name} over ${input.relPath}${def.description ? ` — ${def.description}` : ""}`;
+    return { ...ready, plan, objective, contentSha256 };
+  }
+
+  public async createDatasetJob(prepared: PreparedDatasetRun, opts: { previewOnly: boolean }): Promise<JobManifest> {
+    const { plan, entry, definition: def } = prepared;
+    if (prepared.blockers.length > 0 || !plan || !entry || !def) throw new SubmissionBlockedError(prepared.blockers.join("\n\n") || "the dataset plan is incomplete");
+    this.assertNoActiveDuplicate(prepared.contentSha256, opts.previewOnly);
+    const info: DatasetWorkflowInfo = {
+      name: def.name,
+      version: def.schemaVersion,
+      origin: "project",
+      definitionFile: entry.file,
+      definitionSha256: entry.definitionSha256!,
+      resolvedSha256: entry.resolvedSha256!,
+      output: def.output.type,
+      synthesisEnabled: def.synthesis.enabled,
+      dataset: plan.dataset,
+      selection: plan.selection,
+      planSha256: plan.planSha256,
+    };
+    const job = this.persistJob({
+      kind: "workflow",
+      schemaVersion: DATASET_MANIFEST_SCHEMA_VERSION,
+      objective: prepared.objective,
+      model: prepared.model,
+      account: prepared.account,
+      pin: prepared.pin,
+      format: def.output.type,
+      items: plan.items.map((it) => ({
+        source: it.source,
+        body: it.body,
+        characters: it.characters,
+        prompt: it.prompt,
+        inputSha256: it.inputSha256,
+        metadata: { selectedFields: it.values },
+      })),
+      context: { fileCount: 1, characters: plan.totalCharacters, excludedCount: 0 },
+      warnings: [...prepared.warnings],
+      retryCount: 0,
+      workflow: info,
+      writeArtefacts: (localId, customIds, itemShas) => {
+        atomicWriteFile(this.registry.artefact(localId, "objective"), prepared.objective + "\n");
+        // Exact definition bytes: the job stays understandable after the file changes.
+        atomicWriteFile(this.registry.artefact(localId, "workflowSource"), entry.bytes!);
+        atomicWriteJson(this.registry.artefact(localId, "workflowResolved"), {
+          name: def.name,
+          origin: "project",
+          definitionFile: entry.file,
+          definitionSha256: entry.definitionSha256,
+          resolvedSha256: entry.resolvedSha256,
+          definition: def,
+          effective: { model: prepared.model, providerPin: prepared.pin ?? null, maxTokens: prepared.maxTokens, limits: prepared.limits },
+        });
+        atomicWriteJson(this.registry.artefact(localId, "dataset"), {
+          dataset: plan.dataset,
+          selection: plan.selection,
+          counts: plan.counts,
+          planSha256: plan.planSha256,
+          // Source mapping: logical source ID <-> provider custom_id, never the same value.
+          items: plan.items.map((it, i) => ({
+            ordinal: it.ordinal,
+            customId: customIds[i],
+            sourceId: it.source.sourceId,
+            ...(it.source.row !== undefined ? { row: it.source.row } : {}),
+            ...(it.source.line !== undefined ? { line: it.source.line } : {}),
+            inputSha256: it.inputSha256,
+            requestSha256: itemShas[i],
+            characters: it.characters,
+          })),
+          createdAt: nowIso(),
+        });
+        atomicWriteJson(this.registry.artefact(localId, "plan"), {
+          workflow: { name: def.name, origin: "project", definitionSha256: entry.definitionSha256, resolvedSha256: entry.resolvedSha256 },
+          objective: prepared.objective,
+          model: prepared.model,
+          account: prepared.account,
+          providerPin: prepared.pin ?? null,
+          format: def.output.type,
+          totals: { requests: plan.items.length, ...plan.counts, characters: plan.totalCharacters, largestItem: plan.largest ?? null },
+          limits: prepared.limits,
+          items: plan.items.map((it, i) => ({ ordinal: it.ordinal, customId: customIds[i], source: it.source, characters: it.characters, requestSha256: itemShas[i] })),
+          createdAt: nowIso(),
+        });
+      },
+      previewDetails: { workflow: def.name, requests: plan.items.length, rows: plan.counts.selectedRows, characters: plan.totalCharacters, planSha256: plan.planSha256 },
+    });
+    if (opts.previewOnly) return job;
+    return this.submit(job.localId, { skipDuplicateCheck: true });
+  }
+
+  /**
+   * For a previewed dataset job: a note when the workflow file differs from the one
+   * the preview was built from. The stored request is still what gets submitted.
+   */
+  public workflowDrift(localId: string): string | undefined {
+    const job = this.registry.read(localId);
+    const w = job.workflow;
+    if (!isDatasetWorkflow(w)) return undefined;
+    const abs = path.join(this.deps.workspaceRoot, ...w.definitionFile.split("/"));
+    const current = fs.existsSync(abs) ? sha256Hex(fs.readFileSync(abs)) : undefined;
+    if (current === w.definitionSha256) return undefined;
+    return current === undefined
+      ? `The workflow file ${w.definitionFile} no longer exists. ${localId} submits the request stored at preview time.`
+      : `The workflow file ${w.definitionFile} has changed since ${localId} was previewed. The request stored at preview time is submitted unchanged; create a new preview to use the new definition.`;
+  }
+
+  /** The output validator of a JSON dataset job, from the definition stored WITH the job (never the current file). */
+  private outputValidator(job: JobManifest): OutputValidator | undefined {
+    if (!isDatasetWorkflow(job.workflow) || job.workflow.output !== "json") return undefined;
+    try {
+      const stored = JSON.parse(fs.readFileSync(this.registry.artefact(job.localId, "workflowResolved"), "utf8")) as { definition: WorkflowDefinition };
+      const out = stored.definition.output;
+      const compiled = out.type === "json" ? compileOutputSchema(out.schema) : undefined;
+      if (compiled?.ok) return compiled.validate;
+    } catch {
+      // fall through: never treat output as valid without its schema
+    }
+    return () => ["the job's stored output schema (request/workflow.json) is missing or unusable; output cannot be validated"];
+  }
+
   // --------------------------------------------------------------- submit
 
   /** previewed -> submitting -> submitted | failed. Persists `submitting` BEFORE the HTTP call. */
@@ -540,7 +796,14 @@ export class BatchService {
       if (!apiKey) {
         throw new Error(`Missing API key for account "${job.account}". Configure it in Pi (auth.json) or set OPENROUTER_API_KEY. Job ${localId} stays previewed.`);
       }
-      this.registry.update(localId, (u) => u.transition("submitting"));
+      const drift = this.workflowDrift(localId);
+      this.registry.update(localId, (u) => {
+        if (drift) {
+          u.note("workflow_changed_since_preview", { definitionFile: isDatasetWorkflow(job.workflow) ? job.workflow.definitionFile : undefined });
+          if (!u.manifest.warnings.includes(drift)) u.manifest.warnings.push(drift);
+        }
+        u.transition("submitting");
+      });
       this.logger.log("info", "submit_start", { localId, model: job.model, requests: body.requests.length });
 
       try {
@@ -795,6 +1058,7 @@ export class BatchService {
       expectedCustomIds: job.customIds,
       // Release 1 jobs never validated JSON output; keep their semantics.
       format: job.schemaVersion >= 2 ? job.format : "markdown",
+      validateJson: this.outputValidator(job),
     });
   }
 
@@ -919,6 +1183,8 @@ export class BatchService {
       atomicWriteJson(this.registry.itemArtefact(localId, ordinal, "resultJson"), { ordinal, ...rest, batchOutcome: n.outcome, finalResponseFile });
       if (item.status === "completed" && n.outcome !== "corrupt") {
         atomicWriteFile(this.registry.itemArtefact(localId, ordinal, "resultMd"), item.text!.trimEnd() + "\n");
+        // Parsed, schema-valid JSON is stored separately from the raw text.
+        if (item.json !== undefined) atomicWriteJson(this.registry.itemArtefact(localId, ordinal, "output"), item.json);
       }
     }
     atomicWriteJson(this.registry.artefact(localId, "resultSummary"), {
@@ -1107,7 +1373,11 @@ export class BatchService {
         characters: item.characters ?? promptOf(body).length,
         prompt: promptOf(body),
         replaces: { jobId: localId, customId: item.customId, ordinal: item.ordinal },
+        ...(item.inputSha256 ? { inputSha256: item.inputSha256 } : {}),
+        metadata: this.inheritedItemMetadata(localId, item.ordinal),
       })),
+      // A retry of a dataset job is a dataset job: same schema version, same stored workflow.
+      ...(source.schemaVersion === DATASET_MANIFEST_SCHEMA_VERSION ? { schemaVersion: DATASET_MANIFEST_SCHEMA_VERSION } : {}),
       context:
         opts.mode === "items"
           ? {
@@ -1124,7 +1394,7 @@ export class BatchService {
       ...(source.synthesis ? { synthesis: source.synthesis } : {}),
       writeArtefacts: (newId, customIds) => {
         atomicWriteFile(this.registry.artefact(newId, "objective"), objective);
-        for (const name of ["context", "contextManifest", "synthesisLinkage"] as const) {
+        for (const name of ["context", "contextManifest", "synthesisLinkage", "workflowSource", "workflowResolved", "dataset"] as const) {
           const from = this.registry.artefact(localId, name);
           if (fs.existsSync(from)) fs.copyFileSync(from, this.registry.artefact(newId, name));
         }
@@ -1148,6 +1418,16 @@ export class BatchService {
     this.logger.log("info", "retry_created", { localId: child.localId, parentJobId: localId, mode: opts.mode, requests: bodies.length });
     if (opts.previewOnly) return child;
     return this.submit(child.localId, { skipDuplicateCheck: true });
+  }
+
+  /** Dataset provenance a retried item keeps from its parent (selected values), without re-reading the dataset. */
+  private inheritedItemMetadata(jobId: string, ordinal: number): Record<string, unknown> | undefined {
+    try {
+      const meta = JSON.parse(fs.readFileSync(this.registry.itemArtefact(jobId, ordinal, "metadata"), "utf8")) as { selectedFields?: unknown };
+      return meta.selectedFields !== undefined ? { selectedFields: meta.selectedFields } : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   // ------------------------------------------------------------ synthesis
@@ -1181,6 +1461,9 @@ export class BatchService {
     const source = this.registry.read(sourceJobId);
     if (source.kind === "synthesis") throw new Error(`${sourceJobId} is itself a synthesis job; synthesize its source job instead.`);
     if (!TERMINAL_STATUSES.has(source.localStatus)) throw new Error(`${sourceJobId} is ${source.localStatus}; wait until it has finished.`);
+    if (isDatasetWorkflow(source.workflow) && !source.workflow.synthesisEnabled) {
+      throw new Error(`${sourceJobId} was created by workflow ${JSON.stringify(source.workflow.name)}, which has synthesis disabled (synthesis.enabled: false in the definition stored with the job).`);
+    }
     const model = normalizeBatchModelSlug(opts.model ?? config.defaultModel);
     const account = opts.account ?? source.account;
     const pin: ProviderPin | undefined = opts.providerPin ? { only: [opts.providerPin], allow_fallbacks: false } : undefined;
@@ -1352,6 +1635,8 @@ export class BatchService {
       ["Item", `${it.ordinal} of ${items.length}`],
       ["Custom ID", it.customId],
       ["Source", sourceLabel(it)],
+      ["Source ID", it.source.kind === "row" ? `${it.source.sourceId} (${it.source.file}${it.source.row !== undefined ? ` row ${it.source.row}` : ` line ${it.source.line}`})` : undefined],
+      ["Input SHA-256", it.inputSha256],
       ["Item status", it.status],
       ["Batch status", `${job.localStatus}${job.providerStatus ? ` (provider: ${job.providerStatus})` : ""}`],
       ["Validation", it.validation ? (it.validation.valid ? "valid" : `invalid — ${it.validation.errors.join("; ")}`) : undefined],
@@ -1363,6 +1648,7 @@ export class BatchService {
       ["Request SHA-256", it.requestSha256],
       ["Request", fs.existsSync(this.registry.itemArtefact(localId, it.ordinal, "request")) ? this.registry.itemArtefact(localId, it.ordinal, "request") : this.registry.artefact(localId, "submittedRequest")],
       ["Result", fs.existsSync(resultMd) ? resultMd : undefined],
+      ["Parsed JSON", fs.existsSync(this.registry.itemArtefact(localId, it.ordinal, "output")) ? this.registry.itemArtefact(localId, it.ordinal, "output") : undefined],
     ];
     const lines = rows.filter(([, v]) => v !== undefined && v !== "").map(([k, v]) => `  ${k.padEnd(16)} ${v}`);
     if (it.status === "completed" && !trusted) lines.push("", "⚠ The batch response could not be correlated safely (corrupt); this item's text is not presented.");

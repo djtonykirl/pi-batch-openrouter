@@ -20,9 +20,10 @@ import type { JobEvent, JobManifest } from "./types.js";
  *       request/  objective.md, context.md, context-manifest.json, submitted-request.json, request.sha256,
  *                 plan.json (workflows), synthesis-linkage.json (synthesis jobs)
  *       request/items/001/  metadata.json, request.json, request.sha256, prompt.md     (Release 2)
+ *       request/  workflow.yaml, workflow.json, dataset.json                         (Release 3 dataset jobs)
  *       provider/ submission-response.json, latest-status.json, final-response.json
  *       result/   result.md, result.json, metadata.json, summary.json, unexpected.json
- *       result/items/001/   raw.json, result.json, result.md                          (Release 2)
+ *       result/items/001/   raw.json, result.json, result.md, output.json (parsed JSON; Release 3)
  *
  * Item folders are named by ordinal, not custom_id: Release 1 custom_ids could
  * contain ':' which is not a valid Windows file name character.
@@ -52,6 +53,9 @@ export const ARTEFACTS = {
   synthesisLinkage: "request/synthesis-linkage.json",
   resultSummary: "result/summary.json",
   resultUnexpected: "result/unexpected.json",
+  workflowSource: "request/workflow.yaml",
+  workflowResolved: "request/workflow.json",
+  dataset: "request/dataset.json",
 } as const;
 
 export const ITEM_ARTEFACTS = {
@@ -62,6 +66,7 @@ export const ITEM_ARTEFACTS = {
   raw: "raw.json",
   resultJson: "result.json",
   resultMd: "result.md",
+  output: "output.json",
 } as const;
 
 const ITEM_SIDE: Record<keyof typeof ITEM_ARTEFACTS, "request" | "result"> = {
@@ -72,6 +77,7 @@ const ITEM_SIDE: Record<keyof typeof ITEM_ARTEFACTS, "request" | "result"> = {
   raw: "result",
   resultJson: "result",
   resultMd: "result",
+  output: "result",
 };
 
 export function itemFolder(ordinal: number): string {
@@ -189,7 +195,7 @@ export class JobRegistry {
       throw new CorruptManifestError(localId, (err as Error).message);
     }
     const m = parsed as Partial<JobManifest>;
-    if (!m || m.localId !== localId || !isLocalStatus(m.localStatus) || (m.schemaVersion !== 1 && m.schemaVersion !== 2)) {
+    if (!m || m.localId !== localId || !isLocalStatus(m.localStatus) || (m.schemaVersion !== 1 && m.schemaVersion !== 2 && m.schemaVersion !== 3)) {
       throw new CorruptManifestError(localId, "missing or invalid localId/localStatus/schemaVersion");
     }
     return m as JobManifest;

@@ -1,3 +1,5 @@
+import { extractJsonObject, type OutputValidator } from "../workflows/structured.js";
+
 /**
  * Raw OpenRouter batch object -> internal NormalisedBatchResult.
  *
@@ -27,6 +29,8 @@ export interface NormalisedBatchItem {
   customId: string;
   status: NormalisedItemStatus;
   text?: string;
+  /** Parsed JSON object (format json), also kept for schema-invalid items as evidence. */
+  json?: Record<string, unknown>;
   finishReason?: string;
   generationId?: string;
   /** The provider's result entry, verbatim (absent for "missing"). */
@@ -99,6 +103,8 @@ export interface NormaliseExpectations {
   expectedCustomIds: string[];
   /** When "json", completed text must parse to a JSON object, else the item is corrupt. */
   format?: "markdown" | "json";
+  /** Release 3 JSON workflows: schema errors for a parsed object (empty = valid); errors make the item corrupt. */
+  validateJson?: OutputValidator;
 }
 
 const num = (v: unknown): number | undefined => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
@@ -144,25 +150,7 @@ function extractText(content: unknown): { ok: true; text?: string } | { ok: fals
 const valid = (warnings: string[] = []): ItemValidation => ({ valid: true, errors: [], warnings });
 const invalid = (error: string, warnings: string[] = []): ItemValidation => ({ valid: false, errors: [error], warnings });
 
-/** Strict: one JSON object, optionally wrapped in a single ``` fence (reported as a warning). */
-function validateJsonText(text: string): { ok: true; warning?: string } | { ok: false; error: string } {
-  let body = text.trim();
-  let warning: string | undefined;
-  const fence = /^```(?:json)?\s*\n([\s\S]*?)\n```$/i.exec(body);
-  if (fence) {
-    body = fence[1]!.trim();
-    warning = "JSON output was wrapped in a code fence";
-  }
-  try {
-    const parsed: unknown = JSON.parse(body);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { ok: false, error: "output is valid JSON but not a JSON object" };
-    return { ok: true, warning };
-  } catch {
-    return { ok: false, error: "output is not valid JSON (format=json was requested)" };
-  }
-}
-
-function normaliseItem(raw: Record<string, unknown>, customId: string, resultIndex: number, format: "markdown" | "json"): NormalisedBatchItem {
+function normaliseItem(raw: Record<string, unknown>, customId: string, resultIndex: number, format: "markdown" | "json", validateJson?: OutputValidator): NormalisedBatchItem {
   const base = { customId, raw, resultIndex };
   const error = extractError(raw.error);
   if (error) return { ...base, status: "failed", error, validation: invalid(`provider error: ${error.message}`) };
@@ -212,11 +200,21 @@ function normaliseItem(raw: Record<string, unknown>, customId: string, resultInd
   if (finishReason === "length") warnings.push("output may be truncated (finish_reason: length)");
   else if (finishReason && finishReason !== "stop" && finishReason !== "end_turn") warnings.push(`unusual finish_reason: ${finishReason}`);
   if (format === "json") {
-    const j = validateJsonText(text);
+    // Strict extraction (whole text, or one outer fence); see workflows/structured.ts.
+    const j = extractJsonObject(text);
     if (!j.ok) {
       return { ...base, ...extra, text, status: "corrupt", error: { code: "invalid_json", message: j.error }, validation: invalid(j.error, warnings) };
     }
-    if (j.warning) warnings.push(j.warning);
+    if (j.fenced) warnings.push("JSON output was wrapped in a code fence");
+    if (validateJson) {
+      const errors = validateJson(j.value);
+      if (errors.length > 0) {
+        const message = `output does not match the workflow's JSON Schema: ${errors.slice(0, 3).join("; ")}${errors.length > 3 ? `; … (${errors.length} errors)` : ""}`;
+        // The parsed value is kept as evidence; the item is not usable.
+        return { ...base, ...extra, text, json: j.value, status: "corrupt", error: { code: "schema_invalid", message }, validation: { valid: false, errors, warnings } };
+      }
+    }
+    return { ...base, ...extra, text, json: j.value, status: "completed", validation: valid(warnings) };
   }
   return { ...base, ...extra, text, status: "completed", validation: valid(warnings) };
 }
@@ -303,7 +301,7 @@ export function normaliseBatchResult(rawText: string, expect: NormaliseExpectati
       base.unexpected.push({ resultIndex: i, customId, reason: "unknown_custom_id", raw: entry });
       continue;
     }
-    byId.set(customId, normaliseItem(item, customId, i, format));
+    byId.set(customId, normaliseItem(item, customId, i, format, expect.validateJson));
   }
 
   // Submission order, independent of result order.

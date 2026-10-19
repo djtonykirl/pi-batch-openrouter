@@ -13,9 +13,14 @@ import type { LocalStatus } from "./state.js";
  *   1  Release 1: single-request goals. No `kind`, `items`, `workflow`, `synthesis`.
  *      Read as-is and never rewritten to v2; `jobItems()` derives a one-item view.
  *   2  Release 2: adds per-item inventory and workflow/synthesis linkage.
+ *   3  Release 3: dataset workflow jobs (project workflow + CSV/JSONL rows, optional
+ *      JSON Schema output validation). Only these jobs (and their retries) are written
+ *      as v3, so a Release 2 build reports them as unreadable instead of retrieving
+ *      them without schema validation. Every other new job is still written as v2.
  */
 export const MANIFEST_SCHEMA_VERSION = 2;
-export type ManifestSchemaVersion = 1 | 2;
+export const DATASET_MANIFEST_SCHEMA_VERSION = 3;
+export type ManifestSchemaVersion = 1 | 2 | 3;
 
 export type JobKind = "goal" | "workflow" | "synthesis";
 
@@ -33,13 +38,21 @@ export const ITEM_STATUSES = ["planned", "submitted", "completed", "failed", "co
 export type ItemStatus = (typeof ITEM_STATUSES)[number];
 
 export interface ItemSource {
-  /** goal: an `/batch ask` request; file/group: map-files; synthesis: a synthesis request. */
-  kind: "goal" | "file" | "group" | "synthesis";
+  /** goal: an `/batch ask` request; file/group: map-files; row: a dataset row; synthesis: a synthesis request. */
+  kind: "goal" | "file" | "group" | "row" | "synthesis";
   /** Workspace-relative path (kind "file"). */
   path?: string;
   /** Workspace-relative paths (kind "group", or the files of a goal). */
   paths?: string[];
   label?: string;
+  /** kind "row": the stable logical source ID (from the workflow's idField; never the provider custom_id). */
+  sourceId?: string;
+  /** kind "row": workspace-relative dataset path. */
+  file?: string;
+  /** kind "row": 1-based CSV data record (header excluded). */
+  row?: number;
+  /** kind "row": 1-based physical JSONL line. */
+  line?: number;
 }
 
 export interface JobItem {
@@ -51,6 +64,8 @@ export interface JobItem {
   requestSha256?: string;
   /** Characters of the user prompt for this item (not tokens). */
   characters?: number;
+  /** Dataset rows: SHA-256 of the canonical selected input (source ID + selected field values). */
+  inputSha256?: string;
   status: ItemStatus;
   validation?: { valid: boolean; errors: string[]; warnings: string[] };
   error?: { code?: string; message: string };
@@ -61,10 +76,63 @@ export interface JobItem {
   replaces?: { jobId: string; customId: string; ordinal: number };
 }
 
-export interface WorkflowInfo {
+export type WorkflowInfo = MapFilesWorkflowInfo | DatasetWorkflowInfo;
+
+export interface MapFilesWorkflowInfo {
   name: "map-files";
   version: 1;
   options: { groupSize: number; format: "markdown" | "json"; includeInstructions: boolean };
+}
+
+/**
+ * A project workflow run over a dataset. The full resolved definition, a verbatim
+ * copy of the YAML and the dataset mapping are request artefacts
+ * (request/workflow.json, request/workflow.yaml, request/dataset.json); the
+ * manifest keeps the identity and the facts needed for summaries.
+ */
+export interface DatasetWorkflowInfo {
+  name: string;
+  /** The workflow definition's schemaVersion. */
+  version: 1;
+  origin: "project";
+  /** Workspace-relative path of the definition when the job was planned. */
+  definitionFile: string;
+  /** SHA-256 of the definition file bytes. */
+  definitionSha256: string;
+  /** SHA-256 of the canonical resolved definition. */
+  resolvedSha256: string;
+  output: "markdown" | "json";
+  synthesisEnabled: boolean;
+  dataset: DatasetInfo;
+  selection: DatasetSelection;
+  /** SHA-256 of the logical plan (source IDs, request hashes, model, pin); equal for identical inputs. */
+  planSha256: string;
+}
+
+export interface DatasetInfo {
+  type: "csv" | "jsonl";
+  /** Workspace-relative path. */
+  path: string;
+  sha256: string;
+  bytes: number;
+  idField: string;
+  fields: string[];
+  totalRows: number;
+  selectedRows: number;
+  excludedRows: number;
+  invalidRows: number;
+  blankLines: number;
+}
+
+export interface DatasetSelection {
+  /** Stable source IDs given with --id, in the order given (planning uses dataset order). */
+  ids?: string[];
+  fromRow?: number;
+  toRow?: number;
+}
+
+export function isDatasetWorkflow(w: WorkflowInfo | undefined): w is DatasetWorkflowInfo {
+  return !!w && (w as DatasetWorkflowInfo).origin === "project";
 }
 
 export interface SynthesisSourceRef {
