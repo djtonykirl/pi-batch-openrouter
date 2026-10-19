@@ -8,6 +8,7 @@ import { INJECTED_MESSAGE_TYPE, type BatchRuntime } from "./runtime.js";
 import { jobItems, sourceLabel } from "./items.js";
 import { CHECK_LOCK_WAIT_MS, DuplicateActiveRequestError, SubmissionBlockedError, formatUsage, itemCounts, type InjectMode, type PreparedAsk, type PreparedDatasetRun, type PreparedPlan, type PreparedSynthesis } from "./service.js";
 import { cmdBatchArtifact } from "./artifact-commands.js";
+import { cmdMetadata } from "./metadata-commands.js";
 import { ArtifactError } from "./artifacts/service.js";
 import { formatLegacyInventory } from "./legacy.js";
 import { BUILTIN_WORKFLOWS, WorkflowNotFoundError, discoverWorkflows, findWorkflow, formatDiagnostics, validateWorkflowFile } from "./workflows/definition.js";
@@ -31,6 +32,7 @@ const SUBCOMMANDS: Record<string, { desc: string; nonTerminal: boolean }> = {
   workflow: { desc: "Project workflows: workflow list | show <name> | validate <name> | validate --file <path>", nonTerminal: true },
   export: { desc: "Export a finished job's results: export <id> --format jsonl|csv [--out path] [--overwrite]", nonTerminal: true },
   artifact: { desc: "Write a controlled file from a validated result: artifact <id> [--synthesis|--item n] --format markdown|html|pdf|text [--template t] [--out path]", nonTerminal: true },
+  metadata: { desc: "Databricks table descriptions/column comments: metadata plan", nonTerminal: true },
   "import-legacy": { desc: "Inventory a pre-Release-1 jobs.json (read-only): import-legacy <path> --preview", nonTerminal: true },
   items: { desc: "List a job's request items", nonTerminal: true },
   item: { desc: "Inspect one item: item <id> <n|custom_id|path> [--text] [--raw]", nonTerminal: true },
@@ -76,6 +78,8 @@ const HELP = `/batch — deferred OpenRouter Batch goals
   artifact <id> [--synthesis|--item <sel>] --format markdown|html|pdf|text [--template <name>]
       [--out <path>] [--overwrite] [--allow-partial]
                                      controlled file from validated results (see /artifact help)
+  metadata plan --context <context.md> --input <tables.jsonl> [--preview]
+                                     Databricks table descriptions and column comments (see /batch metadata help)
   import-legacy <jobs.json> --preview
                                      read-only inventory of pre-Release-1 jobs (import itself is deferred)
   run map-files [options] --prompt "<objective>"
@@ -225,6 +229,8 @@ async function dispatch(rt: BatchRuntime, args: string, ctx: ExtensionCommandCon
       return cmdExport(rt, rest);
     case "artifact":
       return cmdBatchArtifact(rt, rest);
+    case "metadata":
+      return cmdMetadata(rt, rest, ctx);
     case "import-legacy":
       return cmdImportLegacy(rt, rest, ctx);
     case "items":

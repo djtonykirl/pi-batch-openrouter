@@ -57,6 +57,7 @@ export const ARTEFACTS = {
   workflowSource: "request/workflow.yaml",
   workflowResolved: "request/workflow.json",
   dataset: "request/dataset.json",
+  metadataPlan: "request/metadata.json",
   exportsDir: "exports",
 } as const;
 

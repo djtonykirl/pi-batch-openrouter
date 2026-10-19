@@ -1,0 +1,216 @@
+import { Ajv } from "ajv";
+import { canonicalJson, sha256Hex } from "../fsutil.js";
+import { formatErrors } from "../workflows/structured.js";
+
+/**
+ * Phase 1 Databricks metadata enrichment: the data contracts.
+ *
+ *   tables.jsonl   one Databricks table per line (exported by Databricks)
+ *   proposal       what the model must return for one table
+ *   approved.jsonl the reviewed handoff back to Databricks (no SQL, no instructions)
+ *
+ * All three are validated strictly: unknown fields are rejected, nothing is
+ * coerced or defaulted. Only descriptions and column comments are in scope.
+ */
+
+/** catalog.schema.table: three non-empty parts without whitespace, dots or control characters. */
+export const TABLE_NAME_PATTERN = "^[^.\\s\\u0000-\\u001f`]+\\.[^.\\s\\u0000-\\u001f`]+\\.[^.\\s\\u0000-\\u001f`]+$";
+export const CONFIDENCE = ["high", "medium", "low", "insufficient"] as const;
+export type Confidence = (typeof CONFIDENCE)[number];
+const MAX_SAMPLES = 20;
+
+export interface ColumnEvidence {
+  name: string;
+  data_type: string;
+  nullable: boolean;
+  existing_comment: string | null;
+  sample_values?: Array<string | number | boolean | null>;
+}
+
+export interface TableEvidence {
+  table: string;
+  existing_description: string | null;
+  columns: ColumnEvidence[];
+}
+
+export interface ColumnProposal {
+  name: string;
+  comment: string | null;
+  confidence: Confidence;
+  reason: string;
+}
+
+export interface TableProposal {
+  table: string;
+  table_description: { comment: string | null; confidence: Confidence; reason: string };
+  columns: ColumnProposal[];
+}
+
+export interface ApprovedRow {
+  table: string;
+  existing_description: string | null;
+  approved_description: string | null;
+  columns: Array<{ name: string; existing_comment: string | null; approved_comment: string | null }>;
+  provenance: {
+    job_id: string;
+    result_job_id: string | null;
+    result_custom_id: string | null;
+    input_sha256: string;
+    context_sha256: string;
+    proposal_sha256: string | null;
+  };
+}
+
+const nullableText = { anyOf: [{ type: "string", minLength: 1, maxLength: 4000 }, { type: "null" }] };
+
+export const TABLE_EVIDENCE_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["table", "existing_description", "columns"],
+  properties: {
+    table: { type: "string", pattern: TABLE_NAME_PATTERN, maxLength: 765 },
+    existing_description: nullableText,
+    columns: {
+      type: "array",
+      minItems: 1,
+      maxItems: 2000,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["name", "data_type", "nullable", "existing_comment"],
+        properties: {
+          name: { type: "string", minLength: 1, maxLength: 255 },
+          data_type: { type: "string", minLength: 1, maxLength: 1000 },
+          nullable: { type: "boolean" },
+          existing_comment: nullableText,
+          sample_values: { type: "array", maxItems: MAX_SAMPLES, items: { anyOf: [{ type: "string", maxLength: 500 }, { type: "number" }, { type: "boolean" }, { type: "null" }] } },
+        },
+      },
+    },
+  },
+} as const;
+
+const confidenceProp = { enum: [...CONFIDENCE] };
+const reasonProp = { type: "string", minLength: 1, maxLength: 2000 };
+const commentProp = { anyOf: [{ type: "string", minLength: 1, maxLength: 4000 }, { type: "null" }] };
+
+/** The output contract given to the model and enforced locally (draft-07). */
+export const PROPOSAL_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["table", "table_description", "columns"],
+  properties: {
+    table: { type: "string" },
+    table_description: {
+      type: "object",
+      additionalProperties: false,
+      required: ["comment", "confidence", "reason"],
+      properties: { comment: commentProp, confidence: confidenceProp, reason: reasonProp },
+    },
+    columns: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["name", "comment", "confidence", "reason"],
+        properties: { name: { type: "string" }, comment: commentProp, confidence: confidenceProp, reason: reasonProp },
+      },
+    },
+  },
+} as const;
+
+export const APPROVED_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["table", "existing_description", "approved_description", "columns", "provenance"],
+  properties: {
+    table: { type: "string", pattern: TABLE_NAME_PATTERN },
+    existing_description: nullableText,
+    approved_description: nullableText,
+    columns: {
+      type: "array",
+      minItems: 1,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["name", "existing_comment", "approved_comment"],
+        properties: { name: { type: "string", minLength: 1 }, existing_comment: nullableText, approved_comment: nullableText },
+      },
+    },
+    provenance: {
+      type: "object",
+      additionalProperties: false,
+      required: ["job_id", "result_job_id", "result_custom_id", "input_sha256", "context_sha256", "proposal_sha256"],
+      properties: {
+        job_id: { type: "string", pattern: "^B-\\d{8}-[0-9A-Z]{4,8}$" },
+        result_job_id: { anyOf: [{ type: "string" }, { type: "null" }] },
+        result_custom_id: { anyOf: [{ type: "string" }, { type: "null" }] },
+        input_sha256: { type: "string", pattern: "^[0-9a-f]{64}$" },
+        context_sha256: { type: "string", pattern: "^[0-9a-f]{64}$" },
+        proposal_sha256: { anyOf: [{ type: "string", pattern: "^[0-9a-f]{64}$" }, { type: "null" }] },
+      },
+    },
+  },
+} as const;
+
+const ajv = new Ajv({ allErrors: true, strict: true, strictTypes: false, coerceTypes: false, useDefaults: false, removeAdditional: false, logger: false });
+const tableValidator = ajv.compile(TABLE_EVIDENCE_SCHEMA);
+const proposalValidator = ajv.compile(PROPOSAL_SCHEMA);
+const approvedValidator = ajv.compile(APPROVED_SCHEMA);
+
+/** Databricks identifiers are case-insensitive: duplicates are compared case-insensitively. */
+export const identityKey = (s: string): string => s.toLowerCase();
+
+/** Schema errors plus duplicate-column checks for one evidence record (no values in messages). */
+export function tableEvidenceProblems(value: unknown): string[] {
+  if (!tableValidator(value)) return formatErrors(tableValidator.errors ?? []);
+  const t = value as TableEvidence;
+  const seen = new Map<string, number>();
+  const problems: string[] = [];
+  t.columns.forEach((c, i) => {
+    const k = identityKey(c.name);
+    if (seen.has(k)) problems.push(`duplicate column ${JSON.stringify(c.name)} (columns ${seen.get(k)! + 1} and ${i + 1})`);
+    else seen.set(k, i);
+  });
+  return problems;
+}
+
+/** SHA-256 of the canonical evidence record: identifies exactly what was sent for this table. */
+export function evidenceHash(t: TableEvidence): string {
+  return sha256Hex(canonicalJson(t));
+}
+
+/**
+ * Proposal checks for one table: the JSON Schema, then deterministic consistency
+ * with the evidence the request was built from. They check identity and
+ * structure, not whether the prose is right.
+ */
+export function proposalProblems(value: unknown, expected: TableEvidence): string[] {
+  if (!proposalValidator(value)) return formatErrors(proposalValidator.errors ?? []);
+  const p = value as TableProposal;
+  const problems: string[] = [];
+  if (p.table !== expected.table) problems.push(`/table is not the requested table (expected ${JSON.stringify(expected.table)})`);
+  const expectedNames = new Map(expected.columns.map((c) => [c.name, c]));
+  const seen = new Set<string>();
+  for (const [i, c] of p.columns.entries()) {
+    if (!expectedNames.has(c.name)) {
+      const caseOnly = expected.columns.find((e) => identityKey(e.name) === identityKey(c.name));
+      problems.push(caseOnly ? `/columns/${i}/name differs in case from input column ${JSON.stringify(caseOnly.name)}; names must match exactly` : `/columns/${i}/name ${JSON.stringify(c.name)} is not a column of the table (invented column)`);
+      continue;
+    }
+    if (seen.has(c.name)) problems.push(`/columns/${i}/name ${JSON.stringify(c.name)} appears more than once`);
+    seen.add(c.name);
+  }
+  for (const c of expected.columns) if (!seen.has(c.name)) problems.push(`column ${JSON.stringify(c.name)} is missing from the proposal`);
+  const consistency = (at: string, x: { comment: string | null; confidence: Confidence }) => {
+    if (x.comment === null && x.confidence !== "insufficient") problems.push(`${at}: a null comment requires confidence "insufficient"`);
+    if (x.comment !== null && x.confidence === "insufficient") problems.push(`${at}: confidence "insufficient" requires a null comment (no guess)`);
+  };
+  consistency("/table_description", p.table_description);
+  p.columns.forEach((c, i) => consistency(`/columns/${i}`, c));
+  return problems;
+}
+
+export function approvedRowProblems(value: unknown): string[] {
+  return approvedValidator(value) ? [] : formatErrors(approvedValidator.errors ?? []);
+}

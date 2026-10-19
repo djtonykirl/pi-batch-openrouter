@@ -15,6 +15,9 @@ import { compileOutputSchema, type OutputValidator } from "./workflows/structure
 import { findWorkflow, formatDiagnostics, type WorkflowDefinition, type WorkflowEntry } from "./workflows/definition.js";
 import { planDatasetRun, type DatasetPlan, type EffectiveLimits } from "./workflows/dataset-run.js";
 import { resolveWorkspaceInput, resolveWorkspaceOutput } from "./workspace-paths.js";
+import { decodeDatasetBytes } from "./datasets/dataset.js";
+import { proposalProblems, type TableEvidence } from "./metadata/contract.js";
+import { METADATA_WORKFLOW, planMetadataRun, type MetadataPlan } from "./metadata/plan.js";
 import { buildExportRows, toCsv, toJsonl, writeExport } from "./export.js";
 import { inventoryLegacyJobs, type LegacyInventory } from "./legacy.js";
 import { ARTEFACTS, JobRegistry, JobUpdate } from "./registry.js";
@@ -24,6 +27,7 @@ import {
   DATASET_MANIFEST_SCHEMA_VERSION,
   MANIFEST_SCHEMA_VERSION,
   isDatasetWorkflow,
+  isMetadataWorkflow,
   type DatasetSelection,
   type DatasetWorkflowInfo,
   type ExportRecord,
@@ -32,6 +36,7 @@ import {
   type JobKind,
   type JobManifest,
   type MapFilesWorkflowInfo,
+  type MetadataWorkflowInfo,
   type SynthesisLinkage,
   type WorkflowInfo,
 } from "./types.js";
@@ -146,6 +151,38 @@ export interface PreparedDatasetRun {
   contentSha256: string;
   blockers: string[];
   warnings: string[];
+}
+
+export interface MetadataRunOptions {
+  context: string;
+  input: string;
+  model?: string;
+  account?: string;
+  providerPin?: string;
+}
+
+export interface PreparedMetadataRun {
+  options: MetadataRunOptions;
+  model: string;
+  account: string;
+  pin?: ProviderPin;
+  maxTokens: number;
+  plan?: MetadataPlan;
+  context?: { relPath: string; bytes: number; text: string };
+  input?: { relPath: string; bytes: number };
+  objective: string;
+  contentSha256: string;
+  blockers: string[];
+  warnings: string[];
+}
+
+export interface StoredMetadataPlan {
+  workflow: typeof METADATA_WORKFLOW;
+  context: MetadataWorkflowInfo["context"];
+  input: MetadataWorkflowInfo["input"];
+  planSha256: string;
+  tables: Array<{ ordinal: number; customId: string; table: string; line: number; inputSha256: string; requestSha256: string; hasSamples: boolean; evidence: TableEvidence }>;
+  createdAt: string;
 }
 
 export class SubmissionBlockedError extends Error {
@@ -755,8 +792,112 @@ export class BatchService {
       : `The workflow file ${w.definitionFile} has changed since ${localId} was previewed. The request stored at preview time is submitted unchanged; create a new preview to use the new definition.`;
   }
 
+  // ------------------------------------------------- Databricks metadata (Phase 1)
+
+  /** Plans `databricks-metadata`: one request per table in tables.jsonl, sharing context.md. Nothing is persisted. */
+  public async planMetadata(options: MetadataRunOptions): Promise<PreparedMetadataRun> {
+    const config = this.deps.getConfig();
+    const blockers: string[] = [];
+    const account = options.account ?? config.defaultAccount;
+    const model = normalizeBatchModelSlug(options.model ?? config.defaultModel);
+    const pin: ProviderPin | undefined = options.providerPin ? { only: [options.providerPin], allow_fallbacks: false } : undefined;
+    const base: PreparedMetadataRun = { options, model, account, pin, maxTokens: config.request.maxTokens, objective: "", contentSha256: "", blockers, warnings: [] };
+    const read = (raw: string, what: string, maxBytes: number) => {
+      const r = resolveWorkspaceInput(this.deps.workspaceRoot, raw, config, { what, maxBytes });
+      if (!r.ok) {
+        blockers.push(r.message);
+        return undefined;
+      }
+      const bytes = fs.readFileSync(r.absPath);
+      const text = decodeDatasetBytes(bytes);
+      if (text === undefined) {
+        blockers.push(`${what} ${r.relPath} is not valid UTF-8 text`);
+        return undefined;
+      }
+      return { relPath: r.relPath, bytes, text };
+    };
+    const context = read(options.context, "context", config.context.maxFileBytes);
+    const input = read(options.input, "tables input", config.workflows.maxDatasetBytes);
+    if (!context || !input) return base;
+    const plan = planMetadataRun({
+      context,
+      input,
+      model,
+      pin,
+      maxTokens: config.request.maxTokens,
+      limits: { maxRequests: config.workflows.maxRequestsPerBatch, maxRows: config.workflows.maxRowsPerRun, maxCharactersPerItem: config.workflows.maxCharactersPerItem, maxTotalCharacters: config.workflows.maxTotalCharacters },
+      security: { scanSecrets: config.security.scanSecrets, blockOnSecret: config.security.blockOnSecret, knownSecrets: await this.knownSecrets(account) },
+    });
+    blockers.push(...plan.blockers);
+    const contentSha256 = contentHash(buildSubmitBody({ model, provider: pin, requests: plan.items.map((it) => ({ custom_id: "{custom_id}", body: it.body })) }));
+    return { ...base, plan, context: { relPath: context.relPath, bytes: context.bytes.length, text: context.text }, input: { relPath: input.relPath, bytes: input.bytes.length }, objective: `Databricks metadata proposals for ${plan.tables} table(s) from ${input.relPath}`, contentSha256, warnings: plan.warnings };
+  }
+
+  public async createMetadataJob(prepared: PreparedMetadataRun, opts: { previewOnly: boolean }): Promise<JobManifest> {
+    const { plan, context, input } = prepared;
+    if (prepared.blockers.length > 0 || !plan || !context || !input) throw new SubmissionBlockedError(prepared.blockers.join("\n\n") || "the metadata plan is incomplete");
+    this.assertNoActiveDuplicate(prepared.contentSha256, opts.previewOnly);
+    const info: MetadataWorkflowInfo = {
+      name: METADATA_WORKFLOW.name,
+      version: METADATA_WORKFLOW.version,
+      origin: "builtin",
+      context: { path: context.relPath, sha256: plan.contextSha256, bytes: context.bytes },
+      input: { path: input.relPath, sha256: plan.inputSha256, bytes: input.bytes, tables: plan.tables, tablesWithSamples: plan.tablesWithSamples },
+      planSha256: plan.planSha256,
+    };
+    const job = this.persistJob({
+      kind: "workflow",
+      schemaVersion: DATASET_MANIFEST_SCHEMA_VERSION,
+      objective: prepared.objective,
+      model: prepared.model,
+      account: prepared.account,
+      pin: prepared.pin,
+      format: "json",
+      items: plan.items.map((it) => ({ source: it.source, body: it.body, characters: it.characters, prompt: it.prompt, inputSha256: it.inputSha256, metadata: { table: it.evidence.table, hasSamples: it.hasSamples } })),
+      context: { fileCount: 2, characters: plan.totalCharacters, excludedCount: 0 },
+      warnings: [...prepared.warnings],
+      retryCount: 0,
+      workflow: info,
+      writeArtefacts: (localId, customIds, itemShas) => {
+        atomicWriteFile(this.registry.artefact(localId, "objective"), prepared.objective + "\n");
+        // Exact copy of the shared context sent with every request.
+        atomicWriteFile(this.registry.artefact(localId, "context"), context.text);
+        atomicWriteJson(this.registry.artefact(localId, "metadataPlan"), {
+          workflow: METADATA_WORKFLOW,
+          context: info.context,
+          input: info.input,
+          planSha256: plan.planSha256,
+          tables: plan.items.map((it, i) => ({ ordinal: it.ordinal, customId: customIds[i], table: it.evidence.table, line: it.source.line, inputSha256: it.inputSha256, requestSha256: itemShas[i], hasSamples: it.hasSamples, evidence: it.evidence })),
+          createdAt: nowIso(),
+        });
+      },
+      previewDetails: { workflow: METADATA_WORKFLOW.name, requests: plan.items.length, characters: plan.totalCharacters, planSha256: plan.planSha256 },
+    });
+    if (opts.previewOnly) return job;
+    return this.submit(job.localId, { skipDuplicateCheck: true });
+  }
+
+  /** Stored evidence of a metadata job (or a retry of one), keyed by table name. */
+  public metadataEvidence(localId: string): StoredMetadataPlan {
+    return JSON.parse(fs.readFileSync(this.registry.artefact(localId, "metadataPlan"), "utf8")) as StoredMetadataPlan;
+  }
+
   /** The output validator of a JSON dataset job, from the definition stored WITH the job (never the current file). */
   private outputValidator(job: JobManifest): OutputValidator | undefined {
+    if (isMetadataWorkflow(job.workflow)) {
+      // Each item is checked against the evidence of ITS table (by the item's source, never the model's claim).
+      try {
+        const byTable = new Map(this.metadataEvidence(job.localId).tables.map((t) => [t.table, t.evidence]));
+        const items = job.items ?? [];
+        return (value, customId) => {
+          const it = items.find((i) => i.customId === customId);
+          const ev = it?.source.sourceId !== undefined ? byTable.get(it.source.sourceId) : undefined;
+          return ev ? proposalProblems(value, ev) : ["no stored evidence for this item; its output cannot be validated"];
+        };
+      } catch {
+        return () => ["the job's stored metadata evidence (request/metadata.json) is missing or unusable; output cannot be validated"];
+      }
+    }
     if (!isDatasetWorkflow(job.workflow) || job.workflow.output !== "json") return undefined;
     try {
       const stored = JSON.parse(fs.readFileSync(this.registry.artefact(job.localId, "workflowResolved"), "utf8")) as { definition: WorkflowDefinition };
@@ -1397,7 +1538,7 @@ export class BatchService {
       ...(source.synthesis ? { synthesis: source.synthesis } : {}),
       writeArtefacts: (newId, customIds) => {
         atomicWriteFile(this.registry.artefact(newId, "objective"), objective);
-        for (const name of ["context", "contextManifest", "synthesisLinkage", "workflowSource", "workflowResolved", "dataset"] as const) {
+        for (const name of ["context", "contextManifest", "synthesisLinkage", "workflowSource", "workflowResolved", "dataset", "metadataPlan"] as const) {
           const from = this.registry.artefact(localId, name);
           if (fs.existsSync(from)) fs.copyFileSync(from, this.registry.artefact(newId, name));
         }

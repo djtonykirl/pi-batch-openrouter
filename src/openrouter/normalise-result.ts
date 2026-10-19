@@ -207,7 +207,7 @@ function normaliseItem(raw: Record<string, unknown>, customId: string, resultInd
     }
     if (j.fenced) warnings.push("JSON output was wrapped in a code fence");
     if (validateJson) {
-      const errors = validateJson(j.value);
+      const errors = validateJson(j.value, customId);
       if (errors.length > 0) {
         const message = `output does not match the workflow's JSON Schema: ${errors.slice(0, 3).join("; ")}${errors.length > 3 ? `; … (${errors.length} errors)` : ""}`;
         // The parsed value is kept as evidence; the item is not usable.

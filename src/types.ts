@@ -76,7 +76,24 @@ export interface JobItem {
   replaces?: { jobId: string; customId: string; ordinal: number };
 }
 
-export type WorkflowInfo = MapFilesWorkflowInfo | DatasetWorkflowInfo;
+export type WorkflowInfo = MapFilesWorkflowInfo | DatasetWorkflowInfo | MetadataWorkflowInfo;
+
+/**
+ * Built-in Databricks metadata enrichment (Phase 1): one table per request, shared
+ * domain context. Evidence and per-table hashes are in request/metadata.json.
+ */
+export interface MetadataWorkflowInfo {
+  name: "databricks-metadata";
+  version: 1;
+  origin: "builtin";
+  context: { path: string; sha256: string; bytes: number };
+  input: { path: string; sha256: string; bytes: number; tables: number; tablesWithSamples: number };
+  planSha256: string;
+}
+
+export function isMetadataWorkflow(w: WorkflowInfo | undefined): w is MetadataWorkflowInfo {
+  return !!w && w.name === "databricks-metadata" && (w as MetadataWorkflowInfo).origin === "builtin";
+}
 
 export interface MapFilesWorkflowInfo {
   name: "map-files";

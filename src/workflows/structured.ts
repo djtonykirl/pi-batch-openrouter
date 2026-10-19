@@ -41,7 +41,8 @@ export function extractJsonObject(text: string): JsonExtraction {
   return { ok: true, value: parsed as Record<string, unknown>, fenced };
 }
 
-export type OutputValidator = (value: unknown) => string[];
+/** Errors for one parsed output (empty = valid). `customId` identifies the item, for per-item expectations. */
+export type OutputValidator = (value: unknown, customId?: string) => string[];
 
 function depth(v: unknown, d = 0): number {
   if (d > MAX_SCHEMA_DEPTH) return d;

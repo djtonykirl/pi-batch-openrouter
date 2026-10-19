@@ -3,7 +3,7 @@ import { matchesKey, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/p
 import { ACTIVE_STATUSES, TERMINAL_STATUSES as TERMINAL, type LocalStatus } from "./state.js";
 import { formatIsoShort } from "./time.js";
 import { sourceLabel } from "./items.js";
-import { isDatasetWorkflow, type JobManifest } from "./types.js";
+import { isDatasetWorkflow, isMetadataWorkflow, type JobManifest } from "./types.js";
 
 export interface DashboardActions {
   refresh(): Promise<JobManifest[]>;
@@ -226,6 +226,7 @@ function workflowCell(job: JobManifest): string | undefined {
   const w = job.workflow;
   if (!w) return undefined;
   if (isDatasetWorkflow(w)) return `${w.name} (project workflow v${w.version}, definition ${w.definitionSha256.slice(0, 12)}…)`;
+  if (isMetadataWorkflow(w)) return `${w.name} (built-in; context ${w.context.path} sha256 ${w.context.sha256.slice(0, 12)}…, ${w.input.tables} table(s) from ${w.input.path})`;
   return `${w.name} v${w.version}${w.options.groupSize > 1 ? ` (groups of ${w.options.groupSize})` : ""}`;
 }
 
