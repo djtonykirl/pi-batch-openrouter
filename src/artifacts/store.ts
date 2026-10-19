@@ -24,7 +24,8 @@ import type { ArtifactFormat } from "./formats.js";
 export const ARTIFACT_SCHEMA_VERSION = 1;
 export const ARTIFACT_ID_PATTERN = /^A-\d{8}-[0-9A-HJKMNP-TV-Z]{4,8}$/;
 
-export type ArtifactSourceType = "batch-result" | "batch-item" | "synthesis" | "local-source-file";
+/** batch-report: a document generated locally and deterministically from a job's validated results (e.g. a metadata review). */
+export type ArtifactSourceType = "batch-result" | "batch-item" | "synthesis" | "local-source-file" | "batch-report";
 
 /**
  * What the rendered Markdown came from, relative to batch output:

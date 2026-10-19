@@ -9,7 +9,7 @@
  *             no scripts, no remote resources (Content-Security-Policy as well)
  *   pdf       PDF laid out locally by pdfkit from Markdown (.pdf)
  *   text      the source content itself, unchanged, as a non-executable text file
- *             (.txt, .md, .json, .csv, .yaml, .yml, .sql)
+ *             (.txt, .md, .json, .jsonl, .csv, .yaml, .yml, .sql)
  *
  * Extensions are an ALLOWLIST: anything else is refused, including every
  * executable or script type (.ps1, .sh, .bat, .cmd, .exe, .dll, .com, .msi,
@@ -23,7 +23,7 @@ export const FORMAT_EXTENSIONS: Record<ArtifactFormat, readonly string[]> = {
   markdown: [".md", ".markdown"],
   html: [".html", ".htm"],
   pdf: [".pdf"],
-  text: [".txt", ".md", ".json", ".csv", ".yaml", ".yml", ".sql"],
+  text: [".txt", ".md", ".json", ".jsonl", ".csv", ".yaml", ".yml", ".sql"],
 };
 
 /** Default extension for an internal (no --out) destination. */

@@ -32,7 +32,7 @@ const SUBCOMMANDS: Record<string, { desc: string; nonTerminal: boolean }> = {
   workflow: { desc: "Project workflows: workflow list | show <name> | validate <name> | validate --file <path>", nonTerminal: true },
   export: { desc: "Export a finished job's results: export <id> --format jsonl|csv [--out path] [--overwrite]", nonTerminal: true },
   artifact: { desc: "Write a controlled file from a validated result: artifact <id> [--synthesis|--item n] --format markdown|html|pdf|text [--template t] [--out path]", nonTerminal: true },
-  metadata: { desc: "Databricks table descriptions/column comments: metadata plan", nonTerminal: true },
+  metadata: { desc: "Databricks table descriptions/column comments: metadata plan|summary|review|approved|validate-approved", nonTerminal: true },
   "import-legacy": { desc: "Inventory a pre-Release-1 jobs.json (read-only): import-legacy <path> --preview", nonTerminal: true },
   items: { desc: "List a job's request items", nonTerminal: true },
   item: { desc: "Inspect one item: item <id> <n|custom_id|path> [--text] [--raw]", nonTerminal: true },
@@ -79,6 +79,7 @@ const HELP = `/batch — deferred OpenRouter Batch goals
       [--out <path>] [--overwrite] [--allow-partial]
                                      controlled file from validated results (see /artifact help)
   metadata plan --context <context.md> --input <tables.jsonl> [--preview]
+  metadata summary|review|approved|validate-approved …
                                      Databricks table descriptions and column comments (see /batch metadata help)
   import-legacy <jobs.json> --preview
                                      read-only inventory of pre-Release-1 jobs (import itself is deferred)

@@ -210,6 +210,26 @@ export class ArtifactService {
     return plan;
   }
 
+  /**
+   * A document generated locally from a job's validated results (no template, no model):
+   * written through the same destination, overwrite, atomic-write and provenance rules.
+   */
+  public async planFromReport(p: { jobId: string; label: string; content: string; format: "markdown" | "text"; out?: string; overwrite?: boolean; files: string[]; warnings?: string[] }): Promise<ArtifactPlan> {
+    const plan = await this.plan({
+      format: p.format,
+      source: { type: "batch-report", kind: "text", state: "batch-generated", jobId: p.jobId, files: p.files, sha256: sha256Hex(p.content) },
+      content: { kind: "text", text: p.content },
+      out: p.out,
+      overwrite: p.overwrite ?? false,
+      title: p.label,
+      lineage: {},
+      destinationOrigin: p.out ? "command" : "internal",
+    });
+    plan.renderer = { name: p.label };
+    plan.warnings.push(...(p.warnings ?? []));
+    return plan;
+  }
+
   private workflowDefault(job: JobManifest): WorkflowDefinition["artifact"] | undefined {
     if (!isDatasetWorkflow(job.workflow)) return undefined;
     try {

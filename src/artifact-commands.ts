@@ -154,6 +154,7 @@ function sourceCell(m: ArtifactManifest): string {
   if (s.type === "synthesis") return `synthesis ${s.synthesisJobId} of ${s.jobId}`;
   if (s.type === "batch-item") return `${s.jobId} item ${s.itemOrdinal}${s.sourceId ? ` (${s.sourceId})` : ""}`;
   if (s.type === "batch-result") return `${s.jobId} result`;
+  if (s.type === "batch-report") return `${s.jobId} report`;
   return `file ${s.path}`;
 }
 
