@@ -83,3 +83,75 @@ export function itemText(registry: JobRegistry, job: JobManifest, item: JobItem)
   }
   return undefined;
 }
+
+export interface CoverageEntry {
+  /** The item in the root job. */
+  root: JobItem;
+  /** Where the best result comes from (root job, or a linked retry job), if any item is usable. */
+  usable?: { jobId: string; item: JobItem };
+  /** Every attempt for this root item, oldest first (root first). */
+  attempts: Array<{ jobId: string; item: JobItem; jobStatus: JobManifest["localStatus"] }>;
+}
+
+export interface Coverage {
+  rootJobId: string;
+  entries: CoverageEntry[];
+  usableCount: number;
+  complete: boolean;
+  /** Linked retry jobs that contributed attempts. */
+  retryJobIds: string[];
+}
+
+/**
+ * Combined coverage of a job and its linked retry jobs, without rewriting
+ * history: the root job's own status never changes; this view reports, per
+ * root item, the newest usable attempt and its provenance.
+ */
+export function combinedCoverage(registry: JobRegistry, rootId: string, all: JobManifest[] = registry.list().jobs): Coverage {
+  const root = registry.read(rootId);
+  const rootItems = jobItems(registry, root);
+  const byJob = new Map(all.map((j) => [j.localId, j]));
+
+  // (jobId, customId) of an attempt -> root ordinal; follow replaces links transitively.
+  const owner = new Map<string, number>();
+  for (const it of rootItems) owner.set(`${root.localId} ${it.customId}`, it.ordinal);
+  const attempts = new Map<number, CoverageEntry["attempts"]>(rootItems.map((it) => [it.ordinal, [{ jobId: root.localId, item: it, jobStatus: root.localStatus }]]));
+  const retryJobIds: string[] = [];
+
+  const candidates = all.filter((j) => j.localId !== root.localId && j.parentJobId).sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0));
+  let progressed = true;
+  const done = new Set<string>();
+  while (progressed) {
+    progressed = false;
+    for (const job of candidates) {
+      if (done.has(job.localId)) continue;
+      const parent = byJob.get(job.parentJobId!);
+      if (!parent || (parent.localId !== root.localId && !done.has(parent.localId))) continue;
+      done.add(job.localId);
+      progressed = true;
+      const items = jobItems(registry, job);
+      const parentItems = jobItems(registry, parent);
+      let contributed = false;
+      for (const it of items) {
+        // Release 2 items name their parent item; Release 1 full retries map by ordinal.
+        const parentCustomId = it.replaces ? (it.replaces.jobId === parent.localId ? it.replaces.customId : undefined) : parentItems.find((p) => p.ordinal === it.ordinal)?.customId;
+        if (!parentCustomId) continue;
+        const rootOrdinal = owner.get(`${parent.localId} ${parentCustomId}`);
+        if (rootOrdinal === undefined) continue;
+        owner.set(`${job.localId} ${it.customId}`, rootOrdinal);
+        attempts.get(rootOrdinal)!.push({ jobId: job.localId, item: it, jobStatus: job.localStatus });
+        contributed = true;
+      }
+      if (contributed) retryJobIds.push(job.localId);
+    }
+  }
+
+  const entries: CoverageEntry[] = rootItems.map((it) => {
+    const list = attempts.get(it.ordinal)!;
+    // Only results from a batch whose correlation was trusted count.
+    const usable = [...list].reverse().find((a) => isUsable(a.item) && (a.jobStatus === "ready" || a.jobStatus === "partial"));
+    return { root: it, attempts: list, ...(usable ? { usable: { jobId: usable.jobId, item: usable.item } } : {}) };
+  });
+  const usableCount = entries.filter((e) => e.usable).length;
+  return { rootJobId: root.localId, entries, usableCount, complete: usableCount === entries.length, retryJobIds };
+}

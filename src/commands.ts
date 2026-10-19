@@ -2,10 +2,11 @@ import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { parseArgs, tokenize } from "./args.js";
 import { saveConfigUpdate } from "./config.js";
-import { BatchDashboardComponent, TextViewerComponent, describeJob } from "./dashboard.js";
+import { BatchDashboardComponent, TextViewerComponent, describeJob, itemsCell } from "./dashboard.js";
 import { discoverBatchModels } from "./models.js";
 import { INJECTED_MESSAGE_TYPE, type BatchRuntime } from "./runtime.js";
-import { DuplicateActiveRequestError, SubmissionBlockedError, formatUsage, type InjectMode, type PreparedAsk } from "./service.js";
+import { jobItems, sourceLabel } from "./items.js";
+import { CHECK_LOCK_WAIT_MS, DuplicateActiveRequestError, SubmissionBlockedError, formatUsage, itemCounts, type InjectMode, type PreparedAsk, type PreparedPlan, type PreparedSynthesis } from "./service.js";
 import { ACTIVE_STATUSES, LOCAL_STATUSES, TERMINAL_STATUSES, type LocalStatus } from "./state.js";
 import { formatIsoShort } from "./time.js";
 import type { JobManifest } from "./types.js";
@@ -22,6 +23,11 @@ const SUBCOMMANDS: Record<string, { desc: string; nonTerminal: boolean }> = {
   cancel: { desc: "Request cancellation (history kept)", nonTerminal: true },
   retry: { desc: "Re-run a finished job as a new linked job [--model slug]", nonTerminal: true },
   submit: { desc: "Submit a job created with --preview", nonTerminal: true },
+  run: { desc: 'Run a workflow: run map-files --file a --file b --prompt "..." [--preview]', nonTerminal: true },
+  items: { desc: "List a job's request items", nonTerminal: true },
+  item: { desc: "Inspect one item: item <id> <n|custom_id|path> [--text] [--raw]", nonTerminal: true },
+  "retry-items": { desc: "Re-run failed/selected items as a new linked job: retry-items <id> --failed | --item n", nonTerminal: true },
+  synthesize: { desc: "Synthesize a finished workflow job as a new linked job [--allow-partial] [--preview]", nonTerminal: true },
   view: { desc: "Open interactive TUI dashboard", nonTerminal: false },
   model: { desc: "Select default batch model", nonTerminal: true },
   provider: { desc: "Select default OpenRouter account (Pi provider alias)", nonTerminal: true },
@@ -35,6 +41,10 @@ const ID_COMMANDS: Record<string, (j: JobManifest) => boolean> = {
   cancel: (j) => ACTIVE_STATUSES.has(j.localStatus) || j.localStatus === "previewed",
   retry: (j) => TERMINAL_STATUSES.has(j.localStatus),
   submit: (j) => j.localStatus === "previewed",
+  items: () => true,
+  item: () => true,
+  "retry-items": (j) => TERMINAL_STATUSES.has(j.localStatus),
+  synthesize: (j) => j.kind !== "synthesis" && (j.localStatus === "ready" || j.localStatus === "partial"),
 };
 
 const HELP = `/batch — deferred OpenRouter Batch goals
@@ -44,14 +54,23 @@ const HELP = `/batch — deferred OpenRouter Batch goals
       --context <path>               include a file or directory (repeatable; excluded files skipped & listed)
       --model <slug>  --account <pi-provider-alias>  --provider <upstream-slug pin>
       --format markdown|json  --preview  --no-instructions
+  run map-files [options] --prompt "<objective>"
+                                     one request per file, all in ONE batch
+      --file <path> (repeatable)  --context <dir>  --group-size <n>
+      --model  --account  --provider  --format  --preview  --no-instructions
   submit <id>                        submit a job created with --preview
   list [--status active|ready|failed|<status>|all] [--limit n]
-  show <id>                          local + provider status, usage, artefact path
-  read <id> [--full|--raw]           locally retrieved result (no network)
-  inject <id> [--summary|--full]     add the result to THIS conversation's context
+  show <id>                          local + provider status, usage, items, linked jobs
+  items <id>                         item inventory (and combined coverage with retries)
+  item <id> <n|custom_id|path> [--text] [--raw]
+  read <id> [--full|--raw|--items|--item <sel>|--synthesis]
+  inject <id> [--item <sel>|--synthesis] [--summary|--full]
+                                     add a result to THIS conversation's context
   check [id]                         reconcile with OpenRouter now
   cancel <id>                        request cancellation; history is kept
   retry <id> [--model <slug>]        new linked job from the exact original request
+  retry-items <id> --failed | --item <sel> ... [--model <slug>] [--preview]
+  synthesize <id> [--allow-partial] [--model] [--account] [--provider] [--preview]
   view                               TUI dashboard
   [--global] model [slug]            default batch model
   [--global] provider [alias]        default Pi account for the API key
@@ -60,7 +79,7 @@ IDs accept a unique suffix, e.g. "A7C2". Results are advisory and never applied 
 
 export function registerBatchCommand(rt: BatchRuntime): void {
   rt.pi.registerCommand("batch", {
-    description: "Deferred OpenRouter Batch goals: ask, list, show, read, inject, check, cancel, retry",
+    description: "Deferred OpenRouter Batch goals and multi-request workflows: ask, run, list, show, items, read, inject, retry, synthesize",
     getArgumentCompletions: async function completions(prefix: string): Promise<AutocompleteItem[] | null> {
       // `--global` prefix: complete the remainder, then re-prefix suggestions.
       const trimmedPrefix = prefix.trimStart();
@@ -172,6 +191,18 @@ async function dispatch(rt: BatchRuntime, args: string, ctx: ExtensionCommandCon
       return cmdAsk(rt, rest, ctx);
     case "submit":
       return cmdSubmit(rt, rest);
+    case "run":
+    case "plan":
+      return cmdRun(rt, rest, ctx, sub === "plan");
+    case "items":
+      return cmdItems(rt, rest, ctx);
+    case "item":
+      return cmdItem(rt, rest, ctx);
+    case "retry-items":
+      return cmdRetryItems(rt, rest);
+    case "synthesize":
+    case "synthesise":
+      return cmdSynthesize(rt, rest, ctx);
     case "list":
     case "ls":
       return cmdList(rt, rest);
@@ -324,10 +355,10 @@ function cmdList(rt: BatchRuntime, rest: string[]): void {
     rt.notify(status === "all" ? "No batch jobs in this project. Use /batch ask \"<objective>\"." : `No jobs with status ${status}.`, "info");
     return;
   }
-  const lines = [`LOCAL ID          LOCAL STATUS       PROVIDER     MODEL                      CREATED            OBJECTIVE`];
+  const lines = [`LOCAL ID          LOCAL STATUS       PROVIDER     ITEMS   MODEL                      CREATED            OBJECTIVE`];
   for (const j of shown) {
     lines.push(
-      `${j.localId.padEnd(17)} ${(j.localStatus + (j.injectedAt ? "↩" : "")).padEnd(18)} ${(j.providerStatus ?? "-").padEnd(12)} ${j.model.slice(0, 26).padEnd(26)} ${formatIsoShort(j.createdAt).padEnd(18)} ${j.objective.replace(/\s+/g, " ").slice(0, 40)}`,
+      `${j.localId.padEnd(17)} ${(j.localStatus + (j.injectedAt ? "↩" : "")).padEnd(18)} ${(j.providerStatus ?? "-").padEnd(12)} ${itemsCell(j).padEnd(7)} ${j.model.slice(0, 26).padEnd(26)} ${formatIsoShort(j.createdAt).padEnd(18)} ${j.objective.replace(/\s+/g, " ").slice(0, 40)}`,
     );
   }
   for (const u of unreadable) lines.push(`${u.localId.padEnd(17)} UNREADABLE         ${u.reason}`);
@@ -350,51 +381,91 @@ async function cmdShow(rt: BatchRuntime, rest: string[], ctx: ExtensionCommandCo
     ),
   ];
   if (job.usage) lines.push("", `  Usage: ${formatUsage(job.usage)}`);
+  const items = jobItems(service.registry, job);
+  if (items.length > 1 || job.workflow || job.kind === "synthesis") {
+    const c = itemCounts(items.map((i) => i.status));
+    lines.push("", `  Items: ${items.length} (completed ${c.completed}, failed ${c.failed}, corrupt ${c.corrupt}, missing ${c.missing})   /batch items ${id}`);
+    if (job.usage && items.length > 1 && !items.some((i) => i.usage)) {
+      lines.push("  Item-level usage: not reported by the provider (only the batch totals above; never apportioned)");
+    }
+  }
+  const { retries, syntheses } = service.linkedJobs(id);
+  for (const r of retries) lines.push(`  Linked retry:     ${r.localId} (${r.localStatus}, ${r.retryMode === "items" ? `${r.requestCount} item(s)` : "full re-run"})`);
+  for (const s of syntheses) lines.push(`  Linked synthesis: ${s.localId} (${s.localStatus})`);
+  if (job.synthesis) {
+    lines.push(
+      "",
+      `  Synthesis of:     ${job.synthesis.sourceJobId}`,
+      `  Coverage:         ${job.synthesis.included.length} of ${job.synthesis.expectedItems} item(s) included${job.synthesis.allowPartial ? " (partial explicitly allowed)" : ""}`,
+      ...job.synthesis.excluded.map((e) => `    excluded item ${e.sourceOrdinal} ${sourceLabel(e)}: ${e.reason}`),
+    );
+  }
   await showText(rt, ctx, `Batch ${id}`, lines.join("\n"));
 }
 
 // ----------------------------------------------------------- read/inject
 
 async function cmdRead(rt: BatchRuntime, rest: string[], ctx: ExtensionCommandContext): Promise<void> {
-  const parsed = parseArgs(rest, { booleans: ["full", "raw"] });
+  const parsed = parseArgs(rest, { values: ["item"], booleans: ["full", "raw", "items", "synthesis"] });
   if (parsed.errors.length) throw new Error(`/batch read: ${parsed.errors.join("; ")}`);
-  if (parsed.booleans.has("full") && parsed.booleans.has("raw")) throw new Error("Use either --full or --raw, not both");
-  const id = requireId(rt, parsed.positionals, "/batch read <id> [--full|--raw]");
-  const mode = parsed.booleans.has("raw") ? "raw" : parsed.booleans.has("full") ? "full" : "default";
-  const { title, body } = rt.requireService().read(id, mode);
-  await showText(rt, ctx, title, body);
+  const chosen = ["full", "raw", "items", "synthesis"].filter((b) => parsed.booleans.has(b)).length + (parsed.values.item ? 1 : 0);
+  if (chosen > 1) throw new Error("Use only one of --full, --raw, --items, --item <sel>, --synthesis");
+  const id = requireId(rt, parsed.positionals, "/batch read <id> [--full|--raw|--items|--item <sel>|--synthesis]");
+  const service = rt.requireService();
+  const r = parsed.values.item
+    ? service.describeItem(id, parsed.values.item, { text: true })
+    : parsed.booleans.has("items")
+      ? service.readAllItems(id)
+      : parsed.booleans.has("synthesis")
+        ? service.readSynthesis(id)
+        : service.read(id, parsed.booleans.has("raw") ? "raw" : parsed.booleans.has("full") ? "full" : "default");
+  await showText(rt, ctx, r.title, r.body);
 }
 
 function cmdInject(rt: BatchRuntime, rest: string[]): void {
-  const parsed = parseArgs(rest, { booleans: ["summary", "full"] });
+  const parsed = parseArgs(rest, { values: ["item"], booleans: ["summary", "full", "synthesis"] });
   if (parsed.errors.length) throw new Error(`/batch inject: ${parsed.errors.join("; ")}`);
   if (parsed.booleans.has("full") && parsed.booleans.has("summary")) throw new Error("Use either --summary or --full, not both");
-  const id = requireId(rt, parsed.positionals, "/batch inject <id> [--summary|--full]");
-  injectJob(rt, id, parsed.booleans.has("full") ? "full" : parsed.booleans.has("summary") ? "summary" : "default");
+  if (parsed.values.item && parsed.booleans.has("synthesis")) throw new Error("Use either --item or --synthesis, not both");
+  const id = requireId(rt, parsed.positionals, "/batch inject <id> [--item <sel>|--synthesis] [--summary|--full]");
+  injectJob(rt, id, parsed.booleans.has("full") ? "full" : parsed.booleans.has("summary") ? "summary" : "default", {
+    ...(parsed.values.item ? { item: parsed.values.item } : {}),
+    ...(parsed.booleans.has("synthesis") ? { synthesis: true } : {}),
+  });
 }
 
-export function injectJob(rt: BatchRuntime, id: string, mode: InjectMode): void {
+export function injectJob(rt: BatchRuntime, id: string, mode: InjectMode, target: { item?: string; synthesis?: boolean } = {}): void {
   const service = rt.requireService();
-  const built = service.buildInjection(id, mode);
+  const built = service.buildInjection(id, mode, target);
   if (!built.ok) {
     rt.notify(built.message, "warning");
     return;
   }
+  const injectedId = built.injectedJobId;
   // Supported Pi mechanism: a custom message stored in the session and sent to the
   // model as context. No triggerTurn: the user decides when the model responds.
   rt.pi.sendMessage({
     customType: INJECTED_MESSAGE_TYPE,
     content: built.content,
     display: true,
-    details: { localId: id, mode, bounded: built.bounded, characters: built.characters },
+    details: {
+      localId: injectedId,
+      mode,
+      bounded: built.bounded,
+      characters: built.characters,
+      ...(target.item ? { item: target.item } : {}),
+      ...(target.synthesis ? { synthesisOf: id } : {}),
+    },
   });
-  service.recordInjection(id, { mode, characters: built.characters, bounded: built.bounded });
+  service.recordInjection(injectedId, { mode, characters: built.characters, bounded: built.bounded });
   rt.poller.updateBadge();
+  const what = `${injectedId}${target.item ? ` item ${target.item}` : ""}${target.synthesis ? ` (synthesis of ${id})` : ""}`;
   rt.notify(
-    `Injected ${id} into the conversation (${built.characters} characters${built.bounded ? ", bounded excerpt" : ""}). It will be part of the model's context on your next message.`,
+    `Injected ${what} into the conversation (${built.characters} characters${built.bounded ? ", bounded excerpt" : ""}). It will be part of the model's context on your next message.`,
     "info",
   );
 }
+
 
 // ------------------------------------------------ check / cancel / retry
 
@@ -403,11 +474,12 @@ async function cmdCheck(rt: BatchRuntime, rest: string[]): Promise<void> {
   const raw = rest.find((t) => !t.startsWith("--"));
   if (raw) {
     const id = service.registry.resolveId(raw);
-    const o = await service.reconcile(id, { force: true });
+    const o = await service.reconcile(id, { force: true, waitForLockMs: CHECK_LOCK_WAIT_MS });
     rt.poller.updateBadge();
     const job = service.registry.read(id);
+    const busy = o.skipped === "locked" ? ` — another check has held this job for over ${CHECK_LOCK_WAIT_MS / 1000}s; showing the last known state` : "";
     rt.notify(
-      `${id}: ${job.localStatus}${job.providerStatus ? ` (provider: ${job.providerStatus})` : ""}${o.skipped === "locked" ? " — another check is in progress" : ""}${o.error ? `\nLast check failed: ${o.error}` : ""}`,
+      `${id}: ${job.localStatus}${job.providerStatus ? ` (provider: ${job.providerStatus})` : ""}${busy}${o.error ? `\nLast check failed: ${o.error}` : ""}`,
       o.error ? "warning" : "info",
     );
     return;
@@ -441,6 +513,195 @@ async function cmdRetry(rt: BatchRuntime, rest: string[]): Promise<void> {
       : `❌ Retry ${job.localId} ${job.localStatus}: ${job.error?.message ?? ""}`,
     job.localStatus === "submitted" ? "info" : "error",
   );
+}
+
+// ------------------------------------------------------ workflows / items
+
+async function cmdRun(rt: BatchRuntime, rest: string[], ctx: ExtensionCommandContext, forcePreview: boolean): Promise<void> {
+  const service = rt.requireService();
+  const parsed = parseArgs(rest, {
+    values: ["model", "account", "provider", "format", "prompt", "group-size"],
+    repeatable: ["file", "context"],
+    booleans: ["preview", "no-instructions"],
+  });
+  if (parsed.errors.length > 0) throw new Error(`/batch run: ${parsed.errors.join("; ")}`);
+  const [workflow, ...words] = parsed.positionals;
+  if (!workflow) throw new Error('Usage: /batch run map-files --file <path> [--file <path> ...] --prompt "<objective>" [--preview]');
+  if (workflow.toLowerCase() !== "map-files") throw new Error(`Unknown workflow "${workflow}". Available: map-files`);
+  const format = (parsed.values.format ?? "markdown").toLowerCase();
+  if (format !== "markdown" && format !== "json") throw new Error("--format must be markdown or json");
+  const objective = (parsed.values.prompt ?? words.join(" ")).trim();
+  if (!objective) throw new Error('/batch run map-files: give the shared objective with --prompt "<objective>"');
+  let groupSize = 1;
+  if (parsed.values["group-size"] !== undefined) {
+    groupSize = Number(parsed.values["group-size"]);
+    if (!Number.isInteger(groupSize) || groupSize < 1) throw new Error("--group-size must be a positive integer");
+  }
+
+  const plan = await service.planMapFiles({
+    objective,
+    files: parsed.lists.file ?? [],
+    contexts: parsed.lists.context ?? [],
+    groupSize,
+    model: parsed.values.model,
+    account: parsed.values.account,
+    providerPin: parsed.values.provider,
+    format,
+    includeInstructions: !parsed.booleans.has("no-instructions"),
+  });
+  const previewOnly = forcePreview || parsed.booleans.has("preview");
+  const preview = formatPlanPreview(plan, previewOnly);
+  if (plan.blockers.length > 0) {
+    // Nothing is persisted or sent when blocked.
+    throw new SubmissionBlockedError(`${preview}\n\nPLAN BLOCKED — nothing was saved or sent:\n\n${plan.blockers.join("\n\n")}`);
+  }
+  if (previewOnly) {
+    const job = await service.createWorkflowJob(plan, { previewOnly: true });
+    rt.notify(`${preview}\n\nPlan saved as ${job.localId} (not submitted).\nInspect: ${service.registry.jobDir(job.localId)}\nSubmit:  /batch submit ${job.localId}`, "info");
+    return;
+  }
+  const config = rt.loaded.config;
+  if (config.submission.requireConfirmation && ctx.hasUI) {
+    if (!(await ctx.ui.confirm(`Submit ${plan.items.length} request(s) as one batch?`, preview))) {
+      rt.notify("Submission cancelled; nothing was sent.", "info");
+      return;
+    }
+  } else if (config.submission.showPreview) {
+    rt.notify(preview, "info");
+  }
+  const job = await service.createWorkflowJob(plan, { previewOnly: false });
+  rt.poller.updateBadge();
+  notifySubmitted(rt, job, `${job.requestCount} request(s) in one batch`);
+}
+
+function formatPlanPreview(p: PreparedPlan, previewOnly: boolean): string {
+  const groups = p.workflow.options.groupSize > 1;
+  const excluded = p.pkg.excluded;
+  const lines = [
+    p.blockers.length > 0 ? "Workflow plan (BLOCKED)" : previewOnly ? "Workflow plan (not submitted)" : "Submitting workflow",
+    "",
+    `Workflow:          ${p.workflow.name} v${p.workflow.version}${groups ? ` (groups of ${p.workflow.options.groupSize})` : ""}`,
+    `Objective:         ${p.options.objective.replace(/\s+/g, " ").slice(0, 100)}`,
+    `Model:             ${p.model}`,
+    `Account:           ${p.account}`,
+    `Provider pin:      ${p.pin ? `${p.pin.only.join(",")} (no fallbacks)` : "none"}`,
+    `Requests:          ${p.items.length}`,
+    `Selected files:    ${p.pkg.files.length}`,
+    `Total characters:  ${p.totalCharacters}  (prompt characters; not a token count)`,
+    `Largest item:      ${p.largest ? `${p.largest.characters} characters (${p.largest.label})` : "-"}`,
+    `Excluded files:    ${excluded.length}${excluded.length ? `  (${excluded.slice(0, 4).map((e) => `${e.relPath} [${e.layer}]`).join(", ")}${excluded.length > 4 ? ", …" : ""})` : ""}`,
+    `Blocked files:     ${p.pkg.problems.length}`,
+    `Secrets:           ${p.pkg.secretFindings.length === 0 ? "none detected" : `${p.pkg.secretFindings.length} potential finding(s)`}`,
+    `Output mode:       ${p.options.format}`,
+    `Synthesis:         not part of this job (run /batch synthesize <id> after it finishes)`,
+    `Warnings:          ${p.pkg.warnings.length === 0 ? "none" : p.pkg.warnings.join("; ")}`,
+  ];
+  if (p.items.length > 0) {
+    lines.push("", "Items:");
+    for (const it of p.items.slice(0, 30)) lines.push(`  ${String(it.ordinal).padStart(3, "0")}  ${String(it.characters).padStart(8)} chars  ${sourceLabel(it)}`);
+    if (p.items.length > 30) lines.push(`  … ${p.items.length - 30} more (all listed in request/plan.json)`);
+  }
+  return lines.join("\n");
+}
+
+function notifySubmitted(rt: BatchRuntime, job: JobManifest, what: string): void {
+  if (job.localStatus === "submitted") {
+    rt.notify(
+      `✅ Accepted by OpenRouter (${job.providerStatus ?? "?"}) — ${what}; queued, not completed.\n` +
+        `Job: ${job.localId}   Provider batch: ${job.providerBatchId}\n` +
+        `Track: /batch show ${job.localId}   Items: /batch items ${job.localId}   (polled in the background; survives restarts)`,
+      "info",
+    );
+  } else {
+    rt.notify(`❌ ${job.localId} ${job.localStatus}: ${job.error?.message ?? "unknown error"}\nHistory kept: /batch show ${job.localId}`, "error");
+  }
+}
+
+async function cmdItems(rt: BatchRuntime, rest: string[], ctx: ExtensionCommandContext): Promise<void> {
+  const id = requireId(rt, rest, "/batch items <id>");
+  await showText(rt, ctx, `Items of ${id}`, rt.requireService().describeItems(id));
+}
+
+async function cmdItem(rt: BatchRuntime, rest: string[], ctx: ExtensionCommandContext): Promise<void> {
+  const parsed = parseArgs(rest, { booleans: ["text", "raw"] });
+  if (parsed.errors.length) throw new Error(`/batch item: ${parsed.errors.join("; ")}`);
+  const [rawId, selector] = parsed.positionals;
+  if (!rawId || !selector) throw new Error("Usage: /batch item <id> <n|custom_id|path> [--text] [--raw]");
+  const service = rt.requireService();
+  const id = service.registry.resolveId(rawId);
+  const r = service.describeItem(id, selector, { text: parsed.booleans.has("text"), raw: parsed.booleans.has("raw") });
+  await showText(rt, ctx, r.title, r.body);
+}
+
+async function cmdRetryItems(rt: BatchRuntime, rest: string[]): Promise<void> {
+  const parsed = parseArgs(rest, { values: ["model"], repeatable: ["item"], booleans: ["failed", "preview"] });
+  if (parsed.errors.length) throw new Error(`/batch retry-items: ${parsed.errors.join("; ")}`);
+  const id = requireId(rt, parsed.positionals, "/batch retry-items <id> --failed | --item <sel> [--item <sel>] [--model <slug>] [--preview]");
+  const job = await rt.requireService().retryItems(id, {
+    failed: parsed.booleans.has("failed"),
+    selectors: parsed.lists.item ?? [],
+    model: parsed.values.model,
+    previewOnly: parsed.booleans.has("preview"),
+  });
+  rt.poller.updateBadge();
+  const which = (job.items ?? []).map((i) => `${i.replaces?.ordinal ?? "?"}`).join(", ");
+  if (job.localStatus === "previewed") {
+    rt.notify(`Retry plan ${job.localId} saved (not submitted): ${job.requestCount} item(s) of ${id} [${which}], model ${job.model}.\nSubmit: /batch submit ${job.localId}`, "info");
+    return;
+  }
+  notifySubmitted(rt, job, `retry of ${job.requestCount} item(s) of ${id} [${which}]; ${id} is kept unchanged`);
+}
+
+async function cmdSynthesize(rt: BatchRuntime, rest: string[], ctx: ExtensionCommandContext): Promise<void> {
+  const parsed = parseArgs(rest, { values: ["model", "account", "provider"], booleans: ["allow-partial", "preview"] });
+  if (parsed.errors.length) throw new Error(`/batch synthesize: ${parsed.errors.join("; ")}`);
+  const id = requireId(rt, parsed.positionals, "/batch synthesize <id> [--allow-partial] [--model <slug>] [--preview]");
+  const service = rt.requireService();
+  const prepared = await service.prepareSynthesis(id, {
+    allowPartial: parsed.booleans.has("allow-partial"),
+    model: parsed.values.model,
+    account: parsed.values.account,
+    providerPin: parsed.values.provider,
+  });
+  const previewOnly = parsed.booleans.has("preview");
+  const preview = formatSynthesisPreview(prepared, previewOnly);
+  if (prepared.blockers.length > 0) {
+    throw new SubmissionBlockedError(`${preview}\n\nSYNTHESIS BLOCKED — nothing was saved or sent:\n\n${prepared.blockers.join("\n\n")}`);
+  }
+  if (previewOnly) {
+    const job = await service.createSynthesisJob(prepared, { previewOnly: true });
+    rt.notify(`${preview}\n\nSynthesis saved as ${job.localId} (not submitted).\nSubmit: /batch submit ${job.localId}`, "info");
+    return;
+  }
+  const config = rt.loaded.config;
+  if (config.submission.requireConfirmation && ctx.hasUI) {
+    if (!(await ctx.ui.confirm("Submit synthesis batch?", preview))) {
+      rt.notify("Submission cancelled; nothing was sent.", "info");
+      return;
+    }
+  } else if (config.submission.showPreview) {
+    rt.notify(preview, "info");
+  }
+  const job = await service.createSynthesisJob(prepared, { previewOnly: false });
+  rt.poller.updateBadge();
+  notifySubmitted(rt, job, `synthesis of ${id}`);
+}
+
+function formatSynthesisPreview(p: PreparedSynthesis, previewOnly: boolean): string {
+  const c = p.coverage;
+  return [
+    p.blockers.length > 0 ? "Synthesis plan (BLOCKED)" : previewOnly ? "Synthesis plan (not submitted)" : "Submitting synthesis",
+    "",
+    `Source job:        ${p.sourceJobId}`,
+    `Model:             ${p.model}`,
+    `Provider pin:      ${p.pin ? `${p.pin.only.join(",")} (no fallbacks)` : "none"}`,
+    `Expected items:    ${c.expected}`,
+    `Included items:    ${c.included}`,
+    `Unusable items:    ${c.unusable.length}  (failed ${c.failed}, corrupt ${c.corrupt}, missing ${c.missing}${c.noResult ? `, no result ${c.noResult}` : ""})`,
+    `Partial allowed:   ${c.allowPartial ? "yes" : "no"}`,
+    `Package size:      ${p.characters} characters (not a token count)`,
+    ...c.unusable.map((u) => `  - item ${u.sourceOrdinal} ${u.sourceLabel}: ${u.reason}`),
+  ].join("\n");
 }
 
 // ------------------------------------------------------- settings / view

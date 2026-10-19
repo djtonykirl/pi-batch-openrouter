@@ -98,15 +98,15 @@ export class BatchPoller {
   }
 }
 
-/** e.g. "📦 Batch: 2 active | 3 ready | 1 attention" — only non-zero parts, cleared when nothing to show. */
+/** e.g. "📦 Batch: 2 active | 1 partial | 3 ready" — only non-zero parts, cleared when nothing to show. No costs. */
 export function badgeText(jobs: readonly JobManifest[]): string | undefined {
   const active = jobs.filter((j) => ACTIVE_STATUSES.has(j.localStatus)).length;
+  const partial = jobs.filter((j) => j.localStatus === "partial" && !j.injectedAt).length;
   const ready = jobs.filter((j) => j.localStatus === "ready" && !j.injectedAt).length;
-  const attention = jobs.filter(
-    (j) => (j.localStatus === "partial" || j.localStatus === "corrupt" || (ACTIVE_STATUSES.has(j.localStatus) && j.lastPollError)) && !j.injectedAt,
-  ).length;
+  const attention = jobs.filter((j) => (j.localStatus === "corrupt" || (ACTIVE_STATUSES.has(j.localStatus) && j.lastPollError)) && !j.injectedAt).length;
   const parts: string[] = [];
   if (active) parts.push(`${active} active`);
+  if (partial) parts.push(`${partial} partial`);
   if (ready) parts.push(`${ready} ready`);
   if (attention) parts.push(`${attention} attention`);
   return parts.length ? `📦 Batch: ${parts.join(" | ")}` : undefined;

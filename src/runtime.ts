@@ -85,10 +85,14 @@ export class BatchRuntime {
     this.poller.updateBadge();
     if (!this.loaded.config.notifyOnComplete) return;
     const objective = job.objective.replace(/\s+/g, " ").slice(0, 60);
+    const multi = job.requestCount > 1;
     if (job.localStatus === "ready") {
-      this.notify(`📦 Batch ${job.localId} ready: ${objective}\n/batch read ${job.localId}  ·  /batch inject ${job.localId}`, "info");
+      this.notify(
+        `📦 Batch ${job.localId} ready${multi ? ` (${job.requestCount}/${job.requestCount} items)` : ""}: ${objective}\n/batch read ${job.localId}  ·  /batch inject ${job.localId}${multi ? `  ·  /batch items ${job.localId}` : ""}`,
+        "info",
+      );
     } else if (job.localStatus === "partial") {
-      this.notify(`📦 Batch ${job.localId} partial (${job.error?.message ?? "some requests failed"})\n/batch read ${job.localId} --full`, "warning");
+      this.notify(`📦 Batch ${job.localId} partial (${job.error?.message ?? "some requests failed"})\n/batch items ${job.localId}  ·  /batch retry-items ${job.localId} --failed`, "warning");
     } else {
       this.notify(`📦 Batch ${job.localId} ${job.localStatus}${job.error ? `: ${job.error.message}` : ""}\n/batch show ${job.localId}`, "warning");
     }

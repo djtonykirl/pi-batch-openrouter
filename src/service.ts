@@ -5,7 +5,7 @@ import { buildContextPackage, SYSTEM_PROMPT, type ContextPackage, type PackageIn
 import { formatSecretFindings, scanForSecrets } from "./context/secrets.js";
 import { atomicWriteFile, atomicWriteJson, canonicalJson, sha256Hex, writeOnce, writeOnceUnlessIdentical } from "./fsutil.js";
 import { customIdFor, customIdProblems } from "./ids.js";
-import { itemText, jobItems, resolveItem, sourceLabel } from "./items.js";
+import { combinedCoverage, isUsable, itemText, jobItems, resolveItem, sourceLabel, type Coverage } from "./items.js";
 import { nullLogger, type Logger } from "./logger.js";
 import { normalizeBatchModelSlug } from "./models.js";
 import { OpenRouterBatchClient, OpenRouterError, type RawExchange } from "./openrouter/client.js";
@@ -24,6 +24,7 @@ import {
   type WorkflowInfo,
 } from "./types.js";
 import { MAP_FILES, groupFiles, renderMapFilesPrompt } from "./workflows/map-files.js";
+import { coverageFacts, renderCoverage, renderSynthesisPrompt, type CoverageFacts, type SynthesisInputItem, type SynthesisUnusable } from "./workflows/synthesis.js";
 
 export interface AskOptions {
   objective: string;
@@ -80,6 +81,26 @@ export interface PreparedPlan {
   items: PlannedItem[];
   totalCharacters: number;
   largest?: { characters: number; label: string };
+  contentSha256: string;
+  blockers: string[];
+}
+
+export interface SynthesisOptions {
+  allowPartial: boolean;
+  model?: string;
+  account?: string;
+  providerPin?: string;
+}
+
+export interface PreparedSynthesis {
+  sourceJobId: string;
+  model: string;
+  account: string;
+  pin?: ProviderPin;
+  coverage: CoverageFacts;
+  linkage: SynthesisLinkage;
+  prompt: string;
+  characters: number;
   contentSha256: string;
   blockers: string[];
 }
@@ -1021,6 +1042,30 @@ export class BatchService {
     return child;
   }
 
+  /**
+   * Selected items of a finished job, re-run as a new linked job. `failed`
+   * selects every item without a trusted usable result. The parent job and its
+   * artefacts are never modified (an event is appended to its history).
+   */
+  public async retryItems(localId: string, opts: { failed?: boolean; selectors?: string[]; model?: string; previewOnly?: boolean }): Promise<JobManifest> {
+    const source = this.registry.read(localId);
+    if (!TERMINAL_STATUSES.has(source.localStatus)) {
+      throw new Error(`${localId} is ${source.localStatus}; only finished jobs can have items retried.`);
+    }
+    const items = jobItems(this.registry, source);
+    const trusted = source.localStatus === "ready" || source.localStatus === "partial";
+    const chosen = new Map<number, JobItem>();
+    if (opts.failed) for (const it of items) if (!(trusted && isUsable(it))) chosen.set(it.ordinal, it);
+    for (const sel of opts.selectors ?? []) {
+      const it = resolveItem(items, sel);
+      chosen.set(it.ordinal, it);
+    }
+    if (!opts.failed && (opts.selectors ?? []).length === 0) throw new Error("Choose items: --failed and/or --item <selector> (repeatable).");
+    if (chosen.size === 0) throw new Error(`${localId} has no failed, corrupt or missing items to retry.`);
+    const selected = [...chosen.values()].sort((a, b) => a.ordinal - b.ordinal);
+    return this.createRetryJob(source, selected, { model: opts.model, mode: "items", previewOnly: opts.previewOnly ?? false });
+  }
+
   private async createRetryJob(
     source: JobManifest,
     selected: JobItem[],
@@ -1105,6 +1150,151 @@ export class BatchService {
     return this.submit(child.localId, { skipDuplicateCheck: true });
   }
 
+  // ------------------------------------------------------------ synthesis
+
+  public coverage(localId: string): Coverage {
+    return combinedCoverage(this.registry, localId);
+  }
+
+  /** Synthesis jobs created from `sourceJobId`, newest first. */
+  public synthesisJobs(sourceJobId: string): JobManifest[] {
+    return this.registry.list().jobs.filter((j) => j.kind === "synthesis" && j.synthesis?.sourceJobId === sourceJobId);
+  }
+
+  /** Jobs linked to this one: retries (children) and syntheses. */
+  public linkedJobs(localId: string): { retries: JobManifest[]; syntheses: JobManifest[] } {
+    const jobs = this.registry.list().jobs;
+    return {
+      retries: jobs.filter((j) => j.parentJobId === localId),
+      syntheses: jobs.filter((j) => j.kind === "synthesis" && j.synthesis?.sourceJobId === localId),
+    };
+  }
+
+  /**
+   * Deterministic synthesis package from locally validated item results
+   * (including linked retry jobs). Blocked unless every expected item is usable,
+   * or `allowPartial` is set — in which case the gaps are stated in the prompt
+   * and recorded in the job, never left to the model to mention.
+   */
+  public async prepareSynthesis(sourceJobId: string, opts: SynthesisOptions): Promise<PreparedSynthesis> {
+    const config = this.deps.getConfig();
+    const source = this.registry.read(sourceJobId);
+    if (source.kind === "synthesis") throw new Error(`${sourceJobId} is itself a synthesis job; synthesize its source job instead.`);
+    if (!TERMINAL_STATUSES.has(source.localStatus)) throw new Error(`${sourceJobId} is ${source.localStatus}; wait until it has finished.`);
+    const model = normalizeBatchModelSlug(opts.model ?? config.defaultModel);
+    const account = opts.account ?? source.account;
+    const pin: ProviderPin | undefined = opts.providerPin ? { only: [opts.providerPin], allow_fallbacks: false } : undefined;
+    const coverage = this.coverage(sourceJobId);
+
+    const included: SynthesisInputItem[] = [];
+    const unusable: SynthesisUnusable[] = [];
+    const blockers: string[] = [];
+    for (const e of coverage.entries) {
+      const label = sourceLabel(e.root);
+      if (e.usable) {
+        const job = this.registry.read(e.usable.jobId);
+        const text = itemText(this.registry, job, e.usable.item);
+        if (text === undefined) {
+          blockers.push(`item ${e.root.ordinal} (${label}) is marked completed in ${e.usable.jobId} but its result text is missing on disk`);
+          continue;
+        }
+        included.push({ sourceOrdinal: e.root.ordinal, source: e.root.source, sourceLabel: label, customId: e.usable.item.customId, jobId: e.usable.jobId, text });
+      } else {
+        const last = e.attempts[e.attempts.length - 1]!;
+        const status = last.item.status === "planned" || last.item.status === "submitted" ? "no_result" : last.item.status;
+        const reason =
+          status === "no_result"
+            ? `no result (job ${last.jobId} is ${last.jobStatus})`
+            : `${status}${last.item.error ? `: ${last.item.error.message}` : ""}${last.jobStatus === "corrupt" ? " (batch correlation untrusted)" : ""}`;
+        unusable.push({ sourceOrdinal: e.root.ordinal, sourceLabel: label, status, reason: reason.slice(0, 300) });
+      }
+    }
+    if (included.length === 0) blockers.push(`${sourceJobId} has no usable item results to synthesize.`);
+    if (unusable.length > 0 && !opts.allowPartial) {
+      blockers.push(
+        `${unusable.length} of ${coverage.entries.length} source item(s) have no usable result; synthesis is blocked by default:\n` +
+          unusable.map((u) => `  - item ${u.sourceOrdinal} ${u.sourceLabel}: ${u.reason}`).join("\n") +
+          `\nRetry them first (/batch retry-items ${sourceJobId} --failed) or pass --allow-partial to synthesize with stated gaps.`,
+      );
+    }
+    const facts = coverageFacts(sourceJobId, coverage.entries.length, included.length, unusable, opts.allowPartial);
+    const prompt = renderSynthesisPrompt({ sourceObjective: source.objective, coverage: facts, items: included });
+    if (prompt.length > config.workflows.maxSynthesisCharacters) {
+      blockers.push(
+        `synthesis package is ${prompt.length} characters; workflows.maxSynthesisCharacters is ${config.workflows.maxSynthesisCharacters} (local policy). ` +
+          "No results were dropped: raise the limit deliberately, or synthesize a smaller job.",
+      );
+    }
+    if (config.security.scanSecrets) {
+      const findings = scanForSecrets(prompt, "<synthesis package>", await this.knownSecrets(account));
+      if (findings.length > 0 && config.security.blockOnSecret) blockers.push(formatSecretFindings(findings));
+    }
+    const linkage: SynthesisLinkage = {
+      sourceJobId,
+      expectedItems: coverage.entries.length,
+      included: included.map((i) => ({ jobId: i.jobId, customId: i.customId, sourceOrdinal: i.sourceOrdinal, source: i.source })),
+      excluded: unusable.map((u) => {
+        const root = coverage.entries.find((e) => e.root.ordinal === u.sourceOrdinal)!.root;
+        return { sourceOrdinal: u.sourceOrdinal, customId: root.customId, source: root.source, status: u.status as SynthesisLinkage["excluded"][number]["status"], reason: u.reason };
+      }),
+      allowPartial: opts.allowPartial,
+    };
+    const messages = withSystemPrompt(true, prompt);
+    const contentSha256 = contentHash(buildSubmitBody({ model, provider: pin, requests: [{ custom_id: "{custom_id}", body: this.requestBody(messages) }] }));
+    return { sourceJobId, model, account, pin, coverage: facts, linkage, prompt, characters: prompt.length, contentSha256, blockers };
+  }
+
+  public async createSynthesisJob(prepared: PreparedSynthesis, opts: { previewOnly: boolean }): Promise<JobManifest> {
+    if (prepared.blockers.length > 0) throw new SubmissionBlockedError(prepared.blockers.join("\n\n"));
+    this.assertNoActiveDuplicate(prepared.contentSha256, opts.previewOnly);
+    const source = this.registry.read(prepared.sourceJobId);
+    const objective = `Synthesis of ${prepared.sourceJobId}: ${source.objective}`;
+    const job = this.persistJob({
+      kind: "synthesis",
+      objective,
+      model: prepared.model,
+      account: prepared.account,
+      pin: prepared.pin,
+      format: "markdown",
+      items: [
+        {
+          source: { kind: "synthesis", label: `synthesis of ${prepared.sourceJobId}` },
+          body: this.requestBody(withSystemPrompt(true, prepared.prompt)),
+          characters: prepared.characters,
+          prompt: prepared.prompt,
+        },
+      ],
+      context: { fileCount: 0, characters: prepared.characters, excludedCount: prepared.linkage.excluded.length },
+      warnings: prepared.linkage.excluded.length ? [`partial synthesis: ${prepared.linkage.excluded.length} of ${prepared.linkage.expectedItems} source item(s) not included`] : [],
+      retryCount: 0,
+      synthesis: prepared.linkage,
+      writeArtefacts: (localId) => {
+        atomicWriteFile(this.registry.artefact(localId, "objective"), objective + "\n");
+        atomicWriteFile(this.registry.artefact(localId, "context"), prepared.prompt);
+        atomicWriteJson(this.registry.artefact(localId, "synthesisLinkage"), { ...prepared.linkage, coverage: prepared.coverage, createdAt: nowIso() });
+      },
+      previewDetails: { synthesisOf: prepared.sourceJobId, included: prepared.linkage.included.length, excluded: prepared.linkage.excluded.length, characters: prepared.characters },
+    });
+    this.withLock(prepared.sourceJobId, () =>
+      this.registry.update(prepared.sourceJobId, (u) => u.note("synthesis_created", { synthesisJobId: job.localId, included: prepared.linkage.included.length, allowPartial: prepared.linkage.allowPartial })),
+    );
+    if (opts.previewOnly) return job;
+    return this.submit(job.localId, { skipDuplicateCheck: true });
+  }
+
+  /** Coverage facts of a synthesis job, rebuilt from its manifest (independent of the model's prose). */
+  public synthesisCoverage(job: JobManifest): CoverageFacts | undefined {
+    const s = job.synthesis;
+    if (!s) return undefined;
+    return coverageFacts(
+      s.sourceJobId,
+      s.expectedItems,
+      s.included.length,
+      s.excluded.map((e) => ({ sourceOrdinal: e.sourceOrdinal, sourceLabel: sourceLabel(e), status: e.status, reason: e.reason })),
+      s.allowPartial,
+    );
+  }
+
   // ----------------------------------------------------------- read/inject
 
   /** Items table (also used by `/batch items`). Purely local. */
@@ -1135,6 +1325,18 @@ export class BatchService {
     }
     const counts = itemCounts(items.map((i) => i.status));
     lines.push("", `Completed ${counts.completed} · failed ${counts.failed} · corrupt ${counts.corrupt} · missing ${counts.missing} · of ${items.length}`);
+    const { retries, syntheses } = this.linkedJobs(localId);
+    if (retries.length > 0) {
+      const cov = this.coverage(localId);
+      lines.push("", `Original job: ${job.localStatus}`);
+      for (const r of retries) lines.push(`Retry job ${r.localId}: ${r.localStatus} (${r.requestCount} item(s)${r.retryMode === "items" ? "" : ", full re-run"})`);
+      lines.push(`Combined coverage: ${cov.complete ? "complete" : "incomplete"} (${cov.usableCount}/${cov.entries.length} usable)`);
+      for (const e of cov.entries) {
+        if (e.usable && e.usable.jobId !== localId) lines.push(`  item ${String(e.root.ordinal).padStart(3, "0")}: usable via ${e.usable.jobId} item ${e.usable.item.ordinal}`);
+        if (!e.usable) lines.push(`  item ${String(e.root.ordinal).padStart(3, "0")}: no usable result yet`);
+      }
+    }
+    for (const s of syntheses) lines.push(`Synthesis job ${s.localId}: ${s.localStatus}${s.synthesis?.allowPartial ? " (partial allowed)" : ""}`);
     lines.push("", `Details: /batch item ${localId} <n>`);
     return lines.join("\n");
   }
@@ -1203,17 +1405,18 @@ export class BatchService {
         }`,
       };
     }
+    const synthesisBlock = job.kind === "synthesis" ? `COVERAGE (recorded locally, not written by the model)\n${renderCoverage(this.synthesisCoverage(job)!)}\n\n---\n\n` : "";
     const header = job.localStatus === "ready" ? "" : `⚠ Status: ${job.localStatus}${job.error ? ` — ${job.error.message}` : ""}\n\n`;
     const items = jobItems(this.registry, job);
     if (mode === "default" && items.length > 1) {
       return { title: `${localId}: ${truncate(job.objective, 60)}`, body: header + this.multiItemOverview(job, items) };
     }
     const text = fs.existsSync(resultMd) ? fs.readFileSync(resultMd, "utf8") : "(no renderable assistant output)";
-    if (mode === "default") return { title: `${localId}: ${truncate(job.objective, 60)}`, body: header + text };
+    if (mode === "default") return { title: `${localId}: ${truncate(job.objective, 60)}`, body: header + synthesisBlock + text };
 
     const n = JSON.parse(fs.readFileSync(resultJson, "utf8")) as NormalisedBatchResult;
     const lines = [
-      header + text.trimEnd(),
+      header + synthesisBlock + text.trimEnd(),
       "",
       "---",
       `Outcome: ${n.outcome}   Provider status: ${n.providerStatus}`,
@@ -1244,6 +1447,8 @@ export class BatchService {
       const excerpt = text ? truncate(text, 240) : it.error ? `${it.error.code ? `[${it.error.code}] ` : ""}${it.error.message}` : "(no result)";
       lines.push(`${String(it.ordinal).padStart(3, "0")} ${it.status.padEnd(10)} ${sourceLabel(it)}`, `     ${excerpt}`);
     }
+    const { syntheses } = this.linkedJobs(job.localId);
+    lines.push("", syntheses.length ? `Synthesis: ${syntheses.map((s) => `${s.localId} (${s.localStatus})`).join(", ")}` : "Synthesis: none");
     lines.push(
       "",
       `Full results: /batch read ${job.localId} --item <n>   ·   all items: /batch read ${job.localId} --items`,
@@ -1260,11 +1465,30 @@ export class BatchService {
     return { title: `${localId}: all items`, body: header + (fs.existsSync(md) ? fs.readFileSync(md, "utf8") : "(no renderable item output)") };
   }
 
+  /** The newest synthesis of a source job, with coverage shown separately from the model's prose. */
+  public readSynthesis(sourceJobId: string): { title: string; body: string } {
+    const all = this.synthesisJobs(sourceJobId);
+    if (all.length === 0) return { title: `${sourceJobId}: no synthesis`, body: `No synthesis job exists for ${sourceJobId}. Create one with /batch synthesize ${sourceJobId}.` };
+    // Newest usable synthesis first; a newer one still pending or previewed is listed, not shown.
+    const job = all.find((j) => j.localStatus === "ready" || j.localStatus === "partial") ?? all[0]!;
+    const others = all.filter((j) => j !== job).map((j) => `${j.localId} (${j.localStatus})`);
+    const r = this.read(job.localId, "default");
+    return { title: `${sourceJobId} synthesis ${job.localId} (${job.localStatus})`, body: r.body + (others.length ? `\n\nEarlier syntheses: ${others.join(", ")}` : "") };
+  }
+
   public buildInjection(
     localId: string,
     mode: InjectMode,
-    target: { item?: string } = {},
+    target: { item?: string; synthesis?: boolean } = {},
   ): { ok: true; content: string; characters: number; bounded: boolean; injectedJobId: string } | { ok: false; message: string } {
+    if (target.synthesis) {
+      const syn = this.synthesisJobs(localId).find((j) => j.localStatus === "ready");
+      if (!syn) {
+        const any = this.synthesisJobs(localId)[0];
+        return { ok: false, message: any ? `The newest synthesis of ${localId} (${any.localId}) is ${any.localStatus}; only a ready synthesis can be injected.` : `No synthesis exists for ${localId}.` };
+      }
+      return this.buildInjection(syn.localId, mode);
+    }
     const job = this.registry.read(localId);
     if (job.localStatus !== "ready" && job.localStatus !== "partial") {
       return {
@@ -1297,6 +1521,9 @@ export class BatchService {
         const gaps = items.filter((i) => i.status !== "completed");
         if (gaps.length) head.push(`Not covered: ${gaps.map((g) => `${sourceLabel(g)} (${g.status})`).join("; ")}`);
       }
+    }
+    if (job.kind === "synthesis" && job.synthesis) {
+      head.push("", `Synthesis of source job: ${job.synthesis.sourceJobId}   Synthesis job: ${localId}`, "", "COVERAGE (recorded locally, not written by the model):", renderCoverage(this.synthesisCoverage(job)!));
     }
     if (config.includeObjective) head.push("", "Original objective:", job.objective);
     head.push("", "Result:");

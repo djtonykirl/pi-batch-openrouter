@@ -4,6 +4,7 @@ import * as path from "node:path";
 import test from "node:test";
 import { CUSTOM_ID_PATTERN, customIdFor, customIdProblems, newLocalJobId } from "../src/ids.js";
 import { sha256Hex } from "../src/fsutil.js";
+import { combinedCoverage } from "../src/items.js";
 import { FileLogger } from "../src/logger.js";
 import { OpenRouterBatchClient } from "../src/openrouter/client.js";
 import { JobRegistry } from "../src/registry.js";
@@ -446,6 +447,79 @@ test(
   }),
 );
 
+// ---------------------------------------------------------------- retry (G)
+
+async function partialJob(root: string) {
+  const fake = new FakeOpenRouter();
+  const service = makeService(root, fake);
+  const job = await submitPlan(service, fake);
+  const [a, b, c] = fake.lastCustomIds();
+  fake.getReplies = [{ status: 200, body: completed([ok(a!, "A ok"), failedItem(b!), ok(c!, "C ok")]) }];
+  await service.reconcile(job.localId, { force: true });
+  assert.equal(service.registry.read(job.localId).localStatus, "partial");
+  return { fake, service, job };
+}
+
+test(
+  "retry-items --failed: new linked job with new IDs for only the failed items; parent unchanged; combined coverage complete",
+  withWorkspace(async (root) => {
+    const { fake, service, job } = await partialJob(root);
+    const parentManifest = fs.readFileSync(path.join(service.registry.jobDir(job.localId), "manifest.json"), "utf8");
+    const parentBody = JSON.parse(fs.readFileSync(service.registry.artefact(job.localId, "submittedRequest"), "utf8"));
+
+    fake.submitReplies = [accepted("batch_retry")];
+    const child = await service.retryItems(job.localId, { failed: true });
+    assert.equal(child.localStatus, "submitted");
+    assert.equal(child.parentJobId, job.localId);
+    assert.equal(child.retryMode, "items");
+    assert.equal(child.requestCount, 1);
+    assert.equal(child.context.fileCount, 1);
+    assert.equal(child.context.characters, service.registry.read(job.localId).items![1]!.characters);
+    assert.deepEqual(child.items![0]!.replaces, { jobId: job.localId, customId: job.customIds[1], ordinal: 2 });
+    assert.equal(child.items![0]!.source.path, "src/registry.ts");
+    assert.equal(child.customIds[0], `${child.localId}_request-001`);
+    const childBody = JSON.parse(fs.readFileSync(service.registry.artefact(child.localId, "submittedRequest"), "utf8"));
+    assert.deepEqual(childBody.requests[0].body, parentBody.requests[1].body); // exact original request item
+    assert.equal(child.items![0]!.requestSha256, service.registry.read(job.localId).items![1]!.requestSha256);
+
+    // Parent never rewritten; the link is an appended event.
+    assert.equal(fs.readFileSync(path.join(service.registry.jobDir(job.localId), "manifest.json"), "utf8"), parentManifest);
+    assert.ok(service.registry.events(job.localId).some((e) => e.eventType === "items_retried" && e.details?.childJobId === child.localId));
+
+    fake.getReplies = [{ status: 200, body: completed([ok(child.customIds[0]!, "B ok on retry")], { id: "batch_retry" }) }];
+    await service.reconcile(child.localId, { force: true });
+    assert.equal(service.registry.read(child.localId).localStatus, "ready");
+    assert.equal(service.registry.read(job.localId).localStatus, "partial"); // history not rewritten
+
+    const cov = combinedCoverage(service.registry, job.localId);
+    assert.equal(cov.complete, true);
+    assert.deepEqual(cov.entries.map((e) => e.usable!.jobId), [job.localId, child.localId, job.localId]);
+    const view = service.describeItems(job.localId);
+    assert.match(view, /Original job: partial/);
+    assert.match(view, new RegExp(`Retry job ${child.localId}: ready`));
+    assert.match(view, /Combined coverage: complete \(3\/3 usable\)/);
+    assert.match(view, new RegExp(`item 002: usable via ${child.localId} item 1`));
+
+    await assert.rejects(service.retryItems(child.localId, { failed: true }), /no failed, corrupt or missing items/);
+  }),
+);
+
+test(
+  "retry-items --item: explicit selection (ordinal and path), preview first, then submit",
+  withWorkspace(async (root) => {
+    const { fake, service, job } = await partialJob(root);
+    const child = await service.retryItems(job.localId, { selectors: ["3", "src/service.ts"], previewOnly: true, model: "openai/gpt-6-luna:batch" });
+    assert.equal(child.localStatus, "previewed");
+    assert.equal(child.model, "openai/gpt-6-luna");
+    assert.deepEqual(child.items!.map((i) => i.replaces!.ordinal), [1, 3]);
+    assert.equal(fake.requests.filter((r) => r.method === "POST").length, 1); // only the parent submission
+    fake.submitReplies = [accepted("batch_sel")];
+    assert.equal((await service.submit(child.localId)).localStatus, "submitted");
+    await assert.rejects(service.retryItems(job.localId, { selectors: ["9"] }), /No item 9/);
+    await assert.rejects(service.retryItems(job.localId, {}), /Choose items/);
+  }),
+);
+
 test(
   "item selector: ambiguous source path is reported, never guessed",
   withWorkspace(async (root) => {
@@ -460,6 +534,103 @@ test(
       u.manifest.items![1]!.source = { kind: "group", paths: ["src/z.ts", "src/x.ts"] };
     });
     assert.throws(() => service.describeItem(preview.localId, "src/x.ts"), /ambiguous; it matches items 1, 2/);
+  }),
+);
+
+// ------------------------------------------------------------ synthesis (H)
+
+test(
+  "synthesis: blocked by default on partial coverage; --allow-partial states gaps deterministically; linked new deferred job",
+  withWorkspace(async (root) => {
+    const { fake, service, job } = await partialJob(root);
+    const blocked = await service.prepareSynthesis(job.localId, { allowPartial: false });
+    assert.match(blocked.blockers.join(), /1 of 3 source item\(s\) have no usable result; synthesis is blocked by default/);
+    await assert.rejects(service.createSynthesisJob(blocked, { previewOnly: false }), SubmissionBlockedError);
+
+    const p = await service.prepareSynthesis(job.localId, { allowPartial: true, model: "anthropic/claude-haiku-5.5" });
+    assert.deepEqual(p.blockers, []);
+    assert.match(p.prompt, /COVERAGE\n=+\n\nSource job: B-[\w-]+\nExpected items: 3\nIncluded items: 2\nFailed items: 1\nCorrupt items: 0\nMissing items: 0\nPartial synthesis explicitly allowed: yes/);
+    assert.match(p.prompt, /- src\/registry\.ts \(item 2\): failed: context length exceeded/);
+    assert.match(p.prompt, /ITEM RESULT 001\n=+\n\nSource: src\/service\.ts\nCustom ID: B-[\w-]+_request-001\nValidation: valid\n\nA ok\n\nEND ITEM RESULT/);
+    assert.match(p.prompt, /ITEM RESULT 003/);
+    assert.doesNotMatch(p.prompt, /ITEM RESULT 002/);
+    assert.match(p.prompt, /- Do not invent findings for missing inputs\./);
+
+    fake.submitReplies = [accepted("batch_syn")];
+    const syn = await service.createSynthesisJob(p, { previewOnly: false });
+    assert.equal(syn.localStatus, "submitted");
+    assert.equal(syn.kind, "synthesis");
+    assert.equal(syn.requestCount, 1);
+    assert.equal(syn.model, "anthropic/claude-haiku-5.5");
+    assert.deepEqual(syn.synthesis!.included.map((i) => [i.sourceOrdinal, i.customId]), [
+      [1, job.customIds[0]],
+      [3, job.customIds[2]],
+    ]);
+    assert.deepEqual(syn.synthesis!.excluded.map((e) => [e.sourceOrdinal, e.status]), [[2, "failed"]]);
+    assert.equal(syn.synthesis!.allowPartial, true);
+    assert.ok(fs.existsSync(service.registry.artefact(syn.localId, "synthesisLinkage")));
+    assert.ok(service.registry.events(job.localId).some((e) => e.eventType === "synthesis_created" && e.details?.synthesisJobId === syn.localId));
+    assert.equal(fs.readFileSync(service.registry.artefact(syn.localId, "context"), "utf8"), p.prompt);
+
+    // Restart while synthesis is active, then it completes.
+    const fresh = makeService(root, fake);
+    assert.deepEqual(fresh.jobsNeedingReconcile().map((j) => j.localId), [syn.localId]);
+    fake.getReplies = [{ status: 200, body: completed([ok(syn.customIds[0]!, "Consolidated: two components reviewed.")], { id: "batch_syn" }) }];
+    await fresh.reconcile(syn.localId, { force: true });
+    assert.equal(fresh.registry.read(syn.localId).localStatus, "ready");
+
+    // Coverage is rendered from local state, separately from the model's prose.
+    const read = fresh.readSynthesis(job.localId);
+    assert.match(read.body, /^COVERAGE \(recorded locally, not written by the model\)\nSource job: /);
+    assert.match(read.body, /Conclusions may be incomplete/);
+    assert.match(read.body, /Consolidated: two components reviewed\./);
+    const inj = fresh.buildInjection(job.localId, "default", { synthesis: true });
+    assert.ok(inj.ok);
+    assert.equal(inj.injectedJobId, syn.localId);
+    assert.match(inj.content, new RegExp(`Synthesis of source job: ${job.localId}   Synthesis job: ${syn.localId}`));
+    assert.match(inj.content, /Included items: 2\n/);
+    assert.match(inj.content, /- src\/registry\.ts \(item 2\): failed/);
+    assert.match(inj.content, /Validate it against the current repository/);
+
+    // A newer synthesis that is only previewed does not hide the ready one.
+    const again = await fresh.createSynthesisJob(await fresh.prepareSynthesis(job.localId, { allowPartial: true }), { previewOnly: true });
+    const reread = fresh.readSynthesis(job.localId);
+    assert.match(reread.title, new RegExp(`synthesis ${syn.localId} \\(ready\\)`));
+    assert.match(reread.body, new RegExp(`Earlier syntheses: ${again.localId} \\(previewed\\)`));
+  }),
+);
+
+test(
+  "synthesis after a successful retry uses combined coverage (full), recording which job supplied each item",
+  withWorkspace(async (root) => {
+    const { fake, service, job } = await partialJob(root);
+    fake.submitReplies = [accepted("batch_retry")];
+    const child = await service.retryItems(job.localId, { failed: true });
+    fake.getReplies = [{ status: 200, body: completed([ok(child.customIds[0]!, "B ok")], { id: "batch_retry" }) }];
+    await service.reconcile(child.localId, { force: true });
+    const p = await service.prepareSynthesis(job.localId, { allowPartial: false });
+    assert.deepEqual(p.blockers, []);
+    assert.deepEqual(p.linkage.included.map((i) => [i.sourceOrdinal, i.jobId]), [
+      [1, job.localId],
+      [2, child.localId],
+      [3, job.localId],
+    ]);
+    assert.match(p.prompt, new RegExp(`\\(from retry job ${child.localId}\\)`));
+    assert.match(p.prompt, /Partial synthesis explicitly allowed: no/);
+  }),
+);
+
+test(
+  "synthesis: oversized package is rejected explicitly, never silently trimmed",
+  withWorkspace(async (root) => {
+    const fake = new FakeOpenRouter();
+    const service = makeService(root, fake, makeConfig((c) => (c.workflows.maxSynthesisCharacters = 1200)));
+    const job = await submitPlan(service, fake);
+    fake.getReplies = [{ status: 200, body: completed(fake.lastCustomIds().map((id) => ok(id, "finding ".repeat(80)))) }];
+    await service.reconcile(job.localId, { force: true });
+    const p = await service.prepareSynthesis(job.localId, { allowPartial: false });
+    assert.match(p.blockers.join(), /maxSynthesisCharacters is 1200 \(local policy\)\. No results were dropped/);
+    await assert.rejects(service.prepareSynthesis(p.sourceJobId + "X", { allowPartial: false }));
   }),
 );
 
