@@ -255,6 +255,10 @@ draft → previewed → submitting → submitted → polling ⟲ → provider_co
   - A job left in `retrieving` after its raw response was saved finishes from that local `final-response.json`, with no network call. Item artefacts are rewritten idempotently.
   - A job left in `retrieving` before the raw response was saved is retrieved again.
 - **Concurrency:** a per-job lock file prevents overlapping polls, including across two Pi processes on the same project.
+  - A lock left by a process that died is taken over once it is older than 2 minutes. Until then the background poller skips that job and `/batch check <id>` reports it as busy.
+  - Takeovers are serialised, and the lock is re-read before removal, so two processes that both find the same stale lock cannot both end up holding it.
+  - The owner's process ID is deliberately not checked. The same workspace can be reached from different process-ID spaces (WSL and Windows, containers, synced or network folders), where a live owner can look dead. The age timeout is the only takeover rule.
+- **Provider status is authoritative.** A job stays `polling` while OpenRouter reports `in_progress`. In live testing, OpenRouter kept reporting `in_progress` for a while after the `finalized_at` time it already recorded for the batch, and the results became retrievable only once the status changed to `completed`. Polling more often does not shorten that, and a recorded finish time on its own does not mean the results can be retrieved yet. The delay varied between runs, so no particular duration should be expected.
 
 ## Configuration
 
@@ -331,3 +335,12 @@ The tests use a scripted fake OpenRouter (`test/fixtures/fake-openrouter.ts`). N
 - per-request models that differ from the batch model
 
 Passing the fake does not prove every upstream rule is met.
+
+### Scripting Pi in RPC mode
+
+When we drove Pi from a test script with `pi --mode rpc`, the Pi process exited as soon
+as the script closed its standard input, even while a command it had started (for example
+a submit or a background poll) was still waiting on the network. The interrupted submit was
+then recovered as `submission_unknown`, as designed. Interactive Pi sessions did not show
+this. If you script Pi in RPC mode, keep its input open until each command's RPC `response`
+has arrived, and a little longer if Pi's own background poller may still be working.
