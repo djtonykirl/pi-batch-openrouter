@@ -24,7 +24,7 @@ import {
   type WorkflowInfo,
 } from "./types.js";
 import { MAP_FILES, groupFiles, renderMapFilesPrompt } from "./workflows/map-files.js";
-import { coverageFacts, renderCoverage, renderSynthesisPrompt, type CoverageFacts, type SynthesisInputItem, type SynthesisUnusable } from "./workflows/synthesis.js";
+import { coverageFacts, renderCoverage, renderSynthesisPrompt, synthesisMessages, type CoverageFacts, type SynthesisInputItem, type SynthesisUnusable } from "./workflows/synthesis.js";
 
 export interface AskOptions {
   objective: string;
@@ -1239,7 +1239,7 @@ export class BatchService {
       }),
       allowPartial: opts.allowPartial,
     };
-    const messages = withSystemPrompt(true, prompt);
+    const messages = synthesisMessages(prompt);
     const contentSha256 = contentHash(buildSubmitBody({ model, provider: pin, requests: [{ custom_id: "{custom_id}", body: this.requestBody(messages) }] }));
     return { sourceJobId, model, account, pin, coverage: facts, linkage, prompt, characters: prompt.length, contentSha256, blockers };
   }
@@ -1259,7 +1259,7 @@ export class BatchService {
       items: [
         {
           source: { kind: "synthesis", label: `synthesis of ${prepared.sourceJobId}` },
-          body: this.requestBody(withSystemPrompt(true, prepared.prompt)),
+          body: this.requestBody(synthesisMessages(prepared.prompt)),
           characters: prepared.characters,
           prompt: prepared.prompt,
         },

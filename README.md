@@ -181,6 +181,22 @@ combined coverage, so a successful retry fills a gap. The new job records:
 - `/batch read <id> --synthesis` and `/batch inject <id> --synthesis` render that **coverage block from local state, separately from the model's prose**. They never rely on the model to mention missing inputs.
 - A package larger than `workflows.maxSynthesisCharacters` is rejected with a diagnostic; results are never silently dropped.
 
+**Instructions versus source material.** The synthesis prompt keeps the synthesis task apart from the
+material being synthesised. That material, everything that came from earlier requests, is treated as
+untrusted data: the original source objective, every item result, and source file names.
+- The task is stated in a synthesis-specific system message and in the `SYNTHESIS TASK` and
+  `OUTPUT REQUIREMENTS` sections. Coverage is generated locally.
+- The original objective is quoted in its own section, labelled as context that must not be carried out.
+- Each item result is quoted in a block between `<<<BEGIN … TOKEN>>>` and `<<<END … TOKEN>>>` lines.
+  The token is derived from the quoted content and checked not to occur in any of it, so source text cannot
+  end a block early or imitate a section. Quoted text is kept byte for byte.
+- File names and provider error reasons are JSON-quoted on a single line.
+
+This was added after a live test in which the synthesis model obeyed an instruction-like original objective
+("Reply with exactly the single word …") instead of synthesising. The separation makes that confusion much
+less likely. It is **not** complete protection against prompt injection: a model can still be influenced by
+quoted text, so synthesis output, like all batch output, is advisory and needs review.
+
 ### Usage and cost (multi-request)
 
 - **Batch level:** the batch's usage is shown exactly as returned: tokens, charged cost, BYOK flag, upstream inference cost.
