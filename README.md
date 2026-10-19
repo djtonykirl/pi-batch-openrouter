@@ -34,6 +34,15 @@ validated against a schema and exported with full provenance:
 /batch export B-20261019-QNM4 --format jsonl
 ```
 
+Then turn validated results into controlled files: Markdown, HTML or PDF, rendered locally and traceable to
+the job they came from. Edit the Markdown with Pi first if you like:
+
+```
+/batch artifact B-20261017-K3M9 --synthesis --template report --format markdown --out reports/review.md
+/artifact render reports/review.md --format pdf --out reports/review.pdf
+/artifact show A-20261019-E1ZF
+```
+
 OpenRouter batches are typically billed at about 50% of standard per-token pricing and complete within 24 hours
 (see the [Batch API quickstart](https://openrouter.ai/docs/batch-quickstart)). This extension does not guarantee either.
 
@@ -56,6 +65,8 @@ The API key comes from Pi's model registry/`auth.json` for the selected account 
 | `/batch run <workflow> --input <file> [options]` | One batch, one request per dataset row, from a project workflow (see [Project workflows and datasets](#project-workflows-and-datasets)). |
 | `/batch workflow list \| show <name> \| validate <name> \| validate --file <path>` | Discover, inspect and validate project workflows (`.pi/batch-workflows/*.yaml`). Local only. |
 | `/batch export <id> --format jsonl\|csv [--out <path>] [--overwrite] [--job-only]` | Write a finished job's results with provenance to a file (see [Export](#export)). |
+| `/batch artifact <id> [--synthesis\|--item <sel>] --format markdown\|html\|pdf\|text [--template <name>] [--out <path>] [--overwrite] [--allow-partial]` | Write a controlled file from validated results (see [Artifacts](#artifacts)). |
+| `/artifact list [--job <id>]` · `show <id>` · `render <file.md> --format html\|pdf` · `regenerate <id>` · `templates` | Inspect artifacts, render Pi/user-edited Markdown, re-render without a model call, list templates. |
 | `/batch import-legacy <jobs.json> --preview` | Read-only inventory of pre-Release-1 jobs (see [Known limitations](#known-limitations)). |
 | `/batch submit <id>` | Submit a job created with `--preview` (goal, workflow, retry or synthesis). |
 | `/batch list [--status active\|done\|ready\|failed\|…\|all] [--limit n]` | List jobs from **local** state (no network). `ITEMS` shows usable/total for multi-request jobs. |
@@ -400,6 +411,182 @@ workflow with `synthesis.enabled: false`.
   - JSON results are never flattened into columns.
   - JSONL is the exact representation.
 
+## Artifacts
+
+An artifact is a file produced from validated batch results by a **trusted local renderer**. The model supplies
+content (validated text or schema-validated JSON) and never controls anything else.
+
+```
+UNTRUSTED                     validated result (text, or JSON checked against a schema)
+---------------------------------- trust boundary ----------------------------------
+TRUSTED                       template (local data) -> renderer (in process) -> file at a path you chose
+```
+
+- **Model output never chooses** a path, a renderer, a format, a command, a URL, or code to run.
+- **Paths** come only from:
+  - your `--out`;
+  - your workflow's `artifact.filename`;
+  - a fixed internal default inside the artifact's folder.
+- **No automatic files:** retrieving a batch never creates one. Only `/batch artifact`, `/artifact render` and
+  `/artifact regenerate` do, and none of them calls OpenRouter or a model.
+
+### Creating artifacts
+
+```
+/batch artifact <job> --format markdown|html|pdf|text [--synthesis | --item <n|custom_id|source-id>]
+                      [--template <name>] [--out <workspace path>] [--overwrite] [--allow-partial]
+```
+
+**Source**, one of:
+- **`--synthesis`**: the newest *ready* synthesis of the job.
+- **`--item`**: one completed item. A dataset item with JSON output gives its parsed `output.json`.
+- **Neither**: the whole job result.
+  - Requires a ready job, or a partial one with `--allow-partial`; the gap is recorded and warned about.
+  - JSON jobs give `{ "items": [ { "source_id": …, …parsed fields } ] }`.
+
+Corrupt, failed and unfinished jobs are refused.
+
+**Formats:**
+
+| Format | From | Notes |
+|---|---|---|
+| `markdown` | text, or JSON through a template | UTF-8 `.md`/`.markdown` |
+| `html` | Markdown | self-contained; see the HTML rules below |
+| `pdf` | Markdown | rendered locally by pdfkit; validated before it is written |
+| `text` | the source content unchanged | `.txt .md .json .csv .yaml .yml .sql`; JSON sources only to `.json` (pretty-printed); a `.json` destination must parse |
+
+**Executable types are refused** (allowlist). Every other extension is refused, including `.ps1 .sh .bat .cmd
+.exe .dll .com .msi .js .py` and macro-enabled Office files. Generated code is not materialised in this release,
+and nothing is ever executed.
+
+### Templates
+
+Artifact templates live in `.pi/artifact-templates/<name>.yaml` and are **data**:
+
+```yaml
+schemaVersion: 1
+name: findings-report            # must equal the file name
+input:
+  type: json                     # json: a validated object; text: the result as {{content}}
+  schema:                        # json only: draft-07 schema the data must satisfy before rendering
+    type: object
+    required: [title, executiveSummary, findings]
+    properties:
+      title: { type: string }
+      executiveSummary: { type: string }
+      findings: { type: array, items: { type: string } }
+body: |
+  # {{title}}
+
+  {{executiveSummary}}
+
+  ## Findings
+
+  {{findings}}
+```
+
+**Placeholder rules.** The body uses the same `{{field}}`-only engine as workflows, so there are no expressions,
+loops, includes, environment variables or code, and values are never re-scanned. For JSON input, every
+placeholder must be a **required** schema property, so missing data fails before anything is rendered.
+Values become Markdown by fixed rules:
+- strings as is;
+- lists as `- item` lines;
+- lists of objects and objects as `**key:** value`;
+- deeper nesting or `null` is an error.
+
+**Validation.** Invalid structured data fails with schema errors (locations, not values), and nothing is rendered.
+`/artifact templates` lists templates with their problems. Each artifact records the template's file hash and the
+hash of the resolved input. It also keeps a copy of the template, so later edits to the template file never change
+an earlier artifact's recorded provenance.
+
+### HTML rules
+
+The Markdown is treated as untrusted text:
+- **Raw HTML** in the Markdown is escaped and shown as text.
+- **Images** are not loaded; each becomes `[image: alt]`.
+- **Links** keep only `http(s)`, `mailto`, `#` and relative targets.
+- **Content-Security-Policy:** the page carries one that blocks scripts and every external resource, as a second
+  layer.
+- **Styles** are inline; nothing is fetched.
+
+### PDF renderer
+
+PDFs are laid out **in process by [pdfkit](https://pdfkit.org/)**, which is pure JavaScript. There is no browser,
+no external program, no web service and no network access at render time, so it works the same on locked-down
+Windows. The model never produces PDF bytes.
+
+**Supported Markdown:**
+- headings and paragraphs, with bold, italic and inline code;
+- lists, including nested;
+- code blocks, quotes, rules and tables (one line per row);
+- links, shown as text with the target, not as clickable annotations;
+- images, shown as alt text.
+
+**Validation before writing.** The file goes to its destination only after these checks: `%PDF-` header,
+`%%EOF`, a `startxref` offset pointing at the cross-reference section, `/Root`, and at least one page. Otherwise
+nothing is written. The tests also load every PDF with an independent parser (pdf-lib).
+
+**Fonts.** The PDF standard fonts (Helvetica, Courier) are used. They are not embedded and cover Windows-1252.
+Other characters become ASCII equivalents (`→` becomes `->`) or `?`, and the artifact records how many were
+replaced.
+
+**Determinism.** Metadata dates are a fixed constant, so the same Markdown gives byte-identical PDFs. The render
+time is in the manifest.
+
+**Rendering dependencies:**
+
+| Package | Version | License | Kind | Network at render time | Why |
+|---|---|---|---|---|---|
+| `marked` | 18.0.11 | MIT | pure JS, no dependencies | none | Markdown parser; already in Pi's own dependency tree |
+| `pdfkit` | 0.20.2 | MIT | pure JS (fontkit, linebreak, fflate, png-js, @noble/*) | none | in-process PDF layout; no browser, executable or service |
+| `pdf-lib` | 1.17.1 | MIT | pure JS, **development only** | none | independent PDF parser used by the tests |
+
+### Provenance, the Pi-curated route, and regeneration
+
+Each artifact has a manifest at `.pi/batches/artifacts/<A-id>/manifest.json`, with an `events.jsonl` history,
+a `source.md` holding the exact Markdown rendered, and a `template.yaml` copy. It records:
+- **Source:** batch result, item, synthesis or local file, with its job and item IDs, the files read and their
+  SHA-256.
+- **State:** `batch-generated`, `unmodified-generated-output`, `modified-after-generation` or
+  `unlinked-local-file`.
+- **Lineage:** the artifact it was derived from or regenerated from, and the generation number at that path.
+- **Rendering:** the template and its input hash, the renderer and version, the destination and its SHA-256, and
+  the hash of any file replaced with `--overwrite`.
+
+**Pi-curated route.** `/batch artifact … --format markdown --out reports/x.md` creates an ordinary workspace
+file, so Pi can read and edit it with its normal tools. Then `/artifact render reports/x.md --format pdf --out
+reports/x.pdf` renders what the file contains **now**:
+- the new artifact records the current file's hash;
+- it links to the artifact that generated the file and to the originating job;
+- its source state says whether the file was **edited after generation**.
+
+An edited document is never presented as the original batch output.
+
+**Regeneration.** `/artifact regenerate <id> [--format …] [--out …]` re-renders the stored `source.md`, after
+checking its hash. It makes no model or OpenRouter call, and identical input gives identical output.
+
+**Safety:**
+- **Destinations** must resolve inside the workspace, including through symlinked directories, and may not be
+  inside `.pi/`, hard-denied paths or `.git/`.
+- **No overwrite** without `--overwrite`. Every successful render gets a new manifest, so earlier provenance is
+  never lost.
+- **Atomic writes:** each file is written to a temporary file, flushed, then hard-linked into place, or renamed
+  over the target with `--overwrite`. A failed render writes nothing.
+
+**Workflow default.** A Release 3 workflow can declare the artifact its jobs produce:
+
+```yaml
+artifact:
+  template: findings-report
+  format: pdf
+  filename: reports/findings.pdf
+```
+
+The default is **never generated automatically**:
+- when the job finishes, the notification and `/batch show` say an artifact is available;
+- `/batch artifact <job>` with no format, template or `--out` uses this default, read from the definition stored
+  with the job.
+
 ## What happens to your data
 
 - **Exclusions are applied before the request is built.** Evaluation order (the first match decides):
@@ -437,6 +624,7 @@ Everything is project-local in `.pi/batches/`. A `.gitignore` containing `*` is 
     result/items/001/   raw.json  result.json  result.md  output.json             (per item; output.json = parsed JSON)
     request/  workflow.yaml  workflow.json  dataset.json        (dataset jobs: definition copy, resolved definition + hashes, provenance)
     exports/                                                     (only from an explicit /batch export)
+  artifacts/A-20261019-E1ZF/  manifest.json  events.jsonl  source.md  template.yaml  [rendered.<ext> only without --out]
 ```
 
 - `submitted-request.json` contains the **exact bytes** POSTed to OpenRouter. `request.sha256` is the hash of those bytes.
@@ -533,6 +721,10 @@ All tools call the same `BatchService` as the slash commands, so they get the sa
 - `batch_plan_dataset` (`workflow`, `input`, optional `ids`, `from_row`, `to_row`, `model`) saves a dataset plan
   as a preview. It runs every check of `/batch run` and **never submits**.
 - There is deliberately no export tool. Writing export files is an explicit user command.
+- `artifact_list` and `artifact_show` are read-only.
+- `artifact_plan_render` (`source`, `format`, optional `out`) runs every check of `/artifact render` and renders
+  in memory, but **writes nothing**. It tells the user the command to run.
+- There is no artifact-writing tool.
 - `batch_check_jobs` (optional `batch_id`) reconciles, then reports from local state.
 
 ## Known limitations
@@ -543,6 +735,12 @@ All tools call the same `BatchService` as the slash commands, so they get the sa
   - **Timestamps** are resolved per value. The legacy writer stored `createdAt` in milliseconds and `finalizedAt` in Unix seconds, and the two plausible ranges do not overlap. Anything else stays **UNRESOLVED**.
   - **Import itself is deferred** because the legacy file is global and does not record which project a job belonged to. It also holds no raw provider responses or submitted requests, so records could only become unverifiable history (`legacy-unresolved`), never ready jobs.
 - **Scope.** `/batch ask` is one batch with one request. `/batch run map-files` is one batch with one request per file or group. `/batch run <workflow>` is one batch with one request per dataset row. All support only `/v1/chat/completions` and text (no images or URLs). One batch uses one model. Dataset workflows are one prompt per row: no multi-step pipelines, no conditionals, no expressions.
+- **Artifacts:**
+  - **DOCX is not produced.** It was deferred because the candidate library (`docx`) is about 9 MB, ships `@types/node` 26 as a *runtime* dependency, uses an older `jszip`/`readable-stream` 2 stack, and released six versions in three weeks. HTML and PDF cover the deliverables.
+  - **PDF output** uses the non-embedded standard fonts: Windows-1252 text only, with replacements reported.
+    There are no images, no clickable links and a simple layout.
+  - **Local sources** for `/artifact render` must be Markdown, and templates are not applied to them.
+  - **HTML** is only ever rendered from Markdown; raw model HTML is never passed through.
 - **Dataset field names** must match `[A-Za-z_][A-Za-z0-9_-]{0,63}`. CSV columns with other names (for example containing spaces) cannot be referenced.
 - **JSON Schema** support is draft-07 through Ajv in strict mode. `format` keywords are rejected as unknown, because no format plugin is loaded. Patterns run with JavaScript's regular expression engine, and workflow schemas are trusted local configuration.
 - **Model eligibility is decided by OpenRouter.** A model having a normal endpoint does not mean it has a `:batch` endpoint. The extension does not claim eligibility; it preserves the provider's 400/404/422 response and never switches models on its own.
