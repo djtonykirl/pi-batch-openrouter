@@ -7,6 +7,7 @@ import { discoverBatchModels } from "./models.js";
 import { INJECTED_MESSAGE_TYPE, type BatchRuntime } from "./runtime.js";
 import { jobItems, sourceLabel } from "./items.js";
 import { CHECK_LOCK_WAIT_MS, DuplicateActiveRequestError, SubmissionBlockedError, formatUsage, itemCounts, type InjectMode, type PreparedAsk, type PreparedDatasetRun, type PreparedPlan, type PreparedSynthesis } from "./service.js";
+import { formatLegacyInventory } from "./legacy.js";
 import { BUILTIN_WORKFLOWS, WorkflowNotFoundError, discoverWorkflows, findWorkflow, formatDiagnostics, validateWorkflowFile } from "./workflows/definition.js";
 import { ACTIVE_STATUSES, LOCAL_STATUSES, TERMINAL_STATUSES, type LocalStatus } from "./state.js";
 import { formatIsoShort } from "./time.js";
@@ -27,6 +28,7 @@ const SUBCOMMANDS: Record<string, { desc: string; nonTerminal: boolean }> = {
   run: { desc: "Run a workflow: run <project-workflow> --input data.csv [--preview] | run map-files --file a --prompt \"...\"", nonTerminal: true },
   workflow: { desc: "Project workflows: workflow list | show <name> | validate <name> | validate --file <path>", nonTerminal: true },
   export: { desc: "Export a finished job's results: export <id> --format jsonl|csv [--out path] [--overwrite]", nonTerminal: true },
+  "import-legacy": { desc: "Inventory a pre-Release-1 jobs.json (read-only): import-legacy <path> --preview", nonTerminal: true },
   items: { desc: "List a job's request items", nonTerminal: true },
   item: { desc: "Inspect one item: item <id> <n|custom_id|path> [--text] [--raw]", nonTerminal: true },
   "retry-items": { desc: "Re-run failed/selected items as a new linked job: retry-items <id> --failed | --item n", nonTerminal: true },
@@ -67,6 +69,8 @@ const HELP = `/batch — deferred OpenRouter Batch goals
       --model  --account  --provider  --preview
   export <id> --format jsonl|csv [--out <path>] [--overwrite] [--job-only]
                                      write results with provenance (default: job's exports/ folder)
+  import-legacy <jobs.json> --preview
+                                     read-only inventory of pre-Release-1 jobs (import itself is deferred)
   run map-files [options] --prompt "<objective>"
                                      one request per file, all in ONE batch
       --file <path> (repeatable)  --context <dir>  --group-size <n>
@@ -212,6 +216,8 @@ async function dispatch(rt: BatchRuntime, args: string, ctx: ExtensionCommandCon
       return cmdWorkflow(rt, rest, ctx);
     case "export":
       return cmdExport(rt, rest);
+    case "import-legacy":
+      return cmdImportLegacy(rt, rest, ctx);
     case "items":
       return cmdItems(rt, rest, ctx);
     case "item":
@@ -760,6 +766,23 @@ function cmdExport(rt: BatchRuntime, rest: string[]): void {
   if (format !== "jsonl" && format !== "csv") throw new Error("--format jsonl or --format csv is required");
   const rec = rt.requireService().exportResults(id, { format, out: parsed.values.out, overwrite: parsed.booleans.has("overwrite"), jobOnly: parsed.booleans.has("job-only") });
   rt.notify(`Exported ${rec.records} record(s) of ${id} as ${format}${rec.combined ? " (including results from linked retries)" : ""}:\n  ${rec.path}\n  sha256 ${rec.sha256}`, "info");
+}
+
+async function cmdImportLegacy(rt: BatchRuntime, rest: string[], ctx: ExtensionCommandContext): Promise<void> {
+  const parsed = parseArgs(rest, { booleans: ["preview"] });
+  if (parsed.errors.length) throw new Error(`/batch import-legacy: ${parsed.errors.join("; ")}`);
+  const file = parsed.positionals[0];
+  if (!file || parsed.positionals.length > 1) throw new Error("Usage: /batch import-legacy <path-to-jobs.json> --preview");
+  if (!parsed.booleans.has("preview")) {
+    throw new SubmissionBlockedError(
+      "Importing legacy jobs is not available in this release; nothing was changed.\n" +
+        "The legacy jobs.json is one global file with no record of which project each job belonged to, and it holds no raw\n" +
+        "provider responses or submitted requests, so its records could only become unverifiable history in this project.\n" +
+        `Use /batch import-legacy ${file} --preview for a read-only inventory.`,
+    );
+  }
+  const inventory = rt.requireService().legacyInventory(file);
+  await showText(rt, ctx, "Legacy jobs (preview)", formatLegacyInventory(inventory));
 }
 
 function formatPlanPreview(p: PreparedPlan, previewOnly: boolean): string {

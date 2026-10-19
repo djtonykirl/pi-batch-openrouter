@@ -16,6 +16,7 @@ import { findWorkflow, formatDiagnostics, type WorkflowDefinition, type Workflow
 import { planDatasetRun, type DatasetPlan, type EffectiveLimits } from "./workflows/dataset-run.js";
 import { resolveWorkspaceInput, resolveWorkspaceOutput } from "./workspace-paths.js";
 import { buildExportRows, toCsv, toJsonl, writeExport } from "./export.js";
+import { inventoryLegacyJobs, type LegacyInventory } from "./legacy.js";
 import { ARTEFACTS, JobRegistry, JobUpdate } from "./registry.js";
 import { ACTIVE_STATUSES, POLLABLE_STATUSES, TERMINAL_STATUSES, type LocalStatus } from "./state.js";
 import { formatIsoShort, isoToEpochMs, nowIso, parseProviderTimestamp } from "./time.js";
@@ -1615,6 +1616,19 @@ export class BatchService {
     );
     this.logger.log("info", "exported", { localId, format: opts.format, records: rows.length });
     return record;
+  }
+
+  // ---------------------------------------------------------------- legacy
+
+  /** Read-only inventory of a pre-Release-1 jobs.json. Never writes the file, never calls the network. */
+  public legacyInventory(file: string): LegacyInventory {
+    const abs = path.resolve(this.deps.workspaceRoot, file);
+    const st = fs.existsSync(abs) ? fs.statSync(abs) : undefined;
+    if (!st?.isFile()) throw new Error(`legacy jobs file not found: ${file}`);
+    if (st.size > 50_000_000) throw new Error(`legacy jobs file is ${st.size} bytes (limit 50000000)`);
+    const known = new Map<string, string>();
+    for (const j of this.registry.list().jobs) if (j.providerBatchId) known.set(j.providerBatchId, j.localId);
+    return inventoryLegacyJobs(fs.readFileSync(abs, "utf8"), known);
   }
 
   // ----------------------------------------------------------- read/inject
