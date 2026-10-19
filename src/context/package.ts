@@ -72,6 +72,13 @@ export interface PackageInput {
   knownSecrets: string[];
   /** Override for tests; default uses `git check-ignore`. */
   gitIgnored?: (root: string, relPaths: string[]) => Set<string> | null;
+  /**
+   * false: collect and check files only (no combined context text, no package-size
+   * check). Used by workflows, which build one prompt per item and apply their own
+   * per-item and total limits. Every other check (path, exclusion, binary, size,
+   * secret scan) still runs.
+   */
+  renderPackage?: boolean;
 }
 
 const KNOWN_TEXT_EXTENSIONS = new Set(
@@ -332,8 +339,8 @@ export function buildContextPackage(input: PackageInput): ContextPackage {
     warnings.push("secret scanning is disabled by configuration");
   }
 
-  const contextText = renderContextText(input.objective, files, input.includeInstructions, input.format);
-  if (contextText.length > config.context.maxContextCharacters) {
+  const contextText = input.renderPackage === false ? "" : renderContextText(input.objective, files, input.includeInstructions, input.format);
+  if (input.renderPackage !== false && contextText.length > config.context.maxContextCharacters) {
     problems.push({
       kind: "context_too_large",
       path: "<package>",
@@ -353,7 +360,7 @@ export function buildContextPackage(input: PackageInput): ContextPackage {
   };
 }
 
-function heading(text: string, char = "="): string {
+export function heading(text: string, char = "="): string {
   return `${text}\n${char.repeat(text.length)}`;
 }
 

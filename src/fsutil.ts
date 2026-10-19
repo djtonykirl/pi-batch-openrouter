@@ -64,6 +64,16 @@ export function writeOnce(filePath: string, data: string | Buffer): string {
   return target;
 }
 
+/**
+ * Like writeOnce, but if the target already holds exactly these bytes nothing is
+ * written. Used for evidence derived deterministically from a saved raw response,
+ * so re-running an interrupted retrieval is idempotent without overwriting anything.
+ */
+export function writeOnceUnlessIdentical(filePath: string, data: string): string {
+  if (fs.existsSync(filePath) && fs.readFileSync(filePath, "utf8") === data) return filePath;
+  return writeOnce(filePath, data);
+}
+
 export function appendJsonl(filePath: string, record: unknown): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.appendFileSync(filePath, JSON.stringify(record) + "\n", "utf8");

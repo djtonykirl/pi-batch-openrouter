@@ -83,7 +83,10 @@ test("unexpected custom_id (not ours) -> corrupt", () => {
   const n = run(completed([successItem("someone-else:1")]));
   assert.equal(n.outcome, "corrupt");
   assert.ok(n.issues.some((i) => i.includes("unexpected custom_id")));
-  assert.ok(n.issues.some((i) => i.includes(`expected custom_id ${CID} missing`)));
+  // Release 2: a missing expected ID is an item-level fact (item "missing"), recorded explicitly.
+  assert.deepEqual(n.missingCustomIds, [CID]);
+  assert.ok(n.warnings.some((w) => w.includes(`expected custom_id ${CID} missing`)));
+  assert.deepEqual(n.unexpected.map((u) => [u.customId, u.reason]), [["someone-else:1", "unknown_custom_id"]]);
 });
 
 test("missing output (empty content) is a failed item, never ready", () => {

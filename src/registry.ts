@@ -17,9 +17,15 @@ import type { JobEvent, JobManifest } from "./types.js";
  *       manifest.json            atomic snapshot (source of truth for current state)
  *       events.jsonl             append-only lifecycle history
  *       .lock                    cross-process advisory lock
- *       request/  objective.md, context.md, context-manifest.json, submitted-request.json, request.sha256
+ *       request/  objective.md, context.md, context-manifest.json, submitted-request.json, request.sha256,
+ *                 plan.json (workflows), synthesis-linkage.json (synthesis jobs)
+ *       request/items/001/  metadata.json, request.json, request.sha256, prompt.md     (Release 2)
  *       provider/ submission-response.json, latest-status.json, final-response.json
- *       result/   result.md, result.json, metadata.json
+ *       result/   result.md, result.json, metadata.json, summary.json, unexpected.json
+ *       result/items/001/   raw.json, result.json, result.md                          (Release 2)
+ *
+ * Item folders are named by ordinal, not custom_id: Release 1 custom_ids could
+ * contain ':' which is not a valid Windows file name character.
  *
  * Chosen over SQLite (better-sqlite3 / node:sqlite) for portability: no native
  * addon to build against Pi's Node ABI on Windows, and no ExperimentalWarning
@@ -42,7 +48,35 @@ export const ARTEFACTS = {
   resultMd: "result/result.md",
   resultJson: "result/result.json",
   resultMetadata: "result/metadata.json",
+  plan: "request/plan.json",
+  synthesisLinkage: "request/synthesis-linkage.json",
+  resultSummary: "result/summary.json",
+  resultUnexpected: "result/unexpected.json",
 } as const;
+
+export const ITEM_ARTEFACTS = {
+  metadata: "metadata.json",
+  request: "request.json",
+  requestSha: "request.sha256",
+  prompt: "prompt.md",
+  raw: "raw.json",
+  resultJson: "result.json",
+  resultMd: "result.md",
+} as const;
+
+const ITEM_SIDE: Record<keyof typeof ITEM_ARTEFACTS, "request" | "result"> = {
+  metadata: "request",
+  request: "request",
+  requestSha: "request",
+  prompt: "request",
+  raw: "result",
+  resultJson: "result",
+  resultMd: "result",
+};
+
+export function itemFolder(ordinal: number): string {
+  return String(ordinal).padStart(3, "0");
+}
 
 export class JobNotFoundError extends Error {
   constructor(public readonly localId: string) {
@@ -115,6 +149,11 @@ export class JobRegistry {
     return path.join(this.jobDir(localId), ...ARTEFACTS[name].split("/"));
   }
 
+  public itemArtefact(localId: string, ordinal: number, name: keyof typeof ITEM_ARTEFACTS): string {
+    if (!Number.isInteger(ordinal) || ordinal < 1) throw new Error(`invalid item ordinal ${ordinal}`);
+    return path.join(this.jobDir(localId), ITEM_SIDE[name], "items", itemFolder(ordinal), ITEM_ARTEFACTS[name]);
+  }
+
   public exists(localId: string): boolean {
     return isLocalJobId(localId) && fs.existsSync(path.join(this.root, localId, ARTEFACTS.manifest));
   }
@@ -150,7 +189,7 @@ export class JobRegistry {
       throw new CorruptManifestError(localId, (err as Error).message);
     }
     const m = parsed as Partial<JobManifest>;
-    if (!m || m.localId !== localId || !isLocalStatus(m.localStatus) || m.schemaVersion !== 1) {
+    if (!m || m.localId !== localId || !isLocalStatus(m.localStatus) || (m.schemaVersion !== 1 && m.schemaVersion !== 2)) {
       throw new CorruptManifestError(localId, "missing or invalid localId/localStatus/schemaVersion");
     }
     return m as JobManifest;

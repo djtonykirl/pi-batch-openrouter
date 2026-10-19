@@ -34,3 +34,16 @@ export function isLocalJobId(value: string): boolean {
 export function customIdFor(localId: string, index: number): string {
   return `${localId}_request-${String(index + 1).padStart(3, "0")}`;
 }
+
+/** Problems that make a set of custom_ids unsafe to submit (empty = OK). Uniqueness is exact (provider-side). */
+export function customIdProblems(ids: readonly string[]): string[] {
+  const problems: string[] = [];
+  if (ids.length === 0) problems.push("batch has no requests");
+  const seen = new Set<string>();
+  for (const id of ids) {
+    if (!CUSTOM_ID_PATTERN.test(id)) problems.push(`custom_id "${id}" does not match ${CUSTOM_ID_PATTERN.source}`);
+    if (seen.has(id)) problems.push(`duplicate custom_id "${id}"`);
+    seen.add(id);
+  }
+  return problems;
+}

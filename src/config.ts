@@ -32,6 +32,13 @@ export interface BatchConfig {
   security: { scanSecrets: boolean; blockOnSecret: boolean; allowOutsideWorkspace: boolean };
   injection: { maxCharacters: number; includeObjective: boolean; includeArtefactPaths: boolean };
   submission: { showPreview: boolean; requireConfirmation: boolean };
+  /** Local policy for multi-request workflows and synthesis (not OpenRouter limits). */
+  workflows: {
+    maxRequestsPerBatch: number;
+    maxCharactersPerItem: number;
+    maxTotalCharacters: number;
+    maxSynthesisCharacters: number;
+  };
 }
 
 export const DEFAULT_CONFIG: BatchConfig = {
@@ -55,6 +62,12 @@ export const DEFAULT_CONFIG: BatchConfig = {
   security: { scanSecrets: true, blockOnSecret: true, allowOutsideWorkspace: false },
   injection: { maxCharacters: 30000, includeObjective: true, includeArtefactPaths: true },
   submission: { showPreview: true, requireConfirmation: false },
+  workflows: {
+    maxRequestsPerBatch: 100,
+    maxCharactersPerItem: 500_000,
+    maxTotalCharacters: 5_000_000,
+    maxSynthesisCharacters: 1_000_000,
+  },
 };
 
 export const GLOBAL_CONFIG_DIR = path.join(os.homedir(), ".pi", "agent", "pi-batch-openrouter");
@@ -154,6 +167,12 @@ const SCHEMA: Record<string, Check | Record<string, Check>> = {
   security: { scanSecrets: bool, blockOnSecret: bool, allowOutsideWorkspace: bool },
   injection: { maxCharacters: posInt(), includeObjective: bool, includeArtefactPaths: bool },
   submission: { showPreview: bool, requireConfirmation: bool },
+  workflows: {
+    maxRequestsPerBatch: posInt(10_000),
+    maxCharactersPerItem: posInt(),
+    maxTotalCharacters: posInt(),
+    maxSynthesisCharacters: posInt(),
+  },
 };
 
 /** Validates field-by-field; invalid fields revert to defaults and are reported. Unknown keys are reported. */

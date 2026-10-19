@@ -2,62 +2,13 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import test from "node:test";
-import { DEFAULT_CONFIG, type BatchConfig } from "../src/config.js";
-import { OpenRouterBatchClient, type FetchLike } from "../src/openrouter/client.js";
-import { JobRegistry } from "../src/registry.js";
 import { BatchService, DuplicateActiveRequestError, SubmissionBlockedError, type AskOptions } from "../src/service.js";
 import type { JobManifest } from "../src/types.js";
+import { FAKE_KEY, FakeOpenRouter, accepted, makeConfig, makeService } from "./fixtures/fake-openrouter.js";
 import { batchObject, completed, failedItem, successItem } from "./fixtures/openrouter.js";
 import { rm, tempWorkspace, writeFiles } from "./helpers.js";
 
-const FAKE_KEY = "sk-or-v1-" + "fa4e".repeat(16);
-
-type Reply = { status: number; body: unknown } | Error | (() => Promise<{ status: number; body: unknown }>);
-
-/** Scripted OpenRouter: queues of replies per route; records every request. */
-class FakeOpenRouter {
-  public readonly requests: Array<{ method: string; url: string; headers: Record<string, string>; body?: string }> = [];
-  public submitReplies: Reply[] = [];
-  public getReplies: Reply[] = [];
-  public cancelReplies: Reply[] = [];
-  public offline = false;
-
-  public readonly fetch: FetchLike = async (url, init) => {
-    this.requests.push({ method: init.method, url, headers: init.headers, body: init.body });
-    if (this.offline) throw new TypeError("fetch failed (offline)");
-    const queue = init.method === "POST" && url.endsWith("/batches") ? this.submitReplies : url.endsWith("/cancel") ? this.cancelReplies : this.getReplies;
-    const reply = queue.length > 1 ? queue.shift()! : queue[0];
-    if (!reply) throw new Error(`no scripted reply for ${init.method} ${url}`);
-    if (reply instanceof Error) throw reply;
-    const r = typeof reply === "function" ? await reply() : reply;
-    return { status: r.status, text: async () => (typeof r.body === "string" ? r.body : JSON.stringify(r.body)) };
-  };
-}
-
-function makeConfig(): BatchConfig {
-  const c = structuredClone(DEFAULT_CONFIG);
-  c.polling.intervalSeconds = 60;
-  c.polling.maxBackoffSeconds = 900;
-  return c;
-}
-
-function makeService(root: string, fake: FakeOpenRouter, cfg = makeConfig(), settled: JobManifest[] = []) {
-  return new BatchService({
-    registry: new JobRegistry(path.join(root, ".pi", "batches")),
-    workspaceRoot: root,
-    getConfig: () => cfg,
-    resolveApiKey: async () => FAKE_KEY,
-    createClient: (apiKey, timeoutMs) => new OpenRouterBatchClient({ apiKey, fetchImpl: fake.fetch, timeoutMs }),
-    gitIgnored: () => new Set(),
-    onSettled: (j) => settled.push(j),
-  });
-}
-
 const ASK: AskOptions = { objective: "Review the authentication design", files: ["src/auth.ts"], contexts: [], format: "markdown", includeInstructions: true };
-
-function accepted(id = "batch_123") {
-  return { status: 202, body: batchObject({ id }) };
-}
 
 async function submitOne(service: BatchService, fake: FakeOpenRouter, ask: AskOptions = ASK): Promise<JobManifest> {
   fake.submitReplies = [accepted()];
@@ -392,6 +343,40 @@ test(
     const [a, b] = await Promise.all([service.reconcile(job.localId, { force: true }), service.reconcile(job.localId, { force: true })]);
     assert.deepEqual([a.skipped, b.skipped].sort(), ["locked", undefined].sort());
     assert.equal(service.registry.read(job.localId).pollAttempts, 1);
+  }),
+);
+
+test(
+  "an explicit check waits for an in-flight check instead of reporting busy; still never overlaps",
+  withWorkspace(async (root) => {
+    const fake = new FakeOpenRouter();
+    const service = makeService(root, fake);
+    const job = await submitOne(service, fake);
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const slow = async () => {
+      maxInFlight = Math.max(maxInFlight, ++inFlight);
+      await new Promise((r) => setTimeout(r, 150));
+      inFlight--;
+      return { status: 200, body: batchObject({ status: "in_progress" }) };
+    };
+    fake.getReplies = [slow, slow];
+    const [background, explicit] = await Promise.all([
+      service.reconcile(job.localId, { force: true }),
+      service.reconcile(job.localId, { force: true, waitForLockMs: 2000 }),
+    ]);
+    assert.equal(background.skipped, undefined);
+    assert.equal(explicit.skipped, undefined, "the waiting check ran after the lock was released");
+    assert.equal(maxInFlight, 1);
+    assert.equal(service.registry.read(job.localId).pollAttempts, 2);
+
+    // A lock that outlives the wait still yields "locked" (e.g. an abandoned lock within its stale window).
+    const held = service.registry.tryLock(job.localId)!;
+    const started = Date.now();
+    const gaveUp = await service.reconcile(job.localId, { force: true, waitForLockMs: 300 });
+    held.release();
+    assert.equal(gaveUp.skipped, "locked");
+    assert.ok(Date.now() - started >= 250);
   }),
 );
 

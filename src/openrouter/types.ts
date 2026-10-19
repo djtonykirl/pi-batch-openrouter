@@ -62,6 +62,28 @@ export interface BatchSnapshot {
   errorMessage?: string;
 }
 
+/**
+ * Local structural checks before anything is sent (empty = OK). OpenRouter stays
+ * authoritative for model/provider eligibility; this only rejects payloads we
+ * know to be wrong. custom_id rules are checked separately (ids.customIdProblems).
+ */
+export function submitBodyProblems(body: SubmitBody): string[] {
+  const problems: string[] = [];
+  const keys = Object.keys(body);
+  if (keys[keys.length - 1] !== "requests") problems.push(`"requests" must be the last top-level field (got order: ${keys.join(", ")})`);
+  if (body.endpoint !== "/v1/chat/completions") problems.push(`unsupported endpoint ${String(body.endpoint)}`);
+  if (typeof body.model !== "string" || !body.model.trim()) problems.push("batch-level model is empty");
+  if (!Array.isArray(body.requests) || body.requests.length === 0) problems.push("batch has no requests");
+  for (const [i, r] of (body.requests ?? []).entries()) {
+    const messages = r.body?.messages;
+    if (!Array.isArray(messages) || messages.length === 0) problems.push(`requests[${i}] has no messages`);
+    else if (messages.some((m) => typeof m.content !== "string" || !m.content.trim())) problems.push(`requests[${i}] has an empty message`);
+    const itemModel = (r.body as { model?: unknown } | undefined)?.model;
+    if (itemModel !== undefined && itemModel !== body.model) problems.push(`requests[${i}] names model ${String(itemModel)}; one batch uses one model (${body.model})`);
+  }
+  return problems;
+}
+
 export function buildSubmitBody(input: {
   model: string;
   provider?: ProviderPin;
