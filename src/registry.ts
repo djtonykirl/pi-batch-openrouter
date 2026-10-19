@@ -24,6 +24,7 @@ import type { JobEvent, JobManifest } from "./types.js";
  *       provider/ submission-response.json, latest-status.json, final-response.json
  *       result/   result.md, result.json, metadata.json, summary.json, unexpected.json
  *       result/items/001/   raw.json, result.json, result.md, output.json (parsed JSON; Release 3)
+ *       exports/  written only by an explicit `/batch export`                       (Release 3)
  *
  * Item folders are named by ordinal, not custom_id: Release 1 custom_ids could
  * contain ':' which is not a valid Windows file name character.
@@ -56,6 +57,7 @@ export const ARTEFACTS = {
   workflowSource: "request/workflow.yaml",
   workflowResolved: "request/workflow.json",
   dataset: "request/dataset.json",
+  exportsDir: "exports",
 } as const;
 
 export const ITEM_ARTEFACTS = {

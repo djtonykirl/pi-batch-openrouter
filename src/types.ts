@@ -135,6 +135,16 @@ export function isDatasetWorkflow(w: WorkflowInfo | undefined): w is DatasetWork
   return !!w && (w as DatasetWorkflowInfo).origin === "project";
 }
 
+export interface ExportRecord {
+  format: "jsonl" | "csv";
+  /** Workspace-relative path of the written file. */
+  path: string;
+  sha256: string;
+  records: number;
+  combined: boolean;
+  at: string;
+}
+
 export interface SynthesisSourceRef {
   /** Job holding the result actually used (the source job, or a linked retry job). */
   jobId: string;
@@ -187,6 +197,8 @@ export interface JobManifest {
   items?: JobItem[];
   workflow?: WorkflowInfo;
   synthesis?: SynthesisLinkage;
+  /** Exports written by `/batch export` (explicit user command only). */
+  exports?: ExportRecord[];
 
   createdAt: string;
   submittedAt?: string;

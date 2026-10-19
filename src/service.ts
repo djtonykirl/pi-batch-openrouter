@@ -14,8 +14,9 @@ import { buildSubmitBody, submitBodyProblems, type BatchRequestItem, type ChatMe
 import { compileOutputSchema, type OutputValidator } from "./workflows/structured.js";
 import { findWorkflow, formatDiagnostics, type WorkflowDefinition, type WorkflowEntry } from "./workflows/definition.js";
 import { planDatasetRun, type DatasetPlan, type EffectiveLimits } from "./workflows/dataset-run.js";
-import { resolveWorkspaceInput } from "./workspace-paths.js";
-import { JobRegistry, JobUpdate } from "./registry.js";
+import { resolveWorkspaceInput, resolveWorkspaceOutput } from "./workspace-paths.js";
+import { buildExportRows, toCsv, toJsonl, writeExport } from "./export.js";
+import { ARTEFACTS, JobRegistry, JobUpdate } from "./registry.js";
 import { ACTIVE_STATUSES, POLLABLE_STATUSES, TERMINAL_STATUSES, type LocalStatus } from "./state.js";
 import { formatIsoShort, isoToEpochMs, nowIso, parseProviderTimestamp } from "./time.js";
 import {
@@ -24,6 +25,7 @@ import {
   isDatasetWorkflow,
   type DatasetSelection,
   type DatasetWorkflowInfo,
+  type ExportRecord,
   type ItemSource,
   type JobItem,
   type JobKind,
@@ -1576,6 +1578,43 @@ export class BatchService {
       s.excluded.map((e) => ({ sourceOrdinal: e.sourceOrdinal, sourceLabel: sourceLabel(e), status: e.status, reason: e.reason })),
       s.allowPartial,
     );
+  }
+
+  // --------------------------------------------------------------- export
+
+  /**
+   * Writes a CSV/JSONL export of a finished job (explicit user command only).
+   * Destination: `--out` inside the workspace, else a new timestamped file in the
+   * job's exports/ folder. Never overwrites unless `overwrite` is set.
+   */
+  public exportResults(localId: string, opts: { format: "jsonl" | "csv"; out?: string; overwrite?: boolean; jobOnly?: boolean }): ExportRecord {
+    const job = this.registry.read(localId);
+    if (!TERMINAL_STATUSES.has(job.localStatus)) throw new Error(`${localId} is ${job.localStatus}; only finished jobs can be exported.`);
+    const combined = !opts.jobOnly;
+    const rows = buildExportRows(this.registry, job, { combined });
+    const data = opts.format === "jsonl" ? toJsonl(rows) : toCsv(rows);
+    let absPath: string;
+    if (opts.out) {
+      const r = resolveWorkspaceOutput(this.deps.workspaceRoot, opts.out);
+      if (!r.ok) throw new SubmissionBlockedError(`Export refused: ${r.message}. Nothing was written.`);
+      if (r.exists && !opts.overwrite) throw new SubmissionBlockedError(`Export refused: ${r.relPath} already exists. Nothing was written (use --overwrite to replace it).`);
+      absPath = r.absPath;
+    } else {
+      const stamp = new Date().toISOString().replace(/[-:.]/g, "");
+      absPath = path.join(this.registry.jobDir(localId), ARTEFACTS.exportsDir, `${localId}-${stamp}.${opts.format}`);
+    }
+    writeExport(absPath, data, opts.overwrite === true);
+    const rootReal = fs.realpathSync.native(this.deps.workspaceRoot);
+    const rel = path.relative(rootReal, fs.realpathSync.native(absPath)).split(path.sep).join("/");
+    const record: ExportRecord = { format: opts.format, path: rel, sha256: sha256Hex(data), records: rows.length, combined, at: nowIso() };
+    this.withLock(localId, () =>
+      this.registry.update(localId, (u) => {
+        u.manifest.exports = [...(u.manifest.exports ?? []), record];
+        u.note("exported", { ...record });
+      }),
+    );
+    this.logger.log("info", "exported", { localId, format: opts.format, records: rows.length });
+    return record;
   }
 
   // ----------------------------------------------------------- read/inject

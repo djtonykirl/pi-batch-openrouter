@@ -1,6 +1,6 @@
 import type { Component } from "@earendil-works/pi-tui";
 import { matchesKey, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
-import { ACTIVE_STATUSES, type LocalStatus } from "./state.js";
+import { ACTIVE_STATUSES, TERMINAL_STATUSES as TERMINAL, type LocalStatus } from "./state.js";
 import { formatIsoShort } from "./time.js";
 import { sourceLabel } from "./items.js";
 import { isDatasetWorkflow, type JobManifest } from "./types.js";
@@ -168,6 +168,7 @@ export function detailCommandHints(job: JobManifest): string[] {
     if (job.localStatus === "ready") hints.push(`/batch synthesize ${id}`);
     else if (job.localStatus === "partial") hints.push(`/batch synthesize ${id} --allow-partial`);
   }
+  if (isDatasetWorkflow(job.workflow) && TERMINAL.has(job.localStatus)) hints.push(`/batch export ${id} --format jsonl`);
   return hints;
 }
 
@@ -238,12 +239,14 @@ function datasetRows(job: JobManifest): Array<[string, string | number | undefin
     : w.selection.fromRow !== undefined || w.selection.toRow !== undefined
       ? `rows ${w.selection.fromRow ?? 1}-${w.selection.toRow ?? d.totalRows}`
       : "all rows";
+  const last = job.exports?.[job.exports.length - 1];
   return [
     ["Dataset", `${d.type} ${d.path} (sha256 ${d.sha256.slice(0, 12)}…)`],
     ["Rows", `${job.parentJobId ? "original run: " : ""}${d.totalRows} total · ${d.selectedRows} selected (${sel}) · ${d.excludedRows} excluded · ${d.invalidRows} invalid`],
     ["Fields sent", `${d.fields.join(", ")} (ID field: ${d.idField})`],
     ["Output", w.output === "json" ? "json (validated against the stored JSON Schema)" : "markdown"],
     ["Synthesis", w.synthesisEnabled ? "enabled by workflow" : "disabled by workflow"],
+    ["Exports", job.exports?.length ? `${job.exports.length} (latest: ${last!.format} ${last!.path}, ${last!.records} records)` : "none"],
   ];
 }
 

@@ -26,6 +26,7 @@ const SUBCOMMANDS: Record<string, { desc: string; nonTerminal: boolean }> = {
   submit: { desc: "Submit a job created with --preview", nonTerminal: true },
   run: { desc: "Run a workflow: run <project-workflow> --input data.csv [--preview] | run map-files --file a --prompt \"...\"", nonTerminal: true },
   workflow: { desc: "Project workflows: workflow list | show <name> | validate <name> | validate --file <path>", nonTerminal: true },
+  export: { desc: "Export a finished job's results: export <id> --format jsonl|csv [--out path] [--overwrite]", nonTerminal: true },
   items: { desc: "List a job's request items", nonTerminal: true },
   item: { desc: "Inspect one item: item <id> <n|custom_id|path> [--text] [--raw]", nonTerminal: true },
   "retry-items": { desc: "Re-run failed/selected items as a new linked job: retry-items <id> --failed | --item n", nonTerminal: true },
@@ -47,6 +48,7 @@ const ID_COMMANDS: Record<string, (j: JobManifest) => boolean> = {
   item: () => true,
   "retry-items": (j) => TERMINAL_STATUSES.has(j.localStatus),
   synthesize: (j) => j.kind !== "synthesis" && (j.localStatus === "ready" || j.localStatus === "partial"),
+  export: (j) => TERMINAL_STATUSES.has(j.localStatus),
 };
 
 const HELP = `/batch — deferred OpenRouter Batch goals
@@ -63,6 +65,8 @@ const HELP = `/batch — deferred OpenRouter Batch goals
                                      one request per dataset row (CSV/JSONL), all in ONE batch
       --id <source-id> (repeatable)  or  --from-row <n> --to-row <m>
       --model  --account  --provider  --preview
+  export <id> --format jsonl|csv [--out <path>] [--overwrite] [--job-only]
+                                     write results with provenance (default: job's exports/ folder)
   run map-files [options] --prompt "<objective>"
                                      one request per file, all in ONE batch
       --file <path> (repeatable)  --context <dir>  --group-size <n>
@@ -206,6 +210,8 @@ async function dispatch(rt: BatchRuntime, args: string, ctx: ExtensionCommandCon
     case "workflow":
     case "workflows":
       return cmdWorkflow(rt, rest, ctx);
+    case "export":
+      return cmdExport(rt, rest);
     case "items":
       return cmdItems(rt, rest, ctx);
     case "item":
@@ -683,7 +689,7 @@ export function formatDatasetPreview(p: PreparedDatasetRun, previewOnly: boolean
   return lines.join("\n");
 }
 
-// ---------------------------------------------------------------- workflow
+// --------------------------------------------------------- workflow / export
 
 async function cmdWorkflow(rt: BatchRuntime, rest: string[], ctx: ExtensionCommandContext): Promise<void> {
   const service = rt.requireService();
@@ -744,6 +750,16 @@ async function cmdWorkflow(rt: BatchRuntime, rest: string[], ctx: ExtensionComma
     return;
   }
   throw new Error(`Unknown workflow action "${action}". Use: /batch workflow list | show <name> | validate <name> | validate --file <path>`);
+}
+
+function cmdExport(rt: BatchRuntime, rest: string[]): void {
+  const parsed = parseArgs(rest, { values: ["format", "out"], booleans: ["overwrite", "job-only"] });
+  if (parsed.errors.length) throw new Error(`/batch export: ${parsed.errors.join("; ")}`);
+  const id = requireId(rt, parsed.positionals, "/batch export <id> --format jsonl|csv [--out <path>] [--overwrite] [--job-only]");
+  const format = (parsed.values.format ?? "").toLowerCase();
+  if (format !== "jsonl" && format !== "csv") throw new Error("--format jsonl or --format csv is required");
+  const rec = rt.requireService().exportResults(id, { format, out: parsed.values.out, overwrite: parsed.booleans.has("overwrite"), jobOnly: parsed.booleans.has("job-only") });
+  rt.notify(`Exported ${rec.records} record(s) of ${id} as ${format}${rec.combined ? " (including results from linked retries)" : ""}:\n  ${rec.path}\n  sha256 ${rec.sha256}`, "info");
 }
 
 function formatPlanPreview(p: PreparedPlan, previewOnly: boolean): string {
