@@ -67,6 +67,7 @@ The API key comes from Pi's model registry/`auth.json` for the selected account 
 | `/batch export <id> --format jsonl\|csv [--out <path>] [--overwrite] [--job-only]` | Write a finished job's results with provenance to a file (see [Export](#export)). |
 | `/batch artifact <id> [--synthesis\|--item <sel>] --format markdown\|html\|pdf\|text [--template <name>] [--out <path>] [--overwrite] [--allow-partial]` | Write a controlled file from validated results (see [Artifacts](#artifacts)). |
 | `/artifact list [--job <id>]` · `show <id>` · `render <file.md> --format html\|pdf` · `regenerate <id>` · `templates` | Inspect artifacts, render Pi/user-edited Markdown, re-render without a model call, list templates. |
+| `/batch metadata plan --context <context.md> --input <tables.jsonl> [--preview]` · `summary` · `review` · `approved` · `validate-approved` | Databricks table descriptions and column comments: proposals, review and a handoff file (see [Databricks metadata enrichment](#databricks-metadata-enrichment-phase-1)). |
 | `/batch import-legacy <jobs.json> --preview` | Read-only inventory of pre-Release-1 jobs (see [Known limitations](#known-limitations)). |
 | `/batch submit <id>` | Submit a job created with `--preview` (goal, workflow, retry or synthesis). |
 | `/batch list [--status active\|done\|ready\|failed\|…\|all] [--limit n]` | List jobs from **local** state (no network). `ITEMS` shows usable/total for multi-request jobs. |
@@ -586,6 +587,137 @@ The default is **never generated automatically**:
 - when the job finishes, the notification and `/batch show` say an artifact is available;
 - `/batch artifact <job>` with no format, template or `--out` uses this default, read from the definition stored
   with the job.
+
+## Databricks metadata enrichment (Phase 1)
+
+This proposes **table descriptions and column comments** for Databricks tables from evidence exported by
+Databricks, plus one shared domain context file, through OpenRouter Batch. It produces a review document and a
+reviewed handoff file for Databricks to validate and apply.
+
+**What Pi never does here:**
+- connect to Databricks or hold Databricks credentials;
+- generate or run SQL;
+- change Unity Catalog;
+- approve anything on its own.
+
+There are no tags, glossary, ontology or relationships in Phase 1.
+
+```
+metadata/<domain>/context.md      shared business context (untrusted source material)
+metadata/<domain>/tables.jsonl    one Databricks table per line (exported by Databricks)
+```
+
+```
+/batch metadata plan --context metadata/beverage/context.md --input metadata/beverage/tables.jsonl --preview
+/batch submit <job>                       (then /batch check, items, item, retry-items as usual)
+/batch metadata summary <job>
+/batch metadata review <job> --out metadata/beverage/review.md
+/batch metadata approved <job> --out metadata/beverage/approved.jsonl
+/batch metadata validate-approved metadata/beverage/approved.jsonl
+```
+
+### Input: `tables.jsonl`
+
+```json
+{"table": "catalog.schema.formulation", "existing_description": null,
+ "columns": [{"name": "status_cd", "data_type": "STRING", "nullable": true, "existing_comment": null,
+              "sample_values": ["ACTIVE", "DRAFT"]}]}
+```
+
+**Required fields:**
+- `table`: a three-part `catalog.schema.table` name;
+- `existing_description`, which may be `null`;
+- `columns`, each with `name`, `data_type`, `nullable` and `existing_comment` (which may be `null`).
+
+**Optional:** `sample_values`, at most 20 scalars per column.
+
+**Rejected input:**
+- unknown fields;
+- duplicate tables or columns (compared case-insensitively, as Databricks does);
+- malformed lines, reported with their line number and never their values.
+
+**Samples.** The Databricks extraction decides whether to include sample values; Pi sends exactly what is in the
+file. The context and every table's evidence are secret-scanned before anything is sent, and findings block the
+plan without echoing the value. The preview shows how many tables carry samples, never the samples themselves.
+
+### One table per request, with isolation
+
+Each request contains the shared context and **only its own table**:
+
+```
+METADATA GENERATION INSTRUCTIONS
+DOMAIN CONTEXT    <<<DOMAIN CONTEXT BEGIN Q…>>> context.md <<<DOMAIN CONTEXT END Q…>>>
+TABLE EVIDENCE    <<<TABLE EVIDENCE BEGIN Q…>>> one table as JSON <<<TABLE EVIDENCE END Q…>>>
+OUTPUT REQUIREMENTS  (the proposal JSON Schema)
+```
+
+This uses the same isolation as synthesis:
+- a task-specific system message;
+- quoted blocks whose boundary token is derived from, and verified absent from, the quoted text;
+- instruction-like text in the context, in names, in existing comments or in samples remains source material.
+
+The model is told:
+- explain business meaning, and don't just restate the type;
+- don't invent meaning;
+- keep the domain's terminology;
+- treat existing comments as evidence;
+- return `null` with confidence `insufficient` rather than guess.
+
+This reduces prompt-injection risk but doesn't eliminate it.
+
+The preview shows the context and input paths with their SHA-256, the number of tables and requests, the tables
+with samples, the provider-bound characters, the largest request and the model. Planning persists the evidence,
+per-table input hashes and request hashes in `request/metadata.json`.
+
+### Proposals and validation
+
+```json
+{"table": "catalog.schema.formulation",
+ "table_description": {"comment": "…", "confidence": "high|medium|low|insufficient", "reason": "…"},
+ "columns": [{"name": "status_cd", "comment": null, "confidence": "insufficient", "reason": "…"}]}
+```
+
+**Validation, before an item can complete:**
+- strict JSON Schema, with unknown fields rejected and no coercion;
+- `table` must equal the item's **own** table, taken from the request rather than from what the model claims;
+- every input column appears exactly once, with its exact name: no missing, duplicate or invented columns;
+- a `null` comment requires `insufficient`, and `insufficient` requires `null`.
+
+Invalid JSON or a failed check makes the item `corrupt`, with the raw output and errors kept. The usual outcome
+rules apply (`partial`, `retry-items`, combined coverage). The checks cover identity and structure, not whether
+the prose is right.
+
+### Review and handoff
+
+- **`review`** writes a Markdown review as an artifact. It contains:
+  - coverage and confidence totals;
+  - per table, the existing and proposed description, confidence and reason, a column table (existing,
+    proposed, confidence), and an "Insufficient evidence" list;
+  - tables without a usable proposal, listed rather than dropped;
+  - the statement "Proposed metadata has not been applied to Databricks".
+
+  Render it with `/artifact render … --format pdf`.
+- **`approved`** writes a **draft** handoff (`.jsonl`, one table per line, input order, fixed keys).
+  - **Existing values are kept**: a generated replacement is never approved automatically, but appears in the
+    review for the reviewer to adopt.
+  - Empty values take the proposal, and insufficient evidence stays `null`.
+  - Every table is included. A table without a usable proposal keeps its existing values, and needs
+    `--allow-partial`.
+  - Each row carries provenance: job, result job and `custom_id`, input hash, context hash and proposal hash.
+- **`validate-approved`** checks a (reviewer-edited) file against the job's stored evidence. It rejects:
+  - tables or columns that aren't in the job, or are missing or duplicated;
+  - altered existing values;
+  - stale hashes;
+  - extra fields, such as SQL.
+
+  It reports how many values were kept, taken as proposed, **edited by a reviewer**, or left null.
+
+```json
+{"table": "catalog.schema.formulation", "existing_description": null, "approved_description": "…",
+ "columns": [{"name": "status_cd", "existing_comment": null, "approved_comment": null}],
+ "provenance": {"job_id": "B-…", "result_job_id": "B-…", "result_custom_id": "B-…_request-002",
+                "input_sha256": "…", "context_sha256": "…", "proposal_sha256": "…"}}
+```
 
 ## What happens to your data
 
