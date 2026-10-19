@@ -1,7 +1,5 @@
-import * as crypto from "node:crypto";
 import * as fs from "node:fs";
-import * as path from "node:path";
-import { atomicWriteFile } from "./fsutil.js";
+import { writeFileAtomicExclusive } from "./fsutil.js";
 import { combinedCoverage, itemText, jobItems, sourceLabel } from "./items.js";
 import type { JobRegistry } from "./registry.js";
 import { isDatasetWorkflow, type JobItem, type JobManifest } from "./types.js";
@@ -139,39 +137,5 @@ export function toCsv(rows: readonly ExportRow[]): string {
   return lines.join("\r\n") + "\r\n";
 }
 
-/**
- * Atomic write. Without `overwrite` the destination is created exclusively: the
- * complete temp file is hard-linked into place (fails if anything exists there),
- * so an existing file is never replaced and a crash never leaves a partial file.
- */
-export function writeExport(absPath: string, data: string, overwrite: boolean): void {
-  if (overwrite) {
-    atomicWriteFile(absPath, data);
-    return;
-  }
-  fs.mkdirSync(path.dirname(absPath), { recursive: true });
-  const tmp = `${absPath}.tmp.${process.pid}.${crypto.randomBytes(4).toString("hex")}`;
-  const fd = fs.openSync(tmp, "wx");
-  try {
-    fs.writeSync(fd, Buffer.from(data, "utf8"));
-    fs.fsyncSync(fd);
-  } finally {
-    fs.closeSync(fd);
-  }
-  try {
-    try {
-      fs.linkSync(tmp, absPath);
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code === "EEXIST") throw new Error(`${absPath} already exists; nothing was overwritten (use --overwrite to replace it, or --out <path>)`);
-      // File systems without hard links: exclusive copy (still never overwrites).
-      fs.copyFileSync(tmp, absPath, fs.constants.COPYFILE_EXCL);
-    }
-  } finally {
-    try {
-      fs.unlinkSync(tmp);
-    } catch {
-      // best-effort temp cleanup
-    }
-  }
-}
+/** Exports use the shared atomic, never-overwrite-by-default writer. */
+export const writeExport = writeFileAtomicExclusive;

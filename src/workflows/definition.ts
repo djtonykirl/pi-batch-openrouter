@@ -137,7 +137,7 @@ function displayPath(pointer: string): string {
     .reduce((acc, seg) => (/^\d+$/.test(seg) ? `${acc}[${seg}]` : acc ? `${acc}.${seg}` : seg), "");
 }
 
-function schemaDiagnostics(file: string, errors: readonly ErrorObject[]): Diagnostic[] {
+export function schemaDiagnostics(file: string, errors: readonly ErrorObject[]): Diagnostic[] {
   return errors.map((e) => {
     const at = displayPath(e.instancePath);
     if (e.keyword === "additionalProperties") {
@@ -154,7 +154,7 @@ function schemaDiagnostics(file: string, errors: readonly ErrorObject[]): Diagno
 }
 
 /** Parses YAML strictly: one document, unique keys, no aliases/anchors, no custom tags. */
-function parseYaml(text: string, file: string): { ok: true; value: unknown } | { ok: false; diagnostics: Diagnostic[] } {
+export function parseYaml(text: string, file: string): { ok: true; value: unknown } | { ok: false; diagnostics: Diagnostic[] } {
   const doc = parseDocument(text, { uniqueKeys: true, merge: false, version: "1.2", schema: "core", prettyErrors: false });
   const problems = [...doc.errors, ...doc.warnings].map((e) => {
     const pos = e.linePos?.[0];
@@ -174,7 +174,7 @@ function parseYaml(text: string, file: string): { ok: true; value: unknown } | {
   return { ok: true, value: doc.toJS({ maxAliasCount: 0 }) };
 }
 
-function hasProtoKey(v: unknown): boolean {
+export function hasProtoKey(v: unknown): boolean {
   if (Array.isArray(v)) return v.some(hasProtoKey);
   if (v && typeof v === "object") return Object.keys(v).some((k) => k === "__proto__" || hasProtoKey((v as Record<string, unknown>)[k]));
   return false;
@@ -263,7 +263,7 @@ export function resolvedHash(def: WorkflowDefinition): string {
   return sha256Hex(canonicalJson(def));
 }
 
-function decodeUtf8(bytes: Buffer): string | undefined {
+export function decodeUtf8(bytes: Buffer): string | undefined {
   try {
     const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
     return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;

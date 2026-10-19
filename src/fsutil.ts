@@ -241,3 +241,40 @@ export function isInside(parent: string, child: string): boolean {
   if (path.isAbsolute(rel)) return false; // different drive on Windows
   return !/^\.\.([\\/]|$)/.test(rel);
 }
+
+/**
+ * Atomic write. Without `overwrite` the destination is created exclusively: the
+ * complete temp file is hard-linked into place (fails if anything exists there),
+ * so an existing file is never replaced and a crash never leaves a partial file.
+ */
+export function writeFileAtomicExclusive(absPath: string, data: string | Buffer, overwrite: boolean): void {
+  if (overwrite) {
+    atomicWriteFile(absPath, data);
+    return;
+  }
+  fs.mkdirSync(path.dirname(absPath), { recursive: true });
+  const tmp = `${absPath}.tmp.${process.pid}.${crypto.randomBytes(4).toString("hex")}`;
+  const fd = fs.openSync(tmp, "wx");
+  try {
+    fs.writeSync(fd, typeof data === "string" ? Buffer.from(data, "utf8") : data);
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  try {
+    try {
+      fs.linkSync(tmp, absPath);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "EEXIST") throw new Error(`${absPath} already exists; nothing was overwritten (use --overwrite to replace it, or --out <path>)`);
+      // File systems without hard links: exclusive copy (still never overwrites).
+      fs.copyFileSync(tmp, absPath, fs.constants.COPYFILE_EXCL);
+    }
+  } finally {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      // best-effort temp cleanup
+    }
+  }
+}
