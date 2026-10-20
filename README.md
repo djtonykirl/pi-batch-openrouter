@@ -904,3 +904,20 @@ a submit or a background poll) was still waiting on the network. The interrupted
 then recovered as `submission_unknown`, as designed. Interactive Pi sessions did not show
 this. If you script Pi in RPC mode, keep its input open until each command's RPC `response`
 has arrived, and a little longer if Pi's own background poller may still be working.
+
+`scripts/pi-rpc.mjs` does this for you. It loads this extension into a real Pi with tools, MCP, skills and
+sessions disabled, and sends the given commands:
+
+```
+node scripts/pi-rpc.mjs <workspace> "/batch metadata plan --context ctx.md --input tables.jsonl --preview" "/batch list"
+```
+
+It only ever sends `/batch` and `/artifact` commands, because any other text reaches Pi's chat model as an
+ordinary prompt and may be billed:
+- an argument that is not such a command is refused before Pi starts (exit 2);
+- if Pi starts an agent turn anyway, the script kills Pi at once (exit 3).
+
+Git Bash rewrites a leading `/batch` into a Windows path (`C:/Program Files/Git/batch …`), which is exactly
+that case. Run the script from PowerShell, or set `MSYS_NO_PATHCONV=1` in Git Bash. `PI_LINGER_MS` (default
+15000) sets how long to wait after the last command, and `PI_MAX` (default 2500) the characters printed per
+message. Commands that reach OpenRouter (`submit`, `check`) are real, paid calls unless the network is blocked.
