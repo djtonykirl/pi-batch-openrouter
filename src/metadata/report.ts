@@ -132,6 +132,9 @@ export function metadataReviewMarkdown(o: MetadataOutcome): string {
   }
   for (const t of o.tables) {
     out.push("", `## ${t.table}`, "");
+    // Contract v2 only: v1 documents are unchanged.
+    const facts = [t.evidence.layer && `**Layer:** ${t.evidence.layer}`, t.evidence.object_type && `**Object:** ${t.evidence.object_type}`].filter(Boolean);
+    if (facts.length) out.push(facts.join(" · "), "");
     out.push("**Existing description:**", "", block(t.evidence.existing_description), "");
     if (!t.proposal) {
       out.push(`_No usable proposal (${t.status})._ Retry it with \`/batch retry-items ${o.job.localId} --failed\`.`);
@@ -140,11 +143,13 @@ export function metadataReviewMarkdown(o: MetadataOutcome): string {
     const d = t.proposal.table_description;
     out.push("**Proposed description:**", "", block(d.comment), "", `**Confidence:** ${d.confidence}`, "", `**Reason:** ${d.reason}`, "");
     if (t.evidence.existing_description !== null && d.comment !== null && d.comment !== t.evidence.existing_description) out.push("_An existing description is present: the proposal replaces it only if a reviewer approves the change._", "");
-    out.push("### Columns", "", "| Column | Type | Existing | Proposed | Confidence |", "|---|---|---|---|---|");
+    const tiers = t.evidence.columns.some((c) => c.profile);
+    out.push("### Columns", "", tiers ? "| Column | Type | Tier | Existing | Proposed | Confidence |" : "| Column | Type | Existing | Proposed | Confidence |", tiers ? "|---|---|---|---|---|---|" : "|---|---|---|---|---|");
     const byName = new Map(t.proposal.columns.map((c) => [c.name, c]));
     for (const c of t.evidence.columns) {
       const p = byName.get(c.name)!;
-      out.push(`| ${cell(c.name)} | ${cell(c.data_type)} | ${cell(c.existing_comment)} | ${cell(p.comment)} | ${p.confidence} |`);
+      const tier = tiers ? ` ${c.profile ? String(c.profile.disclosure_tier) : "—"} |` : "";
+      out.push(`| ${cell(c.name)} | ${cell(c.data_type)} |${tier} ${cell(c.existing_comment)} | ${cell(p.comment)} | ${p.confidence} |`);
     }
     const insufficient = t.proposal.columns.filter((c) => c.comment === null);
     if (d.comment === null || insufficient.length) {

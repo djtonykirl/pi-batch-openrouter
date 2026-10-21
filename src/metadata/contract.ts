@@ -3,7 +3,7 @@ import { canonicalJson, sha256Hex } from "../fsutil.js";
 import { formatErrors } from "../workflows/structured.js";
 
 /**
- * Phase 1 Databricks metadata enrichment: the data contracts.
+ * Databricks metadata enrichment: the data contracts.
  *
  *   tables.jsonl   one Databricks table per line (exported by Databricks)
  *   proposal       what the model must return for one table
@@ -11,6 +11,12 @@ import { formatErrors } from "../workflows/structured.js";
  *
  * All three are validated strictly: unknown fields are rejected, nothing is
  * coerced or defaulted. Only descriptions and column comments are in scope.
+ *
+ * tables.jsonl contract v2 is a strict superset of v1: it adds optional,
+ * already-obfuscated evidence computed inside Databricks (a per-column `profile`
+ * and table-level layer/grain/lineage fields). Every v1 line is a valid v2 line and
+ * hashes exactly as before. The schema mirrors the Databricks side's
+ * `contract/tables.v2.schema.json` field for field (checked by test).
  */
 
 /** catalog.schema.table: three non-empty parts without whitespace, dots or control characters. */
@@ -19,18 +25,58 @@ export const CONFIDENCE = ["high", "medium", "low", "insufficient"] as const;
 export type Confidence = (typeof CONFIDENCE)[number];
 const MAX_SAMPLES = 20;
 
+/** 0 open (reference values), 1 shape, 2 statistics, 3 label only. */
+export type DisclosureTier = 0 | 1 | 2 | 3;
+
+export interface ColumnProfile {
+  disclosure_tier: DisclosureTier;
+  tier_reason: string;
+  column_family_id?: string;
+  pct_null?: number;
+  pct_unique?: number;
+  is_candidate_key?: boolean;
+  format_masks?: Array<{ mask: string; pct: number }>;
+  len_min?: number;
+  len_max?: number;
+  numeric_sign?: "positive" | "negative" | "mixed" | "zero";
+  magnitude_order?: number;
+  decimal_places?: number;
+  join_hints?: Array<{ target_table: string; target_column: string; pct_overlap: number }>;
+  semantic_label?: string;
+}
+
 export interface ColumnEvidence {
   name: string;
   data_type: string;
   nullable: boolean;
   existing_comment: string | null;
   sample_values?: Array<string | number | boolean | null>;
+  /** v2 only. */
+  profile?: ColumnProfile;
 }
 
 export interface TableEvidence {
   table: string;
   existing_description: string | null;
   columns: ColumnEvidence[];
+  /** v2 only: "2" makes a profile required on every column. */
+  contract_version?: "2";
+  layer?: "bronze" | "silver" | "gold" | "other";
+  domain_prefix?: string;
+  object_type?: "MANAGED" | "EXTERNAL" | "VIEW" | "MATERIALIZED_VIEW" | "STREAMING_TABLE";
+  row_count_band?: "0" | "1-1K" | "1K-100K" | "100K-10M" | ">10M";
+  write_cadence?: "daily" | "weekly" | "monthly" | "adhoc" | "unknown";
+  grain_candidates?: string[][];
+  upstream_tables?: string[];
+  writer_logic?: string;
+  view_definition?: string;
+}
+
+const V2_TABLE_FIELDS = ["contract_version", "layer", "domain_prefix", "object_type", "row_count_band", "write_cadence", "grain_candidates", "upstream_tables", "writer_logic", "view_definition"] as const;
+
+/** True when a record uses any v2 field (table-level or a column profile). */
+export function usesV2Evidence(t: TableEvidence): boolean {
+  return V2_TABLE_FIELDS.some((k) => t[k] !== undefined) || t.columns.some((c) => c.profile !== undefined);
 }
 
 export interface ColumnProposal {
@@ -63,31 +109,108 @@ export interface ApprovedRow {
 
 const nullableText = { anyOf: [{ type: "string", minLength: 1, maxLength: 4000 }, { type: "null" }] };
 
+/**
+ * tables.jsonl line, contract v2 (strict superset of v1). Tier rules are schema-enforced:
+ * sample_values only at tier 0 (or without a profile); no masks/lengths at tiers 2-3;
+ * no numeric shape at tier 3; contract_version "2" requires a profile on every column.
+ */
 export const TABLE_EVIDENCE_SCHEMA = {
   type: "object",
   additionalProperties: false,
   required: ["table", "existing_description", "columns"],
-  properties: {
-    table: { type: "string", pattern: TABLE_NAME_PATTERN, maxLength: 765 },
-    existing_description: nullableText,
-    columns: {
-      type: "array",
-      minItems: 1,
-      maxItems: 2000,
-      items: {
-        type: "object",
-        additionalProperties: false,
-        required: ["name", "data_type", "nullable", "existing_comment"],
-        properties: {
-          name: { type: "string", minLength: 1, maxLength: 255 },
-          data_type: { type: "string", minLength: 1, maxLength: 1000 },
-          nullable: { type: "boolean" },
-          existing_comment: nullableText,
-          sample_values: { type: "array", maxItems: MAX_SAMPLES, items: { anyOf: [{ type: "string", maxLength: 500 }, { type: "number" }, { type: "boolean" }, { type: "null" }] } },
+  definitions: {
+    tableName: { type: "string", pattern: TABLE_NAME_PATTERN, maxLength: 765 },
+    nullableText,
+    pct: { type: "number", minimum: 0, maximum: 100 },
+    profile: {
+      type: "object",
+      additionalProperties: false,
+      required: ["disclosure_tier", "tier_reason"],
+      properties: {
+        disclosure_tier: { type: "integer", minimum: 0, maximum: 3 },
+        tier_reason: { type: "string", minLength: 1, maxLength: 500 },
+        column_family_id: { type: "string", pattern: "^[a-z0-9_]{1,64}$" },
+        pct_null: { $ref: "#/definitions/pct" },
+        pct_unique: { $ref: "#/definitions/pct" },
+        is_candidate_key: { type: "boolean" },
+        format_masks: {
+          type: "array",
+          maxItems: 5,
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["mask", "pct"],
+            properties: {
+              mask: { type: "string", minLength: 1, maxLength: 64, pattern: "^[Aa9 ._/:,()#+\\-]+$" },
+              pct: { $ref: "#/definitions/pct" },
+            },
+          },
         },
+        len_min: { type: "integer", minimum: 0 },
+        len_max: { type: "integer", minimum: 0 },
+        numeric_sign: { enum: ["positive", "negative", "mixed", "zero"] },
+        magnitude_order: { type: "integer", minimum: -12, maximum: 18 },
+        decimal_places: { type: "integer", minimum: 0, maximum: 38 },
+        join_hints: {
+          type: "array",
+          maxItems: 5,
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["target_table", "target_column", "pct_overlap"],
+            properties: {
+              target_table: { $ref: "#/definitions/tableName" },
+              target_column: { type: "string", minLength: 1, maxLength: 255 },
+              pct_overlap: { $ref: "#/definitions/pct" },
+            },
+          },
+        },
+        semantic_label: { type: "string", minLength: 1, maxLength: 200 },
       },
+      allOf: [
+        {
+          if: { properties: { disclosure_tier: { minimum: 2 } } },
+          then: { not: { anyOf: [{ required: ["format_masks"] }, { required: ["len_min"] }, { required: ["len_max"] }] } },
+        },
+        {
+          if: { properties: { disclosure_tier: { const: 3 } } },
+          then: { not: { anyOf: [{ required: ["numeric_sign"] }, { required: ["magnitude_order"] }, { required: ["decimal_places"] }] } },
+        },
+      ],
+    },
+    column: {
+      type: "object",
+      additionalProperties: false,
+      required: ["name", "data_type", "nullable", "existing_comment"],
+      properties: {
+        name: { type: "string", minLength: 1, maxLength: 255 },
+        data_type: { type: "string", minLength: 1, maxLength: 1000 },
+        nullable: { type: "boolean" },
+        existing_comment: { $ref: "#/definitions/nullableText" },
+        sample_values: { type: "array", maxItems: MAX_SAMPLES, items: { anyOf: [{ type: "string", maxLength: 500 }, { type: "number" }, { type: "boolean" }, { type: "null" }] } },
+        profile: { $ref: "#/definitions/profile" },
+      },
+      if: { required: ["profile"], properties: { profile: { required: ["disclosure_tier"], properties: { disclosure_tier: { minimum: 1 } } } } },
+      then: { not: { required: ["sample_values"] } },
     },
   },
+  properties: {
+    table: { $ref: "#/definitions/tableName" },
+    existing_description: { $ref: "#/definitions/nullableText" },
+    columns: { type: "array", minItems: 1, maxItems: 2000, items: { $ref: "#/definitions/column" } },
+    contract_version: { const: "2" },
+    layer: { enum: ["bronze", "silver", "gold", "other"] },
+    domain_prefix: { type: "string", pattern: "^[A-Z0-9]{4}$" },
+    object_type: { enum: ["MANAGED", "EXTERNAL", "VIEW", "MATERIALIZED_VIEW", "STREAMING_TABLE"] },
+    row_count_band: { enum: ["0", "1-1K", "1K-100K", "100K-10M", ">10M"] },
+    write_cadence: { enum: ["daily", "weekly", "monthly", "adhoc", "unknown"] },
+    grain_candidates: { type: "array", maxItems: 5, items: { type: "array", minItems: 1, maxItems: 8, items: { type: "string", minLength: 1, maxLength: 255 } } },
+    upstream_tables: { type: "array", maxItems: 50, items: { $ref: "#/definitions/tableName" } },
+    writer_logic: { type: "string", minLength: 1, maxLength: 8000 },
+    view_definition: { type: "string", minLength: 1, maxLength: 8000 },
+  },
+  if: { required: ["contract_version"] },
+  then: { properties: { columns: { items: { required: ["profile"] } } } },
 } as const;
 
 const confidenceProp = { enum: [...CONFIDENCE] };
@@ -153,7 +276,9 @@ export const APPROVED_SCHEMA = {
   },
 } as const;
 
-const ajv = new Ajv({ allErrors: true, strict: true, strictTypes: false, coerceTypes: false, useDefaults: false, removeAdditional: false, logger: false });
+// strictRequired is off because the v2 tier rules use `if: { required: [...] }` conditionals
+// (an authoring check only; validation is unchanged).
+const ajv = new Ajv({ allErrors: true, strict: true, strictTypes: false, strictRequired: false, coerceTypes: false, useDefaults: false, removeAdditional: false, logger: false });
 const tableValidator = ajv.compile(TABLE_EVIDENCE_SCHEMA);
 const proposalValidator = ajv.compile(PROPOSAL_SCHEMA);
 const approvedValidator = ajv.compile(APPROVED_SCHEMA);
