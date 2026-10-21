@@ -100,7 +100,8 @@ function parseCsvDataset(text: string, spec: DatasetSpec): ParsedDataset {
       relax_column_count: false,
       relax_quotes: false,
       info: true,
-    }) as typeof rows;
+      // csv-parse >= 6 types the sync result as string[][] even with `info: true`; at runtime each row is { record, info }.
+    }) as unknown as typeof rows;
   } catch (err) {
     if (err instanceof CsvError) {
       const where = typeof (err as { lines?: number }).lines === "number" ? ` at line ${(err as unknown as { lines: number }).lines}` : "";
