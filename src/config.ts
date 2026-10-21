@@ -43,6 +43,19 @@ export interface BatchConfig {
     /** Dataset workflows: largest dataset file read. */
     maxDatasetBytes: number;
   };
+  /**
+   * Provider routing policy. allowedProviders becomes `provider.only` on every batch.
+   * ZDR and data-collection rules cannot be sent with a batch; the require* flags block
+   * planning unless the matching account* attestation says the OpenRouter account enforces them.
+   */
+  routing: {
+    allowedProviders: string[];
+    allowFallbacks: boolean;
+    requireZdr: boolean;
+    accountZdrEnforced: boolean;
+    requireNoDataCollection: boolean;
+    accountDataCollectionDenied: boolean;
+  };
 }
 
 export const DEFAULT_CONFIG: BatchConfig = {
@@ -74,6 +87,7 @@ export const DEFAULT_CONFIG: BatchConfig = {
     maxRowsPerRun: 1_000,
     maxDatasetBytes: 20_000_000,
   },
+  routing: { allowedProviders: [], allowFallbacks: true, requireZdr: false, accountZdrEnforced: false, requireNoDataCollection: false, accountDataCollectionDenied: false },
 };
 
 export const GLOBAL_CONFIG_DIR = path.join(os.homedir(), ".pi", "agent", "pi-batch-openrouter");
@@ -180,6 +194,14 @@ const SCHEMA: Record<string, Check | Record<string, Check>> = {
     maxSynthesisCharacters: posInt(),
     maxRowsPerRun: posInt(100_000),
     maxDatasetBytes: posInt(),
+  },
+  routing: {
+    allowedProviders: (v) => Array.isArray(v) && v.length <= 50 && v.every((x) => typeof x === "string" && /^[a-z0-9][a-z0-9._/-]{0,99}$/i.test(x)),
+    allowFallbacks: bool,
+    requireZdr: bool,
+    accountZdrEnforced: bool,
+    requireNoDataCollection: bool,
+    accountDataCollectionDenied: bool,
   },
 };
 

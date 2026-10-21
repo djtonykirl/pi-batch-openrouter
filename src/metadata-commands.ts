@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { parseArgs } from "./args.js";
+import { formatPin, formatPrivacyPolicy } from "./openrouter/routing.js";
 import { ArtifactError } from "./artifacts/service.js";
 import { TextViewerComponent } from "./dashboard.js";
 import { writeApprovedDraft, writeMetadataReview } from "./metadata/outputs.js";
@@ -51,7 +52,7 @@ export async function cmdMetadata(rt: BatchRuntime, rest: string[], ctx: Extensi
       if (!parsed.values.context || !parsed.values.input) throw new Error("Usage: /batch metadata plan --context <context.md> --input <tables.jsonl> [--preview]");
       const prepared = await service.planMetadata({ context: parsed.values.context, input: parsed.values.input, model: parsed.values.model, account: parsed.values.account, providerPin: parsed.values.provider });
       const previewOnly = parsed.booleans.has("preview");
-      const preview = formatMetadataPreview(prepared, previewOnly);
+      const preview = formatMetadataPreview(prepared, previewOnly, formatPrivacyPolicy(rt.loaded.config));
       if (prepared.blockers.length > 0) throw new SubmissionBlockedError(`${preview}\n\nPLAN BLOCKED — nothing was saved or sent:\n\n${prepared.blockers.join("\n\n")}`);
       const job = await service.createMetadataJob(prepared, { previewOnly });
       if (previewOnly) {
@@ -115,7 +116,7 @@ export async function cmdMetadata(rt: BatchRuntime, rest: string[], ctx: Extensi
   }
 }
 
-export function formatMetadataPreview(p: PreparedMetadataRun, previewOnly: boolean): string {
+export function formatMetadataPreview(p: PreparedMetadataRun, previewOnly: boolean, privacy?: string): string {
   const plan = p.plan;
   const lines = [p.blockers.length ? "Metadata plan (BLOCKED)" : previewOnly ? "Metadata plan (not submitted)" : "Submitting metadata plan", ""];
   lines.push(`Workflow:          databricks-metadata (built-in): table descriptions and column comments only`);
@@ -126,10 +127,12 @@ export function formatMetadataPreview(p: PreparedMetadataRun, previewOnly: boole
       `Tables:            ${plan.tables}${plan.blankLines ? `  (${plan.blankLines} blank line(s) ignored)` : ""}`,
       `Requests:          ${plan.items.length}  (one per table, one batch)`,
       `Tables w/ samples: ${plan.tablesWithSamples}  (sample values are sent as given; they are not shown here)`,
+      `Contract v2:       ${plan.tablesV2} table(s) with profile evidence${plan.tablesV2 ? " (v2 guidance added to their prompts)" : ""}`,
       `Characters:        ${plan.totalCharacters} provider-bound (not a token count; no cost estimate)`,
       `Largest request:   ${plan.largest ? `${plan.largest.characters} characters (${plan.largest.table})` : "-"}`,
       `Model:             ${p.model}`,
-      `Provider pin:      ${p.pin ? `${p.pin.only.join(",")} (no fallbacks)` : "none"}`,
+      `Provider pin:      ${formatPin(p.pin)}`,
+      ...(privacy ? [`Account privacy:   ${privacy}  (batch requests cannot carry ZDR/data-collection preferences)`] : []),
       `Secrets:           ${plan.secretFindings.length ? `${plan.secretFindings.length} potential finding(s)` : "none detected"} (context and each table's evidence)`,
       `Plan SHA-256:      ${plan.planSha256}`,
       `Warnings:          ${p.warnings.length ? p.warnings.join("; ") : "none"}`,

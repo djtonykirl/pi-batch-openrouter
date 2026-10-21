@@ -10,6 +10,7 @@ import { nullLogger, type Logger } from "./logger.js";
 import { normalizeBatchModelSlug } from "./models.js";
 import { OpenRouterBatchClient, OpenRouterError, type RawExchange } from "./openrouter/client.js";
 import { normaliseBatchResult, type NormalisedBatchResult } from "./openrouter/normalise-result.js";
+import { resolveRouting } from "./openrouter/routing.js";
 import { buildSubmitBody, submitBodyProblems, type BatchRequestItem, type ChatMessage, type ProviderPin, type SubmitBody } from "./openrouter/types.js";
 import { compileOutputSchema, type OutputValidator } from "./workflows/structured.js";
 import { findWorkflow, formatDiagnostics, type WorkflowDefinition, type WorkflowEntry } from "./workflows/definition.js";
@@ -308,7 +309,8 @@ export class BatchService {
     const objective = options.objective.trim();
     const model = normalizeBatchModelSlug(options.model ?? config.defaultModel);
     const account = options.account ?? config.defaultAccount;
-    const pin: ProviderPin | undefined = options.providerPin ? { only: [options.providerPin], allow_fallbacks: false } : undefined;
+    const routing = resolveRouting(config, options.providerPin);
+    const pin = routing.pin;
     const pkg = buildContextPackage({
       workspaceRoot: this.deps.workspaceRoot,
       objective,
@@ -322,7 +324,7 @@ export class BatchService {
     });
     const messages = withSystemPrompt(options.includeInstructions, pkg.contextText);
 
-    const blockers: string[] = [];
+    const blockers: string[] = [...routing.blockers];
     if (!objective) blockers.push("objective is empty");
     for (const p of pkg.problems) blockers.push(p.message);
     if (pkg.secretFindings.length > 0 && config.security.blockOnSecret) blockers.push(formatSecretFindings(pkg.secretFindings));
@@ -493,7 +495,8 @@ export class BatchService {
     const objective = options.objective.trim();
     const model = normalizeBatchModelSlug(options.model ?? config.defaultModel);
     const account = options.account ?? config.defaultAccount;
-    const pin: ProviderPin | undefined = options.providerPin ? { only: [options.providerPin], allow_fallbacks: false } : undefined;
+    const routing = resolveRouting(config, options.providerPin);
+    const pin = routing.pin;
     const groupSize = options.groupSize ?? 1;
     const workflow: MapFilesWorkflowInfo = { name: MAP_FILES.name, version: MAP_FILES.version, options: { groupSize, format: options.format, includeInstructions: options.includeInstructions } };
 
@@ -510,7 +513,7 @@ export class BatchService {
       renderPackage: false,
     });
 
-    const blockers: string[] = [];
+    const blockers: string[] = [...routing.blockers];
     if (!objective) blockers.push("objective is empty");
     if (!Number.isInteger(groupSize) || groupSize < 1) blockers.push(`--group-size must be a positive integer (got ${options.groupSize})`);
     for (const p of pkg.problems) blockers.push(p.message);
@@ -645,7 +648,9 @@ export class BatchService {
     const def = entry.definition;
     const model = normalizeBatchModelSlug(options.model ?? def.model.default ?? config.defaultModel);
     const pinSlug = options.providerPin ?? def.model.provider;
-    const pin: ProviderPin | undefined = pinSlug ? { only: [pinSlug], allow_fallbacks: false } : undefined;
+    const routing = resolveRouting(config, pinSlug);
+    const pin = routing.pin;
+    blockers.push(...routing.blockers);
     const maxTokens = def.request.maxTokens ?? config.request.maxTokens;
     // Workflow limits can only tighten the local configuration, never loosen it.
     const min = (a: number, b?: number) => (b === undefined ? a : Math.min(a, b));
@@ -800,7 +805,9 @@ export class BatchService {
     const blockers: string[] = [];
     const account = options.account ?? config.defaultAccount;
     const model = normalizeBatchModelSlug(options.model ?? config.defaultModel);
-    const pin: ProviderPin | undefined = options.providerPin ? { only: [options.providerPin], allow_fallbacks: false } : undefined;
+    const routing = resolveRouting(config, options.providerPin);
+    const pin = routing.pin;
+    blockers.push(...routing.blockers);
     const base: PreparedMetadataRun = { options, model, account, pin, maxTokens: config.request.maxTokens, objective: "", contentSha256: "", blockers, warnings: [] };
     const read = (raw: string, what: string, maxBytes: number) => {
       const r = resolveWorkspaceInput(this.deps.workspaceRoot, raw, config, { what, maxBytes });
@@ -1610,12 +1617,13 @@ export class BatchService {
     }
     const model = normalizeBatchModelSlug(opts.model ?? config.defaultModel);
     const account = opts.account ?? source.account;
-    const pin: ProviderPin | undefined = opts.providerPin ? { only: [opts.providerPin], allow_fallbacks: false } : undefined;
+    const routing = resolveRouting(config, opts.providerPin);
+    const pin = routing.pin;
     const coverage = this.coverage(sourceJobId);
 
     const included: SynthesisInputItem[] = [];
     const unusable: SynthesisUnusable[] = [];
-    const blockers: string[] = [];
+    const blockers: string[] = [...routing.blockers];
     for (const e of coverage.entries) {
       const label = sourceLabel(e.root);
       if (e.usable) {
