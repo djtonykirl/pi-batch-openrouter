@@ -174,6 +174,7 @@ export class BatchRuntime {
         this.loaded = loadConfig(this.cwd);
       },
       getKnownModels: () => (this.ctx ? discoverBatchModels(this.ctx).map((m) => m.modelId) : []),
+      resolveApiKey: (account) => this.resolveApiKey(account),
     });
     return this.webServer;
   }

@@ -39,6 +39,8 @@ export interface WebServerDeps {
    * starts and stops it. False for Pi's runtime poller, which the server must never stop.
    */
   ownsPoller?: boolean;
+  /** Pi mode: Pi's own key resolver, also used for workspaces switched to in the UI. */
+  resolveApiKey?: (account: string) => Promise<string>;
 }
 
 function samePath(a: string, b: string): boolean {
@@ -71,20 +73,50 @@ const DEFAULT_FALLBACK_MODELS = [
   "deepseek/deepseek-r1",
 ];
 
-function resolveStandaloneApiKey(provider: string): string {
+/**
+ * The API key for `account` outside Pi: that account's own entry in ~/.pi/agent/auth.json, or OPENROUTER_API_KEY
+ * only when `account` is the configured default. Never another account's key (that would bill the wrong account);
+ * with no key it throws a clear error.
+ */
+export function resolveStandaloneApiKey(account: string, defaultAccount: string, authFile = path.join(os.homedir(), ".pi", "agent", "auth.json")): string {
+  let authError: string | undefined;
   try {
-    const authFile = path.join(os.homedir(), ".pi", "agent", "auth.json");
     if (fs.existsSync(authFile)) {
-      const auth = JSON.parse(fs.readFileSync(authFile, "utf8")) as Record<string, { key?: string; access?: string }>;
-      const entry = auth[provider] || auth["openrouter"];
+      const auth = JSON.parse(fs.readFileSync(authFile, "utf8")) as Record<string, { key?: string; access?: string } | undefined>;
+      const entry = Object.prototype.hasOwnProperty.call(auth, account) ? auth[account] : undefined;
       if (entry?.key) return entry.key;
       if (entry?.access) return entry.access;
     }
-  } catch {
-    // fallback to env
+  } catch (err) {
+    authError = (err as Error).message;
   }
-  return process.env.OPENROUTER_API_KEY ?? "";
+  const isDefault = account === defaultAccount;
+  if (isDefault && process.env.OPENROUTER_API_KEY) return process.env.OPENROUTER_API_KEY;
+  throw new Error(
+    `No API key for account "${account}" in ${authFile}${authError ? ` (unreadable: ${authError})` : ""}` +
+      (isDefault ? " and OPENROUTER_API_KEY is not set." : `. OPENROUTER_API_KEY is used only for the default account ("${defaultAccount}").`),
+  );
 }
+
+/**
+ * Wraps a key resolver so the standalone logger can redact every key it has handed out (plus OPENROUTER_API_KEY).
+ * `base` defaults to `resolveStandaloneApiKey` with the configured default account.
+ */
+export function createStandaloneKeyResolver(
+  getDefaultAccount: () => string,
+  base: (account: string) => Promise<string> = async (account) => resolveStandaloneApiKey(account, getDefaultAccount()),
+): { resolve: (account: string) => Promise<string>; secrets: () => string[] } {
+  const resolved = new Set<string>();
+  return {
+    resolve: async (account) => {
+      const key = await base(account);
+      if (key) resolved.add(key);
+      return key;
+    },
+    secrets: () => [...resolved, ...(process.env.OPENROUTER_API_KEY ? [process.env.OPENROUTER_API_KEY] : [])],
+  };
+}
+
 
 /**
  * Enumerates workspace files & directories up to a bounded limit and classifies each
@@ -238,32 +270,36 @@ export class BatchWebServer {
   private readonly sseClients = new Set<http.ServerResponse>();
   private fsWatcher: fs.FSWatcher | null = null;
   private readonly recentWorkspaces = new Set<string>();
-  private resolveApiKeyFn: (account: string) => Promise<string> = async (account: string) => resolveStandaloneApiKey(account);
+  /** Key resolver for workspaces switched to in the UI; undefined = the standalone resolver for each workspace. */
+  private resolveApiKeyFn: ((account: string) => Promise<string>) | undefined;
 
   /** The workspace the server was created for (Pi's session in Pi mode). */
   private readonly initialDeps: WebServerDeps;
 
   constructor(private deps: WebServerDeps) {
     this.initialDeps = deps;
+    this.resolveApiKeyFn = deps.resolveApiKey;
     this.recentWorkspaces.add(toPosix(path.resolve(deps.workspaceRoot)));
   }
 
   private static buildWorkspaceDeps(
     workspaceRoot: string,
-    resolveKey: (account: string) => Promise<string>,
+    resolveKey: ((account: string) => Promise<string>) | undefined,
     getServer: () => BatchWebServer | null,
     getKnownModels?: () => string[],
   ): WebServerDeps {
     let loaded = loadConfig(workspaceRoot);
     const storage = path.resolve(workspaceRoot, loaded.config.storagePath);
     const registry = new JobRegistry(storage);
-    const logger = new FileLogger(path.join(storage, "extension.log"), () => [process.env.OPENROUTER_API_KEY ?? ""]);
+    // Every key handed out is redacted from this workspace's log.
+    const keys = createStandaloneKeyResolver(() => loaded.config.defaultAccount, resolveKey);
+    const logger = new FileLogger(path.join(storage, "extension.log"), keys.secrets);
 
     const service = new BatchService({
       registry,
       workspaceRoot,
       getConfig: () => loaded.config,
-      resolveApiKey: resolveKey,
+      resolveApiKey: keys.resolve,
       logger,
       onSettled: (job) => {
         if (isChatJob(job)) {
@@ -318,7 +354,7 @@ export class BatchWebServer {
 
   /** Creates a standalone `BatchWebServer` bound to `workspaceRoot` without requiring a Pi session. */
   public static createStandalone(workspaceRoot: string, opts?: { resolveApiKey?: (account: string) => Promise<string> }): BatchWebServer {
-    const resolveKey = opts?.resolveApiKey ?? (async (account: string) => resolveStandaloneApiKey(account));
+    const resolveKey = opts?.resolveApiKey;
     let webServer: BatchWebServer | null = null;
     const deps = BatchWebServer.buildWorkspaceDeps(path.resolve(workspaceRoot), resolveKey, () => webServer);
     webServer = new BatchWebServer(deps);
