@@ -72,6 +72,25 @@ function userTurnText(e: Extract<TranscriptEntry, { type: "user" }>): string {
   return e.text ? `${e.text}\n\n${e.inlinedText}` : e.inlinedText;
 }
 
+/**
+ * Short stand-ins for an entry's binary parts (images, multimodal PDFs), used once the turn they were attached to has
+ * been answered: `[attached: name (type, size)]`. Empty when the entry has no parts.
+ */
+function partPlaceholders(e: Extract<TranscriptEntry, { type: "user" }>): string[] {
+  if (!e.parts || e.parts.length === 0) return [];
+  const binary = (e.attachments ?? []).filter((a) => a.kind === "image" || a.mode === "multimodal");
+  if (binary.length > 0) return binary.map((a) => `[attached: ${a.name} (${a.mimeType ?? a.kind}, ${a.bytes} bytes)]`);
+  return e.parts.map((p) => (p.type === "file" ? `[attached: ${p.file.filename} (file)]` : p.type === "image_url" ? "[attached: image]" : "[attached]"));
+}
+
+/** The user text with placeholders for binary parts that are not re-sent. */
+function userTextWithPlaceholders(e: Extract<TranscriptEntry, { type: "user" }>): string {
+  const marks = partPlaceholders(e);
+  if (marks.length === 0) return userTurnText(e);
+  const text = userTurnText(e);
+  return text ? `${text}\n\n${marks.join("\n")}` : marks.join("\n");
+}
+
 export function buildTurnMessages(
   thread: ThreadState,
   entries: TranscriptEntry[],
@@ -79,26 +98,35 @@ export function buildTurnMessages(
   prompt: ChatPrompt,
 ): ChatMessage[] {
   const messages: ChatMessage[] = [{ role: "system", content: systemContent(thread, prompt) }];
-  for (const e of turnsBetween(thread, entries, throughSeq)) {
+  const turns = turnsBetween(thread, entries, throughSeq);
+  // Binary parts go out only with the turn they belong to (the user entries after the last reply); answered turns
+  // carry a short placeholder instead, so an image is not re-sent (and paid for) on every later turn.
+  let lastReply = -1;
+  turns.forEach((e, i) => {
+    if (e.type === "assistant") lastReply = i;
+  });
+  turns.forEach((e, i) => {
     const last = messages[messages.length - 1];
     if (e.type === "user") {
-      const text = userTurnText(e);
+      const current = i > lastReply;
+      const parts = current && e.parts && e.parts.length > 0 ? e.parts : undefined;
+      const text = current ? userTurnText(e) : userTextWithPlaceholders(e);
       if (last?.role === "user") {
         last.content += `\n\n${text}`;
-        if (e.parts && e.parts.length > 0) {
-          last.parts = [...(last.parts ?? []), ...e.parts];
+        if (parts) {
+          last.parts = [...(last.parts ?? []), ...parts];
         }
       } else {
         messages.push({
           role: "user",
           content: text,
-          ...(e.parts && e.parts.length > 0 ? { parts: [...e.parts] } : {}),
+          ...(parts ? { parts: [...parts] } : {}),
         });
       }
     } else {
       messages.push({ role: e.type, content: e.text });
     }
-  }
+  });
   return messages;
 }
 
@@ -128,7 +156,7 @@ function plainTranscript(turns: Turn[]): string {
   return turns
     .map((e) => {
       if (e.type !== "user") return `Assistant (${e.model}): ${e.text}`;
-      const body = userTurnText(e);
+      const body = userTextWithPlaceholders(e);
       return `User: ${body}`;
     })
     .join("\n\n");
@@ -168,8 +196,15 @@ export function buildTitleMessages(
   return [{ role: "user", content: parts.join("\n\n") }];
 }
 
+/** Characters a binary part adds to a request (its base64 data URL); counted at the same characters / 4 rate. */
+function partCharacters(p: NonNullable<ChatMessage["parts"]>[number]): number {
+  if (p.type === "text") return p.text.length;
+  if (p.type === "image_url") return p.image_url.url.length;
+  return p.file.file_data.length;
+}
+
 export function estimateTokens(messages: ChatMessage[]): number {
-  return Math.ceil(messages.reduce((n, m) => n + m.content.length, 0) / 4);
+  return Math.ceil(messages.reduce((n, m) => n + m.content.length + (m.parts ?? []).reduce((k, p) => k + partCharacters(p), 0), 0) / 4);
 }
 
 export function provisionalTitle(text: string): string {

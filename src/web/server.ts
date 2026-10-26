@@ -7,7 +7,7 @@ import { ArtifactService } from "../artifacts/service.js";
 import { ArtifactStore } from "../artifacts/store.js";
 import { prepareAttachments, type AttachmentRequestInput, type UploadedFileInput } from "../attachments.js";
 import { exportMarkdown, formatCost } from "../chat/commands.js";
-import { conversationOrder } from "../chat/request.js";
+import { conversationOrder, estimateTokens } from "../chat/request.js";
 import { ChatService, PROJECT_INSTRUCTIONS_FILE } from "../chat/service.js";
 import { ThreadStore } from "../chat/store.js";
 import { loadConfig, saveConfigUpdate, type BatchConfig } from "../config.js";
@@ -787,7 +787,7 @@ export class BatchWebServer {
             if (config.security.blockOnSecret) prep.blockers.push(formatSecretFindings(msgFindings));
           }
         }
-        const estimatedTokens = Math.ceil((text.length + prep.inlinedText.length) / 4);
+        const estimatedTokens = estimateTokens([{ role: "user", content: text + prep.inlinedText, parts: prep.parts }]);
         this.sendJson(res, 200, {
           attachments: prep.attachments,
           excludedCount: prep.excludedCount,
