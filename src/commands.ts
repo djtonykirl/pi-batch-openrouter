@@ -41,6 +41,7 @@ const SUBCOMMANDS: Record<string, { desc: string; nonTerminal: boolean }> = {
   "retry-items": { desc: "Re-run failed/selected items as a new linked job: retry-items <id> --failed | --item n", nonTerminal: true },
   synthesize: { desc: "Synthesize a finished workflow job as a new linked job [--allow-partial] [--preview]", nonTerminal: true },
   view: { desc: "Open interactive TUI dashboard", nonTerminal: false },
+  web: { desc: "Start or stop local Web UI: web [--port n] [stop]", nonTerminal: false },
   model: { desc: "Select default batch model", nonTerminal: true },
   provider: { desc: "Select default OpenRouter account (Pi provider alias)", nonTerminal: true },
   help: { desc: "Show /batch usage", nonTerminal: false },
@@ -106,6 +107,7 @@ const HELP = `/batch — deferred OpenRouter Batch goals
   retry-items <id> --failed | --item <sel> ... [--model <slug>] [--preview]
   synthesize <id> [--allow-partial] [--model] [--account] [--provider] [--preview]
   view                               TUI dashboard
+  web [--port <n>] [stop]            local Web UI studio (127.0.0.1)
   [--global] model [slug]            default batch model
   [--global] provider [alias]        default Pi account for the API key
 
@@ -269,6 +271,8 @@ async function dispatch(rt: BatchRuntime, args: string, ctx: ExtensionCommandCon
     case "ui":
     case "dashboard":
       return cmdView(rt, ctx);
+    case "web":
+      return cmdWeb(rt, rest);
     case "model":
       return cmdSetting(rt, "defaultModel", rest, isGlobal);
     case "provider":
@@ -992,6 +996,28 @@ async function cmdView(rt: BatchRuntime, ctx: ExtensionCommandContext): Promise<
   } else if (next?.kind === "inject") {
     injectJob(rt, next.id, "default");
   }
+}
+
+async function cmdWeb(rt: BatchRuntime, rest: string[]): Promise<void> {
+  const parsed = parseArgs(rest, { values: ["port"], booleans: ["no-open"] });
+  if (parsed.errors.length > 0) throw new Error(`/batch web: ${parsed.errors.join("; ")}`);
+  const sub = parsed.positionals[0]?.toLowerCase();
+  if (sub === "stop" || sub === "off") {
+    if (!rt.webServer?.isRunning) {
+      rt.notify("Batch Web UI is not running.", "info");
+      return;
+    }
+    await rt.stopWebServer();
+    rt.notify("Batch Web UI stopped.", "info");
+    return;
+  }
+  const port = parsed.values.port !== undefined ? Number(parsed.values.port) : 0;
+  if (!Number.isInteger(port) || port < 0 || port > 65535) {
+    throw new Error("/batch web: --port must be an integer between 0 and 65535");
+  }
+  const srv = rt.ensureWebServer();
+  const url = await srv.start(port);
+  rt.notify(`🌐 Batch Web UI running at ${url}\n(Bound to 127.0.0.1 · use /batch web stop to close it)`, "info");
 }
 
 /** Long text: scrollable viewer in TUI, notification elsewhere (RPC). Never enters model context. */

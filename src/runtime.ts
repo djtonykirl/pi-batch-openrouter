@@ -2,7 +2,7 @@ import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { loadConfig, type LoadedConfig } from "./config.js";
 import { FileLogger, type Logger } from "./logger.js";
-import { resolveApiKeyForProvider } from "./models.js";
+import { discoverBatchModels, resolveApiKeyForProvider } from "./models.js";
 import { BatchPoller } from "./poller.js";
 import { JobRegistry } from "./registry.js";
 import { ArtifactService } from "./artifacts/service.js";
@@ -12,6 +12,7 @@ import { isChatJob, type JobManifest } from "./types.js";
 import { ChatService } from "./chat/service.js";
 import { CHAT_ENTRY_TYPE, ChatSession, type ChatEntryData } from "./chat/session.js";
 import { ThreadStore } from "./chat/store.js";
+import { BatchWebServer } from "./web/server.js";
 
 export const INJECTED_MESSAGE_TYPE = "pi-batch-result";
 const STATUS_KEY = "pi-batch";
@@ -29,6 +30,7 @@ export class BatchRuntime {
   public artifacts: ArtifactService | null = null;
   public chat: ChatService | null = null;
   public chatSession: ChatSession | null = null;
+  public webServer: BatchWebServer | null = null;
   private chatStore: ThreadStore | null = null;
   public readonly poller: BatchPoller;
   private logger: Logger | null = null;
@@ -40,6 +42,7 @@ export class BatchRuntime {
       () => this.loaded.config.polling.enabled,
       (text) => {
         if (this.ctx?.hasUI) this.ctx.ui.setStatus(STATUS_KEY, text);
+        this.webServer?.broadcast({ type: "badge", text });
       },
       async () => {
         if (!this.chat) return;
@@ -49,6 +52,7 @@ export class BatchRuntime {
           this.logger?.log("warn", "chat_tick_failed", { message: (err as Error).message });
         }
         this.chatSession?.sync();
+        this.webServer?.broadcast({ type: "tick" });
       },
     );
   }
@@ -153,6 +157,34 @@ export class BatchRuntime {
     return this.service;
   }
 
+  public ensureWebServer(): BatchWebServer {
+    if (this.webServer) return this.webServer;
+    if (!this.cwd || !this.service || !this.chat || !this.chatStore || !this.artifacts) {
+      throw new Error("No active Pi session/workspace; web UI is unavailable.");
+    }
+    this.webServer = new BatchWebServer({
+      workspaceRoot: this.cwd,
+      service: this.service,
+      chat: this.chat,
+      chatStore: this.chatStore,
+      artifacts: this.artifacts,
+      poller: this.poller,
+      getConfig: () => this.loaded.config,
+      reloadConfig: () => {
+        this.loaded = loadConfig(this.cwd);
+      },
+      getKnownModels: () => (this.ctx ? discoverBatchModels(this.ctx).map((m) => m.modelId) : []),
+    });
+    return this.webServer;
+  }
+
+  public async stopWebServer(): Promise<void> {
+    if (!this.webServer) return;
+    const srv = this.webServer;
+    this.webServer = null;
+    await srv.stop();
+  }
+
   public async resolveApiKey(account: string): Promise<string> {
     if (!this.ctx) return process.env.OPENROUTER_API_KEY ?? "";
     const key = await resolveApiKeyForProvider(this.ctx, account);
@@ -165,6 +197,7 @@ export class BatchRuntime {
   }
 
   private onSettled(job: JobManifest): void {
+    this.webServer?.broadcast({ type: "settled", localId: job.localId, status: job.localStatus });
     if (isChatJob(job)) {
       // Chat replies are shown by the chat session, not announced as batch results.
       try {

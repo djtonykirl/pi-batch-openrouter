@@ -35,6 +35,7 @@
   "scripts": {
     "check": "tsc --noEmit && tsc -p tsconfig.test.json --noEmit",
     "build": "tsc",
+    "web": "tsc -p tsconfig.test.json && node .test-build/src/web/cli.js",
     "test": "tsc -p tsconfig.test.json && node --test --test-timeout=30000 --test-reporter=spec \".test-build/test/**/*.test.js\""
   },
   "peerDependencies": {

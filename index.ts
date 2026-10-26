@@ -50,5 +50,6 @@ export default function (pi: ExtensionAPI): void {
     // Idempotent. Job state is already durable on disk; nothing to flush.
     rt.poller.stop();
     rt.chatSession?.leave();
+    void rt.stopWebServer();
   });
 }
