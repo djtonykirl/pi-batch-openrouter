@@ -111,7 +111,8 @@ test("attachments: workspace files, uploaded text/CSV/JSON, PDF text extraction,
     assert.ok(r1.jobId);
 
     // Check transcript entry has attachment metadata badges
-    const entries1 = env.store.transcript(thread.id).entries;
+    // Attachment warnings (here: no git repository) are shown in the thread as a status entry (U-I5).
+    const entries1 = env.store.transcript(thread.id).entries.filter((e) => e.type !== "status");
     assert.equal(entries1.length, 1);
     const u1 = entries1[0]!;
     assert.equal(u1.type, "user");
@@ -154,12 +155,14 @@ test("attachments: workspace files, uploaded text/CSV/JSON, PDF text extraction,
           name: "diagram.png",
           mimeType: "image/png",
           contentBase64: `data:image/png;base64,${TINY_PNG_B64}`,
+          allowUnscanned: true,
         },
         {
           name: "raw-spec.pdf",
           mimeType: "application/pdf",
           contentBase64: pdf.bytes.toString("base64"),
           pdfMode: "multimodal",
+          allowUnscanned: true,
         },
       ],
     });

@@ -1773,12 +1773,22 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
           reader.readAsDataURL(file);
         });
         const isPdf = file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+        const isImage = /^image\\//.test(file.type) || /\\.(png|jpe?g|webp|gif)$/i.test(file.name);
+        // Binary content cannot be secret-scanned: sending it needs an explicit per-file confirmation.
+        let allowUnscanned = false;
+        if (isImage || (isPdf && pdfMode === "multimodal")) {
+          allowUnscanned = confirm(
+            '"' + file.name + '" is sent as binary content and cannot be scanned for secrets. Send it unscanned?',
+          );
+          if (!allowUnscanned) continue;
+        }
         bag.uploads.push({
           name: file.name,
           mimeType: file.type || undefined,
           size: file.size,
           contentBase64: b64,
           ...(isPdf ? { pdfMode } : {}),
+          ...(allowUnscanned ? { allowUnscanned: true } : {}),
         });
       }
       renderPendingAttachments(target);
@@ -1860,6 +1870,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         state.chatAttachments = { files: [], contexts: [], uploads: [] };
         renderPendingAttachments("chat");
         showToast(res.queued ? "Message queued for next turn" : "Submitted batch turn " + res.jobId);
+        if (res.warnings && res.warnings.length) showToast("⚠ " + res.warnings.join(" "), "error");
         await refreshStateQuiet();
       } catch (err) {
         alertBox.innerHTML = '<div class="alert-box alert-danger">' + escapeHtml(err.message) + "</div>";

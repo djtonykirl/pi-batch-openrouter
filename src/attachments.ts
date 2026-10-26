@@ -29,6 +29,11 @@ export interface UploadedFileInput {
   text?: string;
   /** For PDFs: "text" extracts text locally (default); "multimodal" sends a base64 file part. */
   pdfMode?: "text" | "multimodal";
+  /**
+   * Explicit per-file opt-in for content that cannot be secret-scanned: images and multimodal (raw) PDFs are refused
+   * without it. When set, the file is sent and a warning says it was not scanned.
+   */
+  allowUnscanned?: boolean;
 }
 
 export interface AttachmentRequestInput {
@@ -353,6 +358,14 @@ export function extractTextFromPdfContentStream(content: string): string {
   return lines.join("\n");
 }
 
+function unscannedRefusal(what: string): string {
+  return `${what} cannot be scanned for secrets (binary content). It was not sent. Confirm sending it unscanned (allowUnscanned) or remove it.`;
+}
+
+function unscannedWarning(what: string): string {
+  return `${what} is sent as binary content, not scanned for secrets.`;
+}
+
 export function formatAttachedFileBlock(label: string, content: string): string {
   const clean = content.replace(/\r\n/g, "\n");
   const body = clean.endsWith("\n") ? clean.slice(0, -1) : clean;
@@ -449,6 +462,11 @@ export async function prepareAttachments(opts: {
         blockers.push(`Image "${name}" does not match ${normalizedMime} header bytes`);
         continue;
       }
+      if (!up.allowUnscanned) {
+        blockers.push(unscannedRefusal(`Image "${name}"`));
+        continue;
+      }
+      warnings.push(unscannedWarning(`Image "${name}"`));
       const dataUrl = `data:${normalizedMime};base64,${buf.toString("base64")}`;
       attachments.push({
         source: "upload",
@@ -475,6 +493,11 @@ export async function prepareAttachments(opts: {
           blockers.push(`PDF "${name}" is not a valid PDF file (missing %PDF- header)`);
           continue;
         }
+        if (!up.allowUnscanned) {
+          blockers.push(unscannedRefusal(`PDF "${name}" (multimodal mode)`));
+          continue;
+        }
+        warnings.push(unscannedWarning(`PDF "${name}" (multimodal mode)`));
         const dataUrl = `data:application/pdf;base64,${buf.toString("base64")}`;
         attachments.push({
           source: "upload",
@@ -496,19 +519,11 @@ export async function prepareAttachments(opts: {
         continue;
       }
       if (!extracted.text) {
-        // Fallback to multimodal file part if the PDF has no extractable text layer (e.g. scanned PDF)
-        warnings.push(`PDF "${name}" had no extractable text layer; attached as a multimodal PDF file part`);
-        const dataUrl = `data:application/pdf;base64,${buf.toString("base64")}`;
-        attachments.push({
-          source: "upload",
-          kind: "pdf",
-          name,
-          mimeType: "application/pdf",
-          bytes: buf.length,
-          sha256,
-          mode: "multimodal",
-        });
-        parts.push({ type: "file", file: { filename: name, file_data: dataUrl } });
+        // Never fall back to sending the raw file: it could not be scanned for secrets.
+        blockers.push(
+          `PDF "${name}" has no extractable text layer (for example a scanned PDF), so it cannot be scanned for secrets. ` +
+            "It was not sent. To send the file itself, attach it in multimodal mode and confirm sending it unscanned.",
+        );
         continue;
       }
       if (config.security.scanSecrets) {

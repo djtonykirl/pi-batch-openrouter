@@ -260,9 +260,10 @@ export async function cmdChat(rt: BatchRuntime, rest: string[], ctx: ExtensionCo
       if (!text && files.length === 0 && contexts.length === 0) {
         throw new Error('Usage: /batch chat send [--file <path>] [--context <dir>] "<message>"');
       }
-      await rt.requireChat().send(id, text, { files, contexts });
+      const sent = await rt.requireChat().send(id, text, { files, contexts });
       rt.poller.updateBadge();
       rt.requireChatSession().sync();
+      if (sent.warnings?.length) rt.notify(`⚠ ${sent.warnings.join("\n")}`, "warning");
       return;
     }
     case "retry": {

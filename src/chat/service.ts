@@ -153,7 +153,7 @@ export class ChatService {
    * otherwise it stays queued. A secret refuses the message before anything is written (ChatBlockedError), and a
    * held thread lock propagates as ThreadBusyError with nothing written.
    */
-  public async send(threadId: string, text: string, attachments?: AttachmentRequestInput): Promise<{ queued: boolean; jobId?: string }> {
+  public async send(threadId: string, text: string, attachments?: AttachmentRequestInput): Promise<{ queued: boolean; jobId?: string; warnings?: string[] }> {
     const hasAtt = Boolean((attachments?.files?.length ?? 0) + (attachments?.contexts?.length ?? 0) + (attachments?.uploads?.length ?? 0));
     if (text.trim() === "" && !hasAtt) return { queued: true };
     const thread = this.store.read(threadId);
@@ -162,6 +162,7 @@ export class ChatService {
     if (prep && prep.blockers.length > 0) {
       throw new ChatBlockedError(`${prep.blockers.join("\n\n")}\n\nYour message was not saved.`);
     }
+    const warnings = prep?.warnings ?? [];
     const claim = this.store.update(threadId, (t, append) => {
       const entries = this.store.transcript(threadId).entries;
       const entry = append({
@@ -171,15 +172,18 @@ export class ChatService {
         ...(prep && prep.inlinedText ? { inlinedText: prep.inlinedText } : {}),
         ...(prep && prep.parts.length > 0 ? { parts: prep.parts } : {}),
       });
+      // Shown in the thread, so a file sent without a secret scan (or any other attachment caveat) is never silent.
+      if (warnings.length > 0) append({ type: "status", text: `⚠ ${warnings.join(" ")}` });
       if (t.title === "(untitled)") {
         const titleSource = text.trim() || prep?.attachments.map((a) => a.name).join(", ") || "(attachment)";
         t.title = provisionalTitle(titleSource);
       }
       return this.claim(t, [...entries, entry]);
     });
-    if (!claim) return { queued: true };
+    const warned = warnings.length > 0 ? { warnings } : {};
+    if (!claim) return { queued: true, ...warned };
     const r = await this.submitTurn(threadId, claim, prompt);
-    return { queued: false, ...(r.jobId ? { jobId: r.jobId } : {}) };
+    return { queued: false, ...(r.jobId ? { jobId: r.jobId } : {}), ...warned };
   }
 
   /**
