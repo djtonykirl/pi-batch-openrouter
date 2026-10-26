@@ -9,6 +9,7 @@ import { jobItems, sourceLabel } from "./items.js";
 import { CHECK_LOCK_WAIT_MS, DuplicateActiveRequestError, SubmissionBlockedError, formatUsage, itemCounts, type InjectMode, type PreparedAsk, type PreparedDatasetRun, type PreparedPlan, type PreparedSynthesis } from "./service.js";
 import { cmdBatchArtifact } from "./artifact-commands.js";
 import { cmdMetadata } from "./metadata-commands.js";
+import { cmdChat } from "./chat/commands.js";
 import { ArtifactError } from "./artifacts/service.js";
 import { formatLegacyInventory } from "./legacy.js";
 import { BUILTIN_WORKFLOWS, WorkflowNotFoundError, discoverWorkflows, findWorkflow, formatDiagnostics, validateWorkflowFile } from "./workflows/definition.js";
@@ -34,6 +35,7 @@ const SUBCOMMANDS: Record<string, { desc: string; nonTerminal: boolean }> = {
   artifact: { desc: "Write a controlled file from a validated result: artifact <id> [--synthesis|--item n] --format markdown|html|pdf|text [--template t] [--out path]", nonTerminal: true },
   metadata: { desc: "Databricks table descriptions/column comments: metadata plan|summary|review|approved|validate-approved", nonTerminal: true },
   "import-legacy": { desc: "Inventory a pre-Release-1 jobs.json (read-only): import-legacy <path> --preview", nonTerminal: true },
+  chat: { desc: "Chat with a model at batch prices: chat [continue|resume|clear|rename|model|compact|context|cost|export|off|retry|help]", nonTerminal: true },
   items: { desc: "List a job's request items", nonTerminal: true },
   item: { desc: "Inspect one item: item <id> <n|custom_id|path> [--text] [--raw]", nonTerminal: true },
   "retry-items": { desc: "Re-run failed/selected items as a new linked job: retry-items <id> --failed | --item n", nonTerminal: true },
@@ -83,6 +85,9 @@ const HELP = `/batch — deferred OpenRouter Batch goals
                                      Databricks table descriptions and column comments (see /batch metadata help)
   import-legacy <jobs.json> --preview
                                      read-only inventory of pre-Release-1 jobs (import itself is deferred)
+  chat                               start a chat thread (batch-priced replies; typed text goes to the thread)
+  chat continue | resume [thread] | clear | rename <title> | model [slug] | compact [focus]
+  chat context | cost | export [file] | retry | off | help   (see /batch chat help)
   run map-files [options] --prompt "<objective>"
                                      one request per file, all in ONE batch
       --file <path> (repeatable)  --context <dir>  --group-size <n>
@@ -232,6 +237,8 @@ async function dispatch(rt: BatchRuntime, args: string, ctx: ExtensionCommandCon
       return cmdBatchArtifact(rt, rest);
     case "metadata":
       return cmdMetadata(rt, rest, ctx);
+    case "chat":
+      return cmdChat(rt, rest, ctx);
     case "import-legacy":
       return cmdImportLegacy(rt, rest, ctx);
     case "items":
@@ -988,7 +995,7 @@ async function cmdView(rt: BatchRuntime, ctx: ExtensionCommandContext): Promise<
 }
 
 /** Long text: scrollable viewer in TUI, notification elsewhere (RPC). Never enters model context. */
-async function showText(rt: BatchRuntime, ctx: ExtensionCommandContext, title: string, body: string): Promise<void> {
+export async function showText(rt: BatchRuntime, ctx: ExtensionCommandContext, title: string, body: string): Promise<void> {
   if (ctx.hasUI && ctx.mode === "tui") {
     await ctx.ui.custom<void>((_tui, _theme, _kb, done) => new TextViewerComponent(title, body, () => done(undefined), () => process.stdout.rows ?? 24));
     return;

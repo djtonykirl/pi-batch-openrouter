@@ -107,6 +107,11 @@ export class BatchRuntime {
     return this.artifacts;
   }
 
+  public requireChatStore(): ThreadStore {
+    if (!this.chatStore) throw new Error("No active Pi session/workspace; chat storage is unavailable.");
+    return this.chatStore;
+  }
+
   public requireChat(): ChatService {
     if (!this.chat) throw new Error("No active Pi session/workspace; chat storage is unavailable.");
     return this.chat;
