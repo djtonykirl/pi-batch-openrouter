@@ -2,6 +2,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { registerArtifactCommand } from "./src/artifact-commands.js";
 import { registerBatchCommand } from "./src/commands.js";
+import { renderChatEntry } from "./src/chat/render.js";
+import { CHAT_ENTRY_TYPE, type ChatEntryData } from "./src/chat/session.js";
 import { BatchRuntime, INJECTED_MESSAGE_TYPE } from "./src/runtime.js";
 import { registerBatchTools } from "./src/tools.js";
 
@@ -24,11 +26,22 @@ export default function (pi: ExtensionAPI): void {
     return box;
   });
 
+  pi.registerEntryRenderer<ChatEntryData>(CHAT_ENTRY_TYPE, (entry, { expanded }, theme) => (entry.data ? renderChatEntry(entry.data, expanded, theme) : undefined));
+
+  pi.on("input", async (event) => {
+    const session = rt.chatSession;
+    if (!session) return { action: "continue" as const };
+    const source = event.source === "interactive" || event.source === "rpc" ? event.source : "extension";
+    const result = await session.handleInput(event.text, source);
+    return { action: result === "handled" ? ("handled" as const) : ("continue" as const) };
+  });
+
   pi.on("session_start", (_event, ctx) => {
     // Rebind storage + config to this session's project, then recover/reconcile
     // any jobs left from previous runs (restart-safe; runs on timers, non-blocking).
     rt.poller.stop();
     rt.bind(ctx);
+    rt.startChatSession();
     rt.poller.start();
     rt.poller.updateBadge();
   });
@@ -36,5 +49,6 @@ export default function (pi: ExtensionAPI): void {
   pi.on("session_shutdown", () => {
     // Idempotent. Job state is already durable on disk; nothing to flush.
     rt.poller.stop();
+    rt.chatSession?.leave();
   });
 }

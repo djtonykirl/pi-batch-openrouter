@@ -22,6 +22,8 @@ export class BatchPoller {
     private readonly getService: () => BatchService | null,
     private readonly isEnabled: () => boolean,
     private readonly onBadge?: BadgeCallback,
+    /** Runs after every pass (chat housekeeping). Errors are swallowed so scheduling never stops. */
+    private readonly onTick?: () => Promise<void>,
   ) {}
 
   public start(): void {
@@ -81,6 +83,11 @@ export class BatchPoller {
         // A bug or corrupt manifest for one job must not stop the others; it stays visible via /batch list.
         outcomes.push({ localId: job.localId, status: job.localStatus, polled: false, error: (err as Error).message });
       }
+    }
+    try {
+      await this.onTick?.();
+    } catch {
+      // The tick owner logs its own failures; polling must carry on.
     }
     return outcomes;
   }

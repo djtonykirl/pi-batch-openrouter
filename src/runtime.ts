@@ -8,10 +8,15 @@ import { JobRegistry } from "./registry.js";
 import { ArtifactService } from "./artifacts/service.js";
 import { ArtifactStore } from "./artifacts/store.js";
 import { BatchService } from "./service.js";
-import type { JobManifest } from "./types.js";
+import { isChatJob, type JobManifest } from "./types.js";
+import { ChatService } from "./chat/service.js";
+import { CHAT_ENTRY_TYPE, ChatSession, type ChatEntryData } from "./chat/session.js";
+import { ThreadStore } from "./chat/store.js";
 
 export const INJECTED_MESSAGE_TYPE = "pi-batch-result";
 const STATUS_KEY = "pi-batch";
+/** Separate from STATUS_KEY so the job badge and the chat footer do not overwrite each other. */
+const CHAT_STATUS_KEY = "pi-batch-chat";
 
 /**
  * Session-scoped wiring. Rebinds to each session's cwd (project storage),
@@ -22,6 +27,9 @@ export class BatchRuntime {
   public loaded: LoadedConfig = loadConfig();
   public service: BatchService | null = null;
   public artifacts: ArtifactService | null = null;
+  public chat: ChatService | null = null;
+  public chatSession: ChatSession | null = null;
+  private chatStore: ThreadStore | null = null;
   public readonly poller: BatchPoller;
   private logger: Logger | null = null;
   private apiKeyCache = new Map<string, string>();
@@ -32,6 +40,15 @@ export class BatchRuntime {
       () => this.loaded.config.polling.enabled,
       (text) => {
         if (this.ctx?.hasUI) this.ctx.ui.setStatus(STATUS_KEY, text);
+      },
+      async () => {
+        if (!this.chat) return;
+        try {
+          await this.chat.tick();
+        } catch (err) {
+          this.logger?.log("warn", "chat_tick_failed", { message: (err as Error).message });
+        }
+        this.chatSession?.sync();
       },
     );
   }
@@ -51,6 +68,8 @@ export class BatchRuntime {
     if (!this.cwd) {
       this.service = null;
       this.artifacts = null;
+      this.chat = null;
+      this.chatStore = null;
       return;
     }
     const storage = path.resolve(this.cwd, this.loaded.config.storagePath);
@@ -70,6 +89,14 @@ export class BatchRuntime {
       getConfig: () => this.loaded.config,
       store: new ArtifactStore(path.join(storage, "artifacts")),
     });
+    this.chatStore = new ThreadStore(path.join(storage, "threads"));
+    this.chat = new ChatService({
+      store: this.chatStore,
+      batch: this.service,
+      workspaceRoot: this.cwd,
+      getConfig: () => this.loaded.config,
+      logger: this.logger,
+    });
     if (this.loaded.errors.length > 0) {
       this.logger.log("warn", "config_errors", { errors: this.loaded.errors });
     }
@@ -78,6 +105,42 @@ export class BatchRuntime {
   public requireArtifacts(): ArtifactService {
     if (!this.artifacts) throw new Error("No active Pi session/workspace; artifact storage is unavailable.");
     return this.artifacts;
+  }
+
+  public requireChat(): ChatService {
+    if (!this.chat) throw new Error("No active Pi session/workspace; chat storage is unavailable.");
+    return this.chat;
+  }
+
+  public requireChatSession(): ChatSession {
+    if (!this.chatSession) throw new Error("No active Pi session/workspace; chat is unavailable.");
+    return this.chatSession;
+  }
+
+  /** Builds a fresh ChatSession (chat mode off) for the bound session; entries already in the Pi session are not shown twice. */
+  public startChatSession(): void {
+    this.chatSession = null;
+    const ctx = this.ctx;
+    if (!ctx || !this.chat || !this.chatStore) return;
+    const alreadyShown: { threadId: string; seq: number }[] = [];
+    for (const e of ctx.sessionManager.getEntries()) {
+      if (e.type !== "custom" || e.customType !== CHAT_ENTRY_TYPE) continue;
+      const d = e.data as Partial<ChatEntryData> | undefined;
+      if (d && typeof d.threadId === "string" && typeof d.seq === "number") alreadyShown.push({ threadId: d.threadId, seq: d.seq });
+    }
+    this.chatSession = new ChatSession(
+      {
+        chat: this.chat,
+        store: this.chatStore,
+        appendEntry: (data) => this.pi.appendEntry(CHAT_ENTRY_TYPE, data),
+        setStatus: (text) => {
+          if (ctx.hasUI) ctx.ui.setStatus(CHAT_STATUS_KEY, text);
+        },
+        notify: (message, level) => this.notify(message, level),
+        getConfig: () => this.loaded.config,
+      },
+      alreadyShown,
+    );
   }
 
   public requireService(): BatchService {
@@ -97,6 +160,17 @@ export class BatchRuntime {
   }
 
   private onSettled(job: JobManifest): void {
+    if (isChatJob(job)) {
+      // Chat replies are shown by the chat session, not announced as batch results.
+      try {
+        this.chat?.applySettled(job);
+      } catch (err) {
+        this.logger?.log("warn", "chat_apply_settled_failed", { localId: job.localId, message: (err as Error).message });
+      }
+      this.chatSession?.sync();
+      this.poller.updateBadge();
+      return;
+    }
     this.poller.updateBadge();
     if (!this.loaded.config.notifyOnComplete) return;
     const objective = job.objective.replace(/\s+/g, " ").slice(0, 60);

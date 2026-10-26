@@ -2,7 +2,13 @@ import { Type } from "typebox";
 import type { BatchRuntime } from "./runtime.js";
 import { describeArtifact } from "./artifact-commands.js";
 import { formatIsoShort } from "./time.js";
+import { isChatJob, type JobManifest } from "./types.js";
 import { BUILTIN_WORKFLOWS, discoverWorkflows, findWorkflow, formatDiagnostics, validateWorkflowFile } from "./workflows/definition.js";
+
+/** Chat jobs belong to /batch chat; the model-callable tools never list or describe them. */
+export function visibleToModel(jobs: JobManifest[]): JobManifest[] {
+  return jobs.filter((j) => !isChatJob(j));
+}
 
 /**
  * Model-callable tools. They go through exactly the same packaging, exclusion,
@@ -144,6 +150,7 @@ export function registerBatchTools(rt: BatchRuntime): void {
     execute: async (_toolCallId, params) => {
       const service = rt.requireService();
       const id = service.registry.resolveId(params.batch_id);
+      if (isChatJob(service.registry.read(id))) throw new Error(`${id} is a batch chat job; it is not available through this tool.`);
       return { content: [{ type: "text", text: service.describeItems(id) }], details: { localId: id } };
     },
   });
@@ -309,6 +316,7 @@ export function registerBatchTools(rt: BatchRuntime): void {
       if (params.batch_id) {
         const id = service.registry.resolveId(params.batch_id);
         const job = service.registry.read(id);
+        if (isChatJob(job)) throw new Error(`${id} is a batch chat job; it is not available through this tool.`);
         const resultPath = job.localStatus === "ready" || job.localStatus === "partial" ? service.registry.artefact(id, "resultMd") : undefined;
         return {
           content: [
@@ -331,7 +339,7 @@ export function registerBatchTools(rt: BatchRuntime): void {
           details: { localId: job.localId, localStatus: job.localStatus, providerStatus: job.providerStatus, found: true },
         };
       }
-      const jobs = service.registry.list().jobs.slice(0, 20);
+      const jobs = visibleToModel(service.registry.list().jobs).slice(0, 20);
       const summary = jobs.map((j) => `- ${j.localId} [${j.localStatus}] ${formatIsoShort(j.createdAt)} ${j.objective.replace(/\s+/g, " ").slice(0, 60)}`).join("\n");
       return {
         content: [{ type: "text", text: `Batch jobs (${jobs.length} most recent):\n${summary || "None"}` }],
