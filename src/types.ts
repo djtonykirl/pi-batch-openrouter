@@ -17,12 +17,25 @@ import type { LocalStatus } from "./state.js";
  *      JSON Schema output validation). Only these jobs (and their retries) are written
  *      as v3, so a Release 2 build reports them as unreadable instead of retrieving
  *      them without schema validation. Every other new job is still written as v2.
+ *   4  Batch chat jobs (kind "chat", with `chat` linkage). Only chat jobs are written as v4.
  */
 export const MANIFEST_SCHEMA_VERSION = 2;
 export const DATASET_MANIFEST_SCHEMA_VERSION = 3;
-export type ManifestSchemaVersion = 1 | 2 | 3;
+export const CHAT_MANIFEST_SCHEMA_VERSION = 4;
+export type ManifestSchemaVersion = 1 | 2 | 3 | 4;
 
-export type JobKind = "goal" | "workflow" | "synthesis";
+export type JobKind = "goal" | "workflow" | "synthesis" | "chat";
+
+export interface ChatLinkage {
+  threadId: string;
+  purpose: "turn" | "compact";
+  throughSeq: number;
+  titleItem: boolean;
+}
+
+export function isChatJob(job: Pick<JobManifest, "kind">): boolean {
+  return job.kind === "chat";
+}
 
 /**
  * Item result state, separate from both the local batch status and the
@@ -214,6 +227,7 @@ export interface JobManifest {
   items?: JobItem[];
   workflow?: WorkflowInfo;
   synthesis?: SynthesisLinkage;
+  chat?: ChatLinkage;
   /** Exports written by `/batch export` (explicit user command only). */
   exports?: ExportRecord[];
 

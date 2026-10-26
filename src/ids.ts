@@ -27,6 +27,17 @@ export function newLocalJobId(now: Date = new Date(), randomChars = 4): string {
   return `B-${ymd}-${suffix}`;
 }
 
+export const THREAD_ID_PATTERN = /^T-\d{8}-[0-9A-HJKMNP-TV-Z]{4,8}$/;
+
+/** `T-YYYYMMDD-XXXX`; chat thread ID, same alphabet as job IDs. */
+export function newThreadId(now: Date = new Date(), randomChars = 4): string {
+  return newLocalJobId(now, randomChars).replace(/^B-/, "T-");
+}
+
+export function isThreadId(v: string): boolean {
+  return THREAD_ID_PATTERN.test(v);
+}
+
 export function isLocalJobId(value: string): boolean {
   return LOCAL_ID_PATTERN.test(value);
 }

@@ -198,7 +198,7 @@ export class JobRegistry {
       throw new CorruptManifestError(localId, (err as Error).message);
     }
     const m = parsed as Partial<JobManifest>;
-    if (!m || m.localId !== localId || !isLocalStatus(m.localStatus) || (m.schemaVersion !== 1 && m.schemaVersion !== 2 && m.schemaVersion !== 3)) {
+    if (!m || m.localId !== localId || !isLocalStatus(m.localStatus) || (m.schemaVersion !== 1 && m.schemaVersion !== 2 && m.schemaVersion !== 3 && m.schemaVersion !== 4)) {
       throw new CorruptManifestError(localId, "missing or invalid localId/localStatus/schemaVersion");
     }
     return m as JobManifest;

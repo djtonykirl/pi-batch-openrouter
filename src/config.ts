@@ -43,6 +43,8 @@ export interface BatchConfig {
     /** Dataset workflows: largest dataset file read. */
     maxDatasetBytes: number;
   };
+  /** Batch chat: persistent named threads. */
+  chat: { autoCompact: boolean; autoCompactTokens: number; keepRecentExchanges: number; retitleAtTurn: number; systemPrompt: string };
 }
 
 export const DEFAULT_CONFIG: BatchConfig = {
@@ -73,6 +75,14 @@ export const DEFAULT_CONFIG: BatchConfig = {
     maxSynthesisCharacters: 1_000_000,
     maxRowsPerRun: 1_000,
     maxDatasetBytes: 20_000_000,
+  },
+  chat: {
+    autoCompact: true,
+    autoCompactTokens: 60000,
+    keepRecentExchanges: 4,
+    retitleAtTurn: 3,
+    systemPrompt:
+      "You are a helpful, knowledgeable assistant in an ongoing conversation. Answer clearly and directly. Use Markdown where it helps.",
   },
 };
 
@@ -180,6 +190,13 @@ const SCHEMA: Record<string, Check | Record<string, Check>> = {
     maxSynthesisCharacters: posInt(),
     maxRowsPerRun: posInt(100_000),
     maxDatasetBytes: posInt(),
+  },
+  chat: {
+    autoCompact: bool,
+    autoCompactTokens: posInt(),
+    keepRecentExchanges: posInt(100),
+    retitleAtTurn: posInt(1000),
+    systemPrompt: str,
   },
 };
 
