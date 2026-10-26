@@ -4,8 +4,15 @@
  */
 
 export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string }): string {
-  const tokenJson = JSON.stringify(opts.csrfToken);
-  const rootJson = JSON.stringify(opts.workspaceRoot);
+  // JSON inside <script>: "<" is escaped so a value can never close the script element (e.g. a folder named
+  // "</script>"), and U+2028/U+2029 so it stays one JavaScript string literal.
+  const scriptJson = (v: unknown) =>
+    JSON.stringify(v)
+      .replace(/</g, "\\u003c")
+      .split(String.fromCharCode(0x2028)).join("\\u2028")
+      .split(String.fromCharCode(0x2029)).join("\\u2029");
+  const tokenJson = scriptJson(opts.csrfToken);
+  const rootJson = scriptJson(opts.workspaceRoot);
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -939,6 +946,34 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         .replace(/'/g, "&#39;");
     }
 
+    // Click actions are data, never inline JavaScript: a button carries data-action (a name from ACTIONS) and
+    // data-args (a JSON array), and one delegated listener calls the handler. Untrusted values (file names, job IDs)
+    // therefore never reach a JavaScript parser.
+    const ACTIONS = new Set([
+      "copyExtractedBlock", "downloadExtractedBlock", "openSaveBlockModal", "exportReplyArtifact", "inspectJobFromChat",
+      "retryActiveChatTurn", "pollSingleJob", "removeAttachment", "toggleWorkspaceSelection", "previewWorkspaceFile",
+      "quickAttachToChat", "inspectJobItem", "generateJobArtifact", "exportDatasetJob", "previewArtifactFrame",
+      "submitPreviewedJob", "cancelBatchJob", "retryBatchJob", "synthesizeBatchJob", "setJobSubTab",
+    ]);
+    function act(name, ...args) {
+      return 'data-action="' + escapeHtml(name) + '" data-args="' + escapeHtml(JSON.stringify(args)) + '"';
+    }
+    document.addEventListener("click", (ev) => {
+      const el = ev.target instanceof Element ? ev.target.closest("[data-action]") : null;
+      if (!el) return;
+      const name = el.getAttribute("data-action");
+      if (!ACTIONS.has(name) || typeof window[name] !== "function") return;
+      let args = [];
+      try {
+        args = JSON.parse(el.getAttribute("data-args") || "[]");
+      } catch {
+        return;
+      }
+      if (!Array.isArray(args)) return;
+      ev.preventDefault();
+      window[name](...args);
+    });
+
     function formatBytes(bytes) {
       if (bytes === undefined || bytes === null) return "";
       if (bytes < 1024) return bytes + " B";
@@ -1026,9 +1061,9 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
           (lines === 1 ? "" : "s") +
           ")</span></span>" +
           '<span style="display:flex; gap:6px;">' +
-          '<button class="btn btn-sm" onclick="window.copyExtractedBlock(\\'' + id + '\\')">📋 Copy</button>' +
-          '<button class="btn btn-sm" onclick="window.downloadExtractedBlock(\\'' + id + '\\')">⬇️ Download</button>' +
-          '<button class="btn btn-sm btn-primary" onclick="window.openSaveBlockModal(\\'' + id + '\\')">💾 Save to Workspace…</button>' +
+          '<button class="btn btn-sm" ' + act("copyExtractedBlock", id) + '>📋 Copy</button>' +
+          '<button class="btn btn-sm" ' + act("downloadExtractedBlock", id) + '>⬇️ Download</button>' +
+          '<button class="btn btn-sm btn-primary" ' + act("openSaveBlockModal", id) + '>💾 Save to Workspace…</button>' +
           "</span></div>" +
           '<pre style="margin:0; border:none; border-radius:0;"><code>' +
           escapeHtml(code) +
@@ -1056,8 +1091,8 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
           '<div style="display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:8px; font-size:11px;">' +
           '<span style="font-family:var(--mono); color:#a5b4fc;">🖼️ ' + escapeHtml(alt || suggestedPath) + " (" + escapeHtml(mime) + ")</span>" +
           '<span style="display:flex; gap:6px;">' +
-          '<button class="btn btn-sm" onclick="window.downloadExtractedBlock(\\'' + id + '\\')">⬇️ Download Image</button>' +
-          '<button class="btn btn-sm btn-primary" onclick="window.openSaveBlockModal(\\'' + id + '\\')">💾 Save to Workspace…</button>' +
+          '<button class="btn btn-sm" ' + act("downloadExtractedBlock", id) + '>⬇️ Download Image</button>' +
+          '<button class="btn btn-sm btn-primary" ' + act("openSaveBlockModal", id) + '>💾 Save to Workspace…</button>' +
           "</span></div>" +
           '<img src="' + escapeHtml(dataUrl) + '" alt="' + escapeHtml(alt || suggestedPath) + '" style="max-width:100%; max-height:360px; border-radius:6px; display:block;">' +
           "</div>";
@@ -1450,10 +1485,10 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
                 '<span><strong style="color:#a5b4fc;">' + escapeHtml(e.model) + "</strong> · #" + e.seq + "</span>" +
                 '<span style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">' +
                 (e.finishReason === "length" ? '<span class="status-dot status-waiting">truncated: max_tokens</span>' : "") +
-                '<button class="btn btn-sm" title="Render & download this reply as Markdown (.md)" onclick="window.exportReplyArtifact(\\'' + escapeHtml(e.jobId) + '\\', \\'markdown\\')">⬇️ .md</button>' +
-                '<button class="btn btn-sm" title="Render & download this reply as HTML (.html)" onclick="window.exportReplyArtifact(\\'' + escapeHtml(e.jobId) + '\\', \\'html\\')">📄 .html</button>' +
-                '<button class="btn btn-sm" title="Render & download this reply as PDF (.pdf)" onclick="window.exportReplyArtifact(\\'' + escapeHtml(e.jobId) + '\\', \\'pdf\\')">📕 .pdf</button>' +
-                '<button class="btn btn-sm" onclick="window.inspectJobFromChat(\\'' + escapeHtml(e.jobId) + '\\')">📦 ' + escapeHtml(e.jobId) + "</button>" +
+                '<button class="btn btn-sm" title="Render & download this reply as Markdown (.md)" ' + act("exportReplyArtifact", e.jobId, "markdown") + '>⬇️ .md</button>' +
+                '<button class="btn btn-sm" title="Render & download this reply as HTML (.html)" ' + act("exportReplyArtifact", e.jobId, "html") + '>📄 .html</button>' +
+                '<button class="btn btn-sm" title="Render & download this reply as PDF (.pdf)" ' + act("exportReplyArtifact", e.jobId, "pdf") + '>📕 .pdf</button>' +
+                '<button class="btn btn-sm" ' + act("inspectJobFromChat", e.jobId) + '>📦 ' + escapeHtml(e.jobId) + "</button>" +
                 "</span></div>" +
                 '<div class="msg-body">' + formatMarkdownLite(e.text) + "</div>" +
                 "</div>"
@@ -1473,8 +1508,8 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
                 '<div class="alert-box alert-danger" style="display:flex; align-items:center; justify-content:space-between; gap:12px;">' +
                 "<span>⚠️ Turn failed: " + escapeHtml(e.message) + "</span>" +
                 (unknown
-                  ? '<button class="btn btn-sm" onclick="window.retryActiveChatTurn(true)">⚠️ Retry anyway (check OpenRouter first)</button>'
-                  : '<button class="btn btn-sm" onclick="window.retryActiveChatTurn(false)">🔄 Retry Turn</button>') +
+                  ? '<button class="btn btn-sm" ' + act("retryActiveChatTurn", true) + '>⚠️ Retry anyway (check OpenRouter first)</button>'
+                  : '<button class="btn btn-sm" ' + act("retryActiveChatTurn", false) + '>🔄 Retry Turn</button>') +
                 "</div>"
               );
             }
@@ -1505,8 +1540,8 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
           '<div style="font-size:11px; color:var(--text-muted);">Messages sent while waiting are queued in the thread and automatically submitted as one turn when the reply lands.</div>' +
           "</div>" +
           '<div style="display:flex; gap:8px;">' +
-          (jobId ? '<button class="btn btn-sm" onclick="window.pollSingleJob(\\'' + escapeHtml(jobId) + '\\')">🔄 Poll Job Now</button>' : "") +
-          (jobId ? '<button class="btn btn-sm" onclick="window.inspectJobFromChat(\\'' + escapeHtml(jobId) + '\\')">Inspect</button>' : "") +
+          (jobId ? '<button class="btn btn-sm" ' + act("pollSingleJob", jobId) + '>🔄 Poll Job Now</button>' : "") +
+          (jobId ? '<button class="btn btn-sm" ' + act("inspectJobFromChat", jobId) + '>Inspect</button>' : "") +
           "</div></div>";
       } else {
         inflight.innerHTML = "";
@@ -1696,14 +1731,14 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         chips.push(
           '<span class="att-chip">📄 ' +
             escapeHtml(f) +
-            ' <button type="button" onclick="window.removeAttachment(\\'' + target + "\\', \\'files\\', " + idx + ')">✕</button></span>',
+            ' <button type="button" ' + act("removeAttachment", target, "files", idx) + '>✕</button></span>',
         );
       });
       bag.contexts.forEach((c, idx) => {
         chips.push(
           '<span class="att-chip">📁 ' +
             escapeHtml(c) +
-            ' (dir) <button type="button" onclick="window.removeAttachment(\\'' + target + "\\', \\'contexts\\', " + idx + ')">✕</button></span>',
+            ' (dir) <button type="button" ' + act("removeAttachment", target, "contexts", idx) + '>✕</button></span>',
         );
       });
       bag.uploads.forEach((u, idx) => {
@@ -1713,7 +1748,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
             " (" +
             formatBytes(u.size) +
             (u.pdfMode ? " · " + u.pdfMode : "") +
-            ') <button type="button" onclick="window.removeAttachment(\\'' + target + "\\', \\'uploads\\', " + idx + ')">✕</button></span>',
+            ') <button type="button" ' + act("removeAttachment", target, "uploads", idx) + '>✕</button></span>',
         );
       });
       container.innerHTML = chips.join("");
@@ -1886,16 +1921,14 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
             (e.selectable
               ? '<button class="btn btn-sm ' +
                 (already ? "btn-primary" : "") +
-                '" onclick="window.toggleWorkspaceSelection(\\'' +
-                escapeHtml(e.relPath) +
-                "\\', \\'" +
-                escapeHtml(e.kind) +
-                '\\')">' +
+                '" ' +
+                act("toggleWorkspaceSelection", e.relPath, e.kind) +
+                ">" +
                 (already ? "✓ Attached" : "＋ Attach") +
                 "</button>"
               : "") +
             (!isDir && e.selectable
-              ? '<button class="btn btn-sm" onclick="window.previewWorkspaceFile(\\'' + escapeHtml(e.relPath) + '\\')">👁️ Preview</button>'
+              ? '<button class="btn btn-sm" ' + act("previewWorkspaceFile", e.relPath) + '>👁️ Preview</button>'
               : "") +
             "</td></tr>"
           );
@@ -1943,7 +1976,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
             "<td>" + status + "</td>" +
             "<td>" +
             (e.selectable
-              ? '<button class="btn btn-sm" onclick="window.quickAttachToChat(\\'' + escapeHtml(e.relPath) + "\\', \\'" + escapeHtml(e.kind) + '\\')">Attach to Chat</button>'
+              ? '<button class="btn btn-sm" ' + act("quickAttachToChat", e.relPath, e.kind) + '>Attach to Chat</button>'
               : "") +
             "</td></tr>"
           );
@@ -2045,7 +2078,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
                 '<td style="font-family:var(--mono); font-size:12px;">' + escapeHtml(it.sourceLabel) + "</td>" +
                 '<td><span class="status-dot status-' + escapeHtml(it.status) + '">' + escapeHtml(it.status) + "</span></td>" +
                 "<td>" + (it.characters ?? "—") + "</td>" +
-                '<td><button class="btn btn-sm" onclick="window.inspectJobItem(\\'' + escapeHtml(j.localId) + "\\', " + it.ordinal + ')">View Prompt & Output</button></td>' +
+                '<td><button class="btn btn-sm" ' + act("inspectJobItem", j.localId, it.ordinal) + '>View Prompt & Output</button></td>' +
                 "</tr>",
             )
             .join("") +
@@ -2059,11 +2092,11 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
           '<div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px;">' +
           "<strong>Generate Controlled Artifact from Validated Result</strong>" +
           '<div style="display:flex; gap:8px;">' +
-          '<button class="btn btn-sm btn-primary" onclick="window.generateJobArtifact(\\'' + escapeHtml(j.localId) + '\\', \\'html\\')">Render HTML</button>' +
-          '<button class="btn btn-sm btn-primary" onclick="window.generateJobArtifact(\\'' + escapeHtml(j.localId) + '\\', \\'pdf\\')">Render PDF</button>' +
-          '<button class="btn btn-sm" onclick="window.generateJobArtifact(\\'' + escapeHtml(j.localId) + '\\', \\'markdown\\')">Save Markdown</button>' +
-          (j.workflow ? '<button class="btn btn-sm" onclick="window.exportDatasetJob(\\'' + escapeHtml(j.localId) + '\\', \\'jsonl\\')">Export JSONL</button>' : "") +
-          (j.workflow ? '<button class="btn btn-sm" onclick="window.exportDatasetJob(\\'' + escapeHtml(j.localId) + '\\', \\'csv\\')">Export CSV</button>' : "") +
+          '<button class="btn btn-sm btn-primary" ' + act("generateJobArtifact", j.localId, "html") + '>Render HTML</button>' +
+          '<button class="btn btn-sm btn-primary" ' + act("generateJobArtifact", j.localId, "pdf") + '>Render PDF</button>' +
+          '<button class="btn btn-sm" ' + act("generateJobArtifact", j.localId, "markdown") + '>Save Markdown</button>' +
+          (j.workflow ? '<button class="btn btn-sm" ' + act("exportDatasetJob", j.localId, "jsonl") + '>Export JSONL</button>' : "") +
+          (j.workflow ? '<button class="btn btn-sm" ' + act("exportDatasetJob", j.localId, "csv") + '>Export CSV</button>' : "") +
           "</div></div>" +
           (arts.length
             ? '<table class="data-table"><thead><tr><th>Artifact ID</th><th>Format</th><th>Path</th><th>Size</th><th>Preview / Download</th></tr></thead><tbody>' +
@@ -2076,7 +2109,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
                     '<td style="font-family:var(--mono); font-size:12px;">' + escapeHtml(a.output?.path || "") + "</td>" +
                     "<td>" + formatBytes(a.output?.bytes) + "</td>" +
                     '<td style="display:flex; gap:6px;">' +
-                    '<button class="btn btn-sm" onclick="window.previewArtifactFrame(\\'' + escapeHtml(a.artifactId) + '\\')">Preview</button>' +
+                    '<button class="btn btn-sm" ' + act("previewArtifactFrame", a.artifactId) + '>Preview</button>' +
                     '<a class="btn btn-sm" href="/api/artifacts/' + encodeURIComponent(a.artifactId) + '/content?download=1" target="_blank" style="text-decoration:none;">Download</a>' +
                     "</td></tr>",
                 )
@@ -2111,13 +2144,13 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         (j.providerStatus ? '<span style="font-size:12px; color:var(--text-muted);">Provider: ' + escapeHtml(j.providerStatus) + "</span>" : "") +
         "</div>" +
         '<div style="display:flex; gap:8px; flex-wrap:wrap;">' +
-        (isPreviewed ? '<button class="btn btn-sm btn-primary" onclick="window.submitPreviewedJob(\\'' + escapeHtml(j.localId) + '\\')">🚀 Submit Previewed Batch</button>' : "") +
-        (isActive ? '<button class="btn btn-sm" onclick="window.pollSingleJob(\\'' + escapeHtml(j.localId) + '\\')">🔄 Poll Now</button>' : "") +
-        (isActive || isPreviewed ? '<button class="btn btn-sm btn-danger" onclick="window.cancelBatchJob(\\'' + escapeHtml(j.localId) + '\\')">Cancel</button>' : "") +
-        (isTerminal && !isChat ? '<button class="btn btn-sm" onclick="window.retryBatchJob(\\'' + escapeHtml(j.localId) + '\\', false)">🔁 Retry All</button>' : "") +
-        (isTerminal && !isChat && j.requestCount > 1 ? '<button class="btn btn-sm" onclick="window.retryBatchJob(\\'' + escapeHtml(j.localId) + '\\', true)">🔁 Retry Failed Items</button>' : "") +
+        (isPreviewed ? '<button class="btn btn-sm btn-primary" ' + act("submitPreviewedJob", j.localId) + '>🚀 Submit Previewed Batch</button>' : "") +
+        (isActive ? '<button class="btn btn-sm" ' + act("pollSingleJob", j.localId) + '>🔄 Poll Now</button>' : "") +
+        (isActive || isPreviewed ? '<button class="btn btn-sm btn-danger" ' + act("cancelBatchJob", j.localId) + '>Cancel</button>' : "") +
+        (isTerminal && !isChat ? '<button class="btn btn-sm" ' + act("retryBatchJob", j.localId, false) + '>🔁 Retry All</button>' : "") +
+        (isTerminal && !isChat && j.requestCount > 1 ? '<button class="btn btn-sm" ' + act("retryBatchJob", j.localId, true) + '>🔁 Retry Failed Items</button>' : "") +
         ((j.localStatus === "ready" || j.localStatus === "partial") && !isChat && j.requestCount > 1 && j.kind !== "synthesis"
-          ? '<button class="btn btn-sm btn-primary" onclick="window.synthesizeBatchJob(\\'' + escapeHtml(j.localId) + '\\')">✨ Synthesize</button>'
+          ? '<button class="btn btn-sm btn-primary" ' + act("synthesizeBatchJob", j.localId) + '>✨ Synthesize</button>'
           : "") +
         "</div></div>" +
         '<div style="padding:18px; overflow-y:auto; flex:1; display:flex; flex-direction:column; gap:16px;">' +
@@ -2134,10 +2167,10 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         (j.error ? '<div class="kv-label">Error</div><div class="kv-val" style="color:#fca5a5;">[' + escapeHtml(j.error.code) + "] " + escapeHtml(j.error.message) + "</div>" : "") +
         "</div></div>" +
         '<div style="display:flex; gap:8px;">' +
-        '<button class="btn btn-sm ' + (state.jobSubTab === "result" ? "btn-primary" : "") + '" onclick="window.setJobSubTab(\\'result\\')">📄 Result & Overview</button>' +
-        '<button class="btn btn-sm ' + (state.jobSubTab === "items" ? "btn-primary" : "") + '" onclick="window.setJobSubTab(\\'items\\')">🧩 Items (' + j.requestCount + ")</button>" +
-        (!isChat ? '<button class="btn btn-sm ' + (state.jobSubTab === "artifacts" ? "btn-primary" : "") + '" onclick="window.setJobSubTab(\\'artifacts\\')">🖨️ Artifacts & Exports</button>' : "") +
-        '<button class="btn btn-sm ' + (state.jobSubTab === "events" ? "btn-primary" : "") + '" onclick="window.setJobSubTab(\\'events\\')">🕒 Lifecycle Events</button>' +
+        '<button class="btn btn-sm ' + (state.jobSubTab === "result" ? "btn-primary" : "") + '" ' + act("setJobSubTab", "result") + '>📄 Result & Overview</button>' +
+        '<button class="btn btn-sm ' + (state.jobSubTab === "items" ? "btn-primary" : "") + '" ' + act("setJobSubTab", "items") + '>🧩 Items (' + j.requestCount + ")</button>" +
+        (!isChat ? '<button class="btn btn-sm ' + (state.jobSubTab === "artifacts" ? "btn-primary" : "") + '" ' + act("setJobSubTab", "artifacts") + '>🖨️ Artifacts & Exports</button>' : "") +
+        '<button class="btn btn-sm ' + (state.jobSubTab === "events" ? "btn-primary" : "") + '" ' + act("setJobSubTab", "events") + '>🕒 Lifecycle Events</button>' +
         "</div>" +
         subContent +
         "</div>";
