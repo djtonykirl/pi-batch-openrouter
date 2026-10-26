@@ -24,10 +24,13 @@ import { ARTEFACTS, JobRegistry, JobUpdate } from "./registry.js";
 import { ACTIVE_STATUSES, POLLABLE_STATUSES, TERMINAL_STATUSES, type LocalStatus } from "./state.js";
 import { formatIsoShort, isoToEpochMs, nowIso, parseProviderTimestamp } from "./time.js";
 import {
+  CHAT_MANIFEST_SCHEMA_VERSION,
   DATASET_MANIFEST_SCHEMA_VERSION,
   MANIFEST_SCHEMA_VERSION,
+  isChatJob,
   isDatasetWorkflow,
   isMetadataWorkflow,
+  type ChatLinkage,
   type DatasetSelection,
   type DatasetWorkflowInfo,
   type ExportRecord,
@@ -192,6 +195,13 @@ export class SubmissionBlockedError extends Error {
   }
 }
 
+export class ChatJobError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ChatJobError";
+  }
+}
+
 export class DuplicateActiveRequestError extends Error {
   constructor(public readonly existingId: string) {
     super(`An identical active request already exists:\n  ${existingId}\n\nUse /batch show ${existingId}\n(Use /batch retry ${existingId} to deliberately run it again.)`);
@@ -250,6 +260,7 @@ interface JobDraft {
   retryMode?: JobManifest["retryMode"];
   workflow?: WorkflowInfo;
   synthesis?: SynthesisLinkage;
+  chat?: ChatLinkage;
   /** Extra request artefacts (objective, context, manifests, plan, linkage). */
   writeArtefacts(localId: string, customIds: string[], itemShas: string[]): void;
   previewDetails: Record<string, unknown>;
@@ -284,7 +295,7 @@ export class BatchService {
     return this.deps.createClient ? this.deps.createClient(apiKey, timeoutMs) : new OpenRouterBatchClient({ apiKey, timeoutMs });
   }
 
-  private async knownSecrets(account: string): Promise<string[]> {
+  public async knownSecrets(account: string): Promise<string[]> {
     const out = new Set<string>();
     const env = process.env.OPENROUTER_API_KEY;
     if (env) out.add(env);
@@ -295,6 +306,10 @@ export class BatchService {
       // no key resolvable; nothing extra to protect
     }
     return [...out];
+  }
+
+  private assertNotChat(job: Pick<JobManifest, "kind" | "localId">): void {
+    if (isChatJob(job)) throw new ChatJobError(`${job.localId} is a batch chat job; use /batch chat instead.`);
   }
 
   private requestBody(messages: ChatMessage[]): BatchRequestItem["body"] {
@@ -466,6 +481,7 @@ export class BatchService {
         })),
         ...(draft.workflow ? { workflow: draft.workflow } : {}),
         ...(draft.synthesis ? { synthesis: draft.synthesis } : {}),
+        ...(draft.chat ? { chat: draft.chat } : {}),
         createdAt: nowIso(),
         pollAttempts: 0,
         consecutivePollFailures: 0,
@@ -1444,6 +1460,7 @@ export class BatchService {
   /** Every item of a finished job, re-run as a new linked job from the exact original request bodies. */
   public async retry(localId: string, opts: { model?: string } = {}): Promise<JobManifest> {
     const source = this.registry.read(localId);
+    this.assertNotChat(source);
     if (!TERMINAL_STATUSES.has(source.localStatus)) {
       throw new Error(`${localId} is ${source.localStatus}; only finished jobs (ready/partial/failed/cancelled/expired/corrupt) can be retried.`);
     }
@@ -1459,6 +1476,7 @@ export class BatchService {
    */
   public async retryItems(localId: string, opts: { failed?: boolean; selectors?: string[]; model?: string; previewOnly?: boolean }): Promise<JobManifest> {
     const source = this.registry.read(localId);
+    this.assertNotChat(source);
     if (!TERMINAL_STATUSES.has(source.localStatus)) {
       throw new Error(`${localId} is ${source.localStatus}; only finished jobs can have items retried.`);
     }
@@ -1603,6 +1621,7 @@ export class BatchService {
   public async prepareSynthesis(sourceJobId: string, opts: SynthesisOptions): Promise<PreparedSynthesis> {
     const config = this.deps.getConfig();
     const source = this.registry.read(sourceJobId);
+    this.assertNotChat(source);
     if (source.kind === "synthesis") throw new Error(`${sourceJobId} is itself a synthesis job; synthesize its source job instead.`);
     if (!TERMINAL_STATUSES.has(source.localStatus)) throw new Error(`${sourceJobId} is ${source.localStatus}; wait until it has finished.`);
     if (isDatasetWorkflow(source.workflow) && !source.workflow.synthesisEnabled) {
@@ -1709,6 +1728,48 @@ export class BatchService {
     return this.submit(job.localId, { skipDuplicateCheck: true });
   }
 
+  /** Chat turn/compaction: item 1 is the reply (or summary), optional item 2 a title. Submitted immediately. */
+  public async createChatJob(input: {
+    threadId: string;
+    purpose: "turn" | "compact";
+    throughSeq: number;
+    model: string;
+    account: string;
+    pin?: ProviderPin;
+    main: ChatMessage[];
+    title?: ChatMessage[];
+  }): Promise<JobManifest> {
+    const objective = `${input.purpose === "turn" ? "Chat turn" : "Chat compaction"} in ${input.threadId}`;
+    const render = (m: ChatMessage[]): string => m.map((x) => x.content).join("\n\n");
+    const mk = (messages: ChatMessage[], label: string) => {
+      const prompt = render(messages);
+      return { source: { kind: "goal" as const, label }, body: this.requestBody(messages), characters: prompt.length, prompt };
+    };
+    const items = [mk(input.main, input.purpose === "turn" ? "chat-reply" : "chat-summary")];
+    if (input.title) items.push(mk(input.title, "chat-title"));
+    const characters = items.reduce((n, it) => n + it.characters, 0);
+    const chat: ChatLinkage = { threadId: input.threadId, purpose: input.purpose, throughSeq: input.throughSeq, titleItem: input.title !== undefined };
+    const job = this.persistJob({
+      kind: "chat",
+      schemaVersion: CHAT_MANIFEST_SCHEMA_VERSION,
+      objective,
+      model: input.model,
+      account: input.account,
+      pin: input.pin,
+      format: "markdown",
+      items,
+      context: { fileCount: 0, characters, excludedCount: 0 },
+      warnings: [],
+      retryCount: 0,
+      chat,
+      writeArtefacts: (localId) => {
+        atomicWriteFile(this.registry.artefact(localId, "objective"), objective + "\n");
+      },
+      previewDetails: { threadId: input.threadId, purpose: input.purpose, characters },
+    });
+    return this.submit(job.localId, { skipDuplicateCheck: true });
+  }
+
   /** Coverage facts of a synthesis job, rebuilt from its manifest (independent of the model's prose). */
   public synthesisCoverage(job: JobManifest): CoverageFacts | undefined {
     const s = job.synthesis;
@@ -1731,6 +1792,7 @@ export class BatchService {
    */
   public exportResults(localId: string, opts: { format: "jsonl" | "csv"; out?: string; overwrite?: boolean; jobOnly?: boolean }): ExportRecord {
     const job = this.registry.read(localId);
+    this.assertNotChat(job);
     if (!TERMINAL_STATUSES.has(job.localStatus)) throw new Error(`${localId} is ${job.localStatus}; only finished jobs can be exported.`);
     const combined = !opts.jobOnly;
     const rows = buildExportRows(this.registry, job, { combined });
@@ -1970,6 +2032,7 @@ export class BatchService {
       return this.buildInjection(syn.localId, mode);
     }
     const job = this.registry.read(localId);
+    this.assertNotChat(job);
     if (job.localStatus !== "ready" && job.localStatus !== "partial") {
       return {
         ok: false,
