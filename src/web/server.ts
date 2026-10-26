@@ -178,8 +178,43 @@ export function inspectWorkspaceFiles(workspaceRoot: string, config: BatchConfig
   return entries;
 }
 
+/** Constant-time string comparison (length is not secret). */
+function safeEqual(a: string, b: string): boolean {
+  const ab = Buffer.from(a, "utf8");
+  const bb = Buffer.from(b, "utf8");
+  return ab.length === bb.length && crypto.timingSafeEqual(ab, bb);
+}
+
+function cookieValue(req: http.IncomingMessage, name: string): string | undefined {
+  for (const part of (req.headers.cookie ?? "").split(";")) {
+    const eq = part.indexOf("=");
+    if (eq > 0 && part.slice(0, eq).trim() === name) return part.slice(eq + 1).trim();
+  }
+  return undefined;
+}
+
+const UNAUTHORIZED_PAGE =
+  "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Batch Web UI</title></head><body>" +
+  "<p>Not signed in. Open the link printed by <code>/batch web</code> (or <code>npm run web</code>): it carries a one-time token. " +
+  "Run the command again for a fresh link.</p></body></html>";
+
+/**
+ * Security model (local only):
+ * - Every request must carry `Host: 127.0.0.1:<port>` or `localhost:<port>` (`[::1]:<port>` when bound to ::1), which
+ *   defeats DNS rebinding.
+ * - The start URL carries a one-time launch token. `GET /?token=…` exchanges it for an HttpOnly, SameSite=Strict
+ *   session cookie and redirects to `/`. The page (which embeds the CSRF token) and every `/api/*` request, GETs and
+ *   the event stream included, require that session.
+ * - API requests must not come from another origin (`Origin`, when present, must be this server; `Sec-Fetch-Site`,
+ *   when present, must be `same-origin` or `none`), and mutating ones must also send the CSRF token.
+ * - Tokens are compared in constant time. Responses carry a CSP (a nonce for the one page script), nosniff and
+ *   no-referrer.
+ */
 export class BatchWebServer {
   public readonly csrfToken = crypto.randomBytes(24).toString("hex");
+  private launchToken: string | null = null;
+  private readonly sessions = new Set<string>();
+  private boundHost = "127.0.0.1";
   private server: http.Server | null = null;
   private portNumber: number | null = null;
   private readonly sseClients = new Set<http.ServerResponse>();
@@ -314,7 +349,38 @@ export class BatchWebServer {
   }
 
   public get url(): string | null {
-    return this.portNumber ? `http://127.0.0.1:${this.portNumber}` : null;
+    if (!this.portNumber) return null;
+    return this.boundHost === "::1" ? `http://[::1]:${this.portNumber}` : `http://127.0.0.1:${this.portNumber}`;
+  }
+
+  /**
+   * A start URL with a fresh one-time launch token (any earlier unused token stops working). Opening it signs the
+   * browser in with a session cookie. Null when the server is not running.
+   */
+  public createLaunchUrl(): string | null {
+    if (!this.url) return null;
+    this.launchToken = crypto.randomBytes(24).toString("hex");
+    return `${this.url}/?token=${this.launchToken}`;
+  }
+
+  private get sessionCookieName(): string {
+    // Cookies are not isolated by port: two servers on one host must not overwrite each other's session.
+    return `pi_batch_session_${this.portNumber ?? 0}`;
+  }
+
+  private allowedHosts(): Set<string> {
+    const p = this.portNumber;
+    const hosts = new Set([`127.0.0.1:${p}`, `localhost:${p}`]);
+    if (this.boundHost === "::1") hosts.add(`[::1]:${p}`);
+    return hosts;
+  }
+
+  private hasSession(req: http.IncomingMessage): boolean {
+    const value = cookieValue(req, this.sessionCookieName);
+    if (!value) return false;
+    let ok = false;
+    for (const s of this.sessions) if (safeEqual(s, value)) ok = true;
+    return ok;
   }
 
   public get isRunning(): boolean {
@@ -335,6 +401,7 @@ export class BatchWebServer {
     });
     const addr = srv.address();
     this.portNumber = typeof addr === "object" && addr ? addr.port : port;
+    this.boundHost = host;
     this.server = srv;
 
     try {
@@ -359,6 +426,8 @@ export class BatchWebServer {
       } catch {}
     }
     this.sseClients.clear();
+    this.sessions.clear();
+    this.launchToken = null;
     if (!this.server) return;
     const srv = this.server;
     this.server = null;
@@ -380,22 +449,77 @@ export class BatchWebServer {
   private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     try {
       const method = req.method ?? "GET";
-      const parsedUrl = new URL(req.url ?? "/", `http://${req.headers.host ?? "127.0.0.1"}`);
+      res.setHeader("X-Content-Type-Options", "nosniff");
+      res.setHeader("Referrer-Policy", "no-referrer");
+      res.setHeader("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'");
+
+      // DNS rebinding: only our own host names are served.
+      if (!this.allowedHosts().has(req.headers.host ?? "")) {
+        res.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
+        res.end("Forbidden: unexpected Host header");
+        return;
+      }
+      // Never derive anything from the Host header beyond the check above.
+      const parsedUrl = new URL(req.url ?? "/", "http://127.0.0.1");
       const pathname = parsedUrl.pathname;
 
-      // Serve UI
+      // Serve UI: a launch token signs in once; the page itself requires the session.
       if (method === "GET" && (pathname === "/" || pathname === "/index.html")) {
+        const token = parsedUrl.searchParams.get("token");
+        if (token !== null) {
+          const launch = this.launchToken;
+          if (!launch || !safeEqual(launch, token)) {
+            res.writeHead(401, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+            res.end(UNAUTHORIZED_PAGE);
+            return;
+          }
+          this.launchToken = null; // one-time
+          const session = crypto.randomBytes(32).toString("hex");
+          this.sessions.add(session);
+          res.writeHead(303, {
+            Location: "/",
+            "Set-Cookie": `${this.sessionCookieName}=${session}; HttpOnly; SameSite=Strict; Path=/`,
+            "Cache-Control": "no-store",
+          });
+          res.end();
+          return;
+        }
+        if (!this.hasSession(req)) {
+          res.writeHead(401, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+          res.end(UNAUTHORIZED_PAGE);
+          return;
+        }
+        const nonce = crypto.randomBytes(16).toString("base64");
         const html = renderWebUiHtml({
           csrfToken: this.csrfToken,
           workspaceRoot: toPosix(this.deps.workspaceRoot),
+          nonce,
         });
         res.writeHead(200, {
           "Content-Type": "text/html; charset=utf-8",
           "Cache-Control": "no-store",
           "X-Frame-Options": "DENY",
+          "Content-Security-Policy":
+            `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; img-src 'self' data: blob:; ` +
+            "connect-src 'self'; frame-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
         });
         res.end(html);
         return;
+      }
+
+      if (pathname.startsWith("/api/")) {
+        const origin = req.headers.origin;
+        const port = this.portNumber;
+        const allowedOrigins = new Set([`http://127.0.0.1:${port}`, `http://localhost:${port}`, ...(this.boundHost === "::1" ? [`http://[::1]:${port}`] : [])]);
+        const fetchSite = req.headers["sec-fetch-site"];
+        if ((origin !== undefined && !allowedOrigins.has(origin)) || (fetchSite !== undefined && fetchSite !== "same-origin" && fetchSite !== "none")) {
+          this.sendJson(res, 403, { error: "Forbidden: cross-origin request" });
+          return;
+        }
+        if (!this.hasSession(req)) {
+          this.sendJson(res, 401, { error: "Not signed in: open the link printed by /batch web" });
+          return;
+        }
       }
 
       // SSE stream
@@ -414,7 +538,7 @@ export class BatchWebServer {
       // Enforce CSRF token on mutating API calls
       if (pathname.startsWith("/api/") && method !== "GET" && method !== "HEAD") {
         const token = req.headers["x-batch-token"];
-        if (token !== this.csrfToken) {
+        if (typeof token !== "string" || !safeEqual(token, this.csrfToken)) {
           this.sendJson(res, 403, { error: "Forbidden: invalid or missing X-Batch-Token" });
           return;
         }
@@ -988,6 +1112,9 @@ export class BatchWebServer {
         res.writeHead(200, {
           "Content-Type": contentType,
           "Content-Length": bytes.length,
+          // Rendered from model output: HTML runs in an opaque, script-less sandbox, never with this origin's session.
+          "Content-Security-Policy":
+            manifest.format === "html" ? "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:; frame-ancestors 'self'" : "frame-ancestors 'self'",
           ...(download ? { "Content-Disposition": `attachment; filename="${path.basename(absPath)}"` } : {}),
         });
         res.end(bytes);

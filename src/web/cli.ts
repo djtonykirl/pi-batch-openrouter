@@ -30,6 +30,7 @@ async function main(): Promise<void> {
   const srv = BatchWebServer.createStandalone(cwd);
   const url = await srv.start(port, "127.0.0.1");
   console.log(`🌐 Pi Batch OpenRouter Web UI running at ${url}`);
+  console.log(`🔑 Open (one-time sign-in link): ${srv.createLaunchUrl()}`);
   console.log(`📁 Workspace: ${cwd}`);
   console.log(`Press Ctrl+C to stop.`);
 

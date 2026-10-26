@@ -3,7 +3,8 @@
  * Served locally from 127.0.0.1 with an injected per-session CSRF token.
  */
 
-export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string }): string {
+export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string; nonce?: string }): string {
+  const nonceAttr = (opts.nonce ?? "").replace(/[^A-Za-z0-9+/=_-]/g, "");
   // JSON inside <script>: "<" is escaped so a value can never close the script element (e.g. a folder named
   // "</script>"), and U+2028/U+2029 so it stays one JavaScript string literal.
   const scriptJson = (v: unknown) =>
@@ -900,7 +901,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
   <datalist id="knownModelsList"></datalist>
   <div class="toast-container" id="toastContainer"></div>
 
-  <script>
+  <script nonce="${nonceAttr}">
     const CSRF_TOKEN = ${tokenJson};
     let WORKSPACE_ROOT = ${rootJson};
 

@@ -1017,7 +1017,11 @@ async function cmdWeb(rt: BatchRuntime, rest: string[]): Promise<void> {
   }
   const srv = rt.ensureWebServer();
   const url = await srv.start(port);
-  rt.notify(`🌐 Batch Web UI running at ${url}\n(Bound to 127.0.0.1 · use /batch web stop to close it)`, "info");
+  const launch = srv.createLaunchUrl() ?? url;
+  rt.notify(
+    `🌐 Batch Web UI running at ${url}\nOpen: ${launch}\n(One-time sign-in link; run /batch web again for a new one. Bound to 127.0.0.1 · /batch web stop to close it)`,
+    "info",
+  );
 }
 
 /** Long text: scrollable viewer in TUI, notification elsewhere (RPC). Never enters model context. */

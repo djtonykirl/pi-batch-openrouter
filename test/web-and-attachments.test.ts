@@ -237,6 +237,13 @@ test("web server: serves UI, enforces CSRF token, handles chat + attachments + j
     const baseUrl = await env.web.start(0, "127.0.0.1");
     assert.match(baseUrl, /^http:\/\/127\.0\.0\.1:\d+$/);
 
+    // 0. Sign in with the one-time launch link; every request below carries the session cookie.
+    const launchRes = await globalThis.fetch(env.web.createLaunchUrl()!, { redirect: "manual" });
+    assert.equal(launchRes.status, 303);
+    const cookie = (launchRes.headers.get("set-cookie") ?? "").split(";")[0]!;
+    const fetch = (url: string, init: RequestInit = {}) =>
+      globalThis.fetch(url, { ...init, headers: { ...((init.headers as Record<string, string> | undefined) ?? {}), Cookie: cookie } });
+
     // 1. GET / serves HTML UI with CSRF token
     const uiRes = await fetch(baseUrl + "/");
     assert.equal(uiRes.status, 200);
@@ -344,6 +351,8 @@ test("web server: serves UI, enforces CSRF token, handles chat + attachments + j
     const artContentRes = await fetch(`${baseUrl}/api/artifacts/${artifact.artifactId}/content`);
     assert.equal(artContentRes.status, 200);
     assert.match(artContentRes.headers.get("content-type") ?? "", /text\/html/);
+    // Model-generated HTML never runs with this origin's session (U-C2).
+    assert.match(artContentRes.headers.get("content-security-policy") ?? "", /^sandbox;/);
     const renderedHtml = await artContentRes.text();
     assert.match(renderedHtml, /Summary Result/);
 
