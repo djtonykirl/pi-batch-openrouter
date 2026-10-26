@@ -26,8 +26,18 @@ import type { ThreadState, TranscriptEntry, TranscriptEntryInput } from "./types
 
 /** Project instructions (the CLAUDE.md equivalent), relative to the workspace root. */
 export const PROJECT_INSTRUCTIONS_FILE = ".pi/BATCH_CHAT.md";
-/** A claim with no job after this long was left behind by a process that stopped mid-send. */
-const STALE_CLAIM_MS = 120_000;
+/** Margin on top of the submit HTTP timeout before a claim with no job ID counts as stale. */
+const STALE_CLAIM_MARGIN_MS = 60_000;
+/** Never treat a claim as stale sooner than this. */
+const MIN_STALE_CLAIM_MS = 120_000;
+/**
+ * A claim with no job ID older than this was left behind by a process that stopped mid-send, or its submit is still
+ * running. It is derived from the submit HTTP timeout so a slow (but live, and billed) submit is never expired.
+ */
+export function staleClaimMs(config: BatchConfig): number {
+  return Math.max(MIN_STALE_CLAIM_MS, config.polling.requestTimeoutSeconds * 1000 + STALE_CLAIM_MARGIN_MS);
+}
+
 /** Lock wait for updates no user is waiting on (settling, recording a job ID or a failure). */
 const BACKGROUND_LOCK_WAIT_MS = 10_000;
 
@@ -337,19 +347,69 @@ export class ChatService {
       this.recordFailure(threadId, claim, message, jobId);
       return { error: message };
     }
+    const link = this.linkClaim(threadId, "turn", claim, jobId!);
+    if (!link.linked) return { error: this.linkFailedMessage(threadId, jobId!, link.reason) };
+    return { jobId };
+  }
+
+  /**
+   * Links a submitted job to the claim that created it: only if the thread still holds that claim, or a poller tick
+   * already adopted the job for it. Never throws; a failure is logged and reported (the job is billed, so it must not
+   * look like a normal success).
+   */
+  private linkClaim(threadId: string, purpose: "turn" | "compact", claim: Pending | Compacting, jobId: string): { linked: boolean; reason: string } {
+    let reason = "the thread no longer holds the claim that submitted it";
+    let linked = false;
     try {
-      this.store.update(
+      linked = this.store.update(
         threadId,
         (t) => {
-          if (sameClaim(t.pending, claim)) t.pending!.jobId = jobId;
+          const current = purpose === "turn" ? t.pending : t.compacting;
+          if (sameClaim(current, claim)) {
+            current!.jobId = jobId;
+            return true;
+          }
+          return current?.jobId === jobId;
         },
         BACKGROUND_LOCK_WAIT_MS,
       );
     } catch (err) {
-      // The claim stays without a job ID and expires as stale; the message is safe in the transcript.
-      this.logger.log("warn", "chat_job_link_failed", { threadId, localId: jobId, error: errorMessage(err) });
+      reason = errorMessage(err);
     }
-    return { jobId };
+    if (!linked) this.logger.log("warn", "chat_job_link_failed", { threadId, localId: jobId, purpose, error: reason });
+    return { linked, reason };
+  }
+
+  private linkFailedMessage(threadId: string, jobId: string, reason: string): string {
+    return (
+      `Job ${jobId} was submitted, but it could not be linked to ${threadId} (${reason}). ` +
+      `While the thread still waits for it, a later check links it automatically. Do not resubmit before checking /batch show ${jobId}.`
+    );
+  }
+
+  /**
+   * The chat job a claim created, if there is one: same thread, purpose and `throughSeq`, created at or after the
+   * claim. A claim whose job exists must never be expired as "never submitted": that job may be live and billed.
+   */
+  private claimJob(threadId: string, purpose: "turn" | "compact", claim: Pending | Compacting): JobManifest | undefined {
+    const since = isoToEpochMs(claim.claimedAt);
+    return this.deps.batch.registry
+      .list()
+      .jobs.filter((j) => j.chat?.threadId === threadId && j.chat.purpose === purpose && j.chat.throughSeq === claim.throughSeq && isoToEpochMs(j.createdAt) >= since)
+      .sort((a, b) => isoToEpochMs(a.createdAt) - isoToEpochMs(b.createdAt))[0];
+  }
+
+  /**
+   * A stale claim with no job ID: adopts the job it created if one exists (returns the claim as linked), otherwise
+   * returns undefined and the caller expires it.
+   */
+  private adoptStale(threadId: string, purpose: "turn" | "compact", claim: Pending | Compacting): { adopted?: Pending | Compacting; found: boolean } {
+    const job = this.claimJob(threadId, purpose, claim);
+    if (!job) return { found: false };
+    const { linked } = this.linkClaim(threadId, purpose, claim, job.localId);
+    if (!linked) return { found: true };
+    this.logger.log("warn", "chat_claim_adopted", { threadId, purpose, localId: job.localId });
+    return { found: true, adopted: { ...claim, jobId: job.localId } };
   }
 
   /**
@@ -519,18 +579,8 @@ export class ChatService {
       this.recordCompactionFailure(threadId, claim, message, jobId);
       return { error: message };
     }
-    try {
-      this.store.update(
-        threadId,
-        (t) => {
-          if (sameClaim(t.compacting, claim)) t.compacting!.jobId = jobId;
-        },
-        BACKGROUND_LOCK_WAIT_MS,
-      );
-    } catch (err) {
-      // The claim stays without a job ID and expires as stale.
-      this.logger.log("warn", "chat_job_link_failed", { threadId, localId: jobId, error: errorMessage(err) });
-    }
+    const link = this.linkClaim(threadId, "compact", claim, jobId!);
+    if (!link.linked) return { error: this.linkFailedMessage(threadId, jobId!, link.reason) };
     return { jobId };
   }
 
@@ -596,7 +646,22 @@ export class ChatService {
   }
 
   private async tickThread(thread: ThreadState): Promise<void> {
-    const c = thread.compacting;
+    const staleMs = staleClaimMs(this.deps.getConfig());
+    const isStale = (claim: Pending | Compacting) => Date.now() - isoToEpochMs(claim.claimedAt) > staleMs;
+    let c = thread.compacting;
+    if (c && !c.jobId && isStale(c)) {
+      const r = this.adoptStale(thread.id, "compact", c);
+      if (r.adopted) c = r.adopted;
+      else if (!r.found) {
+        this.recordCompactionFailure(thread.id, c, "The compaction was never submitted (Pi stopped while sending it). The thread is unchanged.");
+      }
+    }
+    let p = thread.pending;
+    if (p && !p.jobId && isStale(p)) {
+      const r = this.adoptStale(thread.id, "turn", p);
+      if (r.adopted) p = r.adopted;
+      else if (!r.found) this.recordFailure(thread.id, p, "The turn was never submitted (Pi stopped while sending it). Use /batch chat retry.");
+    }
     if (c?.jobId) {
       let job: JobManifest | undefined;
       try {
@@ -605,10 +670,7 @@ export class ChatService {
         this.recordCompactionFailure(thread.id, c, `The compaction job ${c.jobId} can no longer be read (${errorMessage(err)}). The thread is unchanged.`, c.jobId);
       }
       if (job && TERMINAL_STATUSES.has(job.localStatus)) this.settleCompaction(job);
-    } else if (c && Date.now() - isoToEpochMs(c.claimedAt) > STALE_CLAIM_MS) {
-      this.recordCompactionFailure(thread.id, c, "The compaction was never submitted (Pi stopped while sending it). The thread is unchanged.");
     }
-    const p = thread.pending;
     if (p?.jobId) {
       let job: JobManifest | undefined;
       try {
@@ -617,8 +679,6 @@ export class ChatService {
         this.recordFailure(thread.id, p, `The reply job ${p.jobId} can no longer be read (${errorMessage(err)}). Use /batch chat retry.`, p.jobId);
       }
       if (job && TERMINAL_STATUSES.has(job.localStatus)) this.settle(job);
-    } else if (p && Date.now() - isoToEpochMs(p.claimedAt) > STALE_CLAIM_MS) {
-      this.recordFailure(thread.id, p, "The turn was never submitted (Pi stopped while sending it). Use /batch chat retry.");
     }
     // A reply settled here starts automatic compaction too (settle calls afterReply).
     await this.sendUnsent(thread.id);
