@@ -31,6 +31,11 @@ export class BatchPoller {
     this.schedule(0);
   }
 
+  /** True between start() and stop(). */
+  public get isRunning(): boolean {
+    return !this.stopped;
+  }
+
   public stop(): void {
     this.stopped = true;
     if (this.timer) clearTimeout(this.timer);

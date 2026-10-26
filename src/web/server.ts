@@ -34,6 +34,24 @@ export interface WebServerDeps {
   getConfig: () => BatchConfig;
   reloadConfig?: () => void;
   getKnownModels?: () => string[];
+  /**
+   * True when `poller` was created for this server (standalone, or a workspace switched to in the UI): the server
+   * starts and stops it. False for Pi's runtime poller, which the server must never stop.
+   */
+  ownsPoller?: boolean;
+}
+
+function samePath(a: string, b: string): boolean {
+  const norm = (p: string) => {
+    let r = path.resolve(p);
+    try {
+      r = fs.realpathSync.native(r);
+    } catch {
+      // compare as given
+    }
+    return process.platform === "win32" ? r.toLowerCase() : r;
+  };
+  return norm(a) === norm(b);
 }
 
 export interface WorkspaceEntryInfo {
@@ -222,7 +240,11 @@ export class BatchWebServer {
   private readonly recentWorkspaces = new Set<string>();
   private resolveApiKeyFn: (account: string) => Promise<string> = async (account: string) => resolveStandaloneApiKey(account);
 
+  /** The workspace the server was created for (Pi's session in Pi mode). */
+  private readonly initialDeps: WebServerDeps;
+
   constructor(private deps: WebServerDeps) {
+    this.initialDeps = deps;
     this.recentWorkspaces.add(toPosix(path.resolve(deps.workspaceRoot)));
   }
 
@@ -290,6 +312,7 @@ export class BatchWebServer {
         loaded = loadConfig(workspaceRoot);
       },
       getKnownModels,
+      ownsPoller: true,
     };
   }
 
@@ -326,12 +349,16 @@ export class BatchWebServer {
       this.fsWatcher.close();
       this.fsWatcher = null;
     }
-    try {
-      this.deps.poller.stop();
-    } catch {}
+    // Only a poller this server created is stopped; Pi's runtime poller (polling Pi's own jobs and chat) never is.
+    if (this.deps.ownsPoller) this.deps.poller.stop();
 
-    const prevKnownModels = this.deps.getKnownModels;
-    this.deps = BatchWebServer.buildWorkspaceDeps(realRoot, this.resolveApiKeyFn, () => this, prevKnownModels);
+    if (samePath(realRoot, this.initialDeps.workspaceRoot)) {
+      // Back to the workspace the server started with: reuse it rather than polling the same storage twice.
+      this.deps = this.initialDeps;
+    } else {
+      const prevKnownModels = this.deps.getKnownModels;
+      this.deps = BatchWebServer.buildWorkspaceDeps(realRoot, this.resolveApiKeyFn, () => this, prevKnownModels);
+    }
     const posixRoot = toPosix(realRoot);
     this.recentWorkspaces.add(posixRoot);
 
@@ -343,7 +370,7 @@ export class BatchWebServer {
     } catch {
       // fs.watch is optional
     }
-    this.deps.poller.start();
+    if (this.deps.ownsPoller && this.isRunning) this.deps.poller.start();
     this.broadcast({ type: "workspace_changed", workspaceRoot: posixRoot });
     return posixRoot;
   }
@@ -387,6 +414,11 @@ export class BatchWebServer {
     return this.server !== null && this.portNumber !== null;
   }
 
+  /** The poller for the workspace currently shown. */
+  public get activePoller(): BatchPoller {
+    return this.deps.poller;
+  }
+
   public async start(port = 0, host = "127.0.0.1"): Promise<string> {
     if (this.server && this.portNumber) return this.url!;
     const srv = http.createServer((req, res) => {
@@ -403,6 +435,8 @@ export class BatchWebServer {
     this.portNumber = typeof addr === "object" && addr ? addr.port : port;
     this.boundHost = host;
     this.server = srv;
+    // Standalone (or a switched-to workspace): nothing else polls this storage, so replies would never land.
+    if (this.deps.ownsPoller) this.deps.poller.start();
 
     try {
       this.deps.service.registry.ensureRoot();
@@ -416,6 +450,7 @@ export class BatchWebServer {
   }
 
   public async stop(): Promise<void> {
+    if (this.deps.ownsPoller) this.deps.poller.stop();
     if (this.fsWatcher) {
       this.fsWatcher.close();
       this.fsWatcher = null;

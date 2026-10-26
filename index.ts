@@ -40,10 +40,17 @@ export default function (pi: ExtensionAPI): void {
     // Rebind storage + config to this session's project, then recover/reconcile
     // any jobs left from previous runs (restart-safe; runs on timers, non-blocking).
     rt.poller.stop();
+    const webStopped = rt.stopWebServerForSessionChange();
     rt.bind(ctx);
     rt.startChatSession();
     rt.poller.start();
     rt.poller.updateBadge();
+    void webStopped.then(
+      (stopped) => {
+        if (stopped) rt.notify("Batch Web UI stopped because the Pi session changed. Run /batch web to open it for this session.", "info");
+      },
+      () => {},
+    );
   });
 
   pi.on("session_shutdown", () => {

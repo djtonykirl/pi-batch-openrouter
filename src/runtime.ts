@@ -178,6 +178,16 @@ export class BatchRuntime {
     return this.webServer;
   }
 
+  /**
+   * A running web server holds the previous session's service, chat and storage; on a new session it is stopped
+   * rather than left serving stale state. Returns true when one was stopped (the caller tells the user).
+   */
+  public async stopWebServerForSessionChange(): Promise<boolean> {
+    if (!this.webServer) return false;
+    await this.stopWebServer();
+    return true;
+  }
+
   public async stopWebServer(): Promise<void> {
     if (!this.webServer) return;
     const srv = this.webServer;
