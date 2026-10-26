@@ -27,6 +27,8 @@ export const CHAT_HELP = `/batch chat — chat with a model at batch prices (rep
   chat export [file] [--overwrite]
                             write the transcript as Markdown (workspace-relative file), or show it
   chat off                  leave chat mode; typing goes to the live model again
+  chat send [--file <path>] [--context <dir>] "<message>"
+                            send a message with attached workspace files or context directories
   chat retry                resubmit the last turn if it failed
   chat help                 this list
 
@@ -75,6 +77,9 @@ export function exportMarkdown(thread: ThreadState, entries: TranscriptEntry[]):
     switch (e.type) {
       case "user":
         out.push("### You", "", e.text);
+        if (e.attachments?.length) {
+          out.push("", `_Attachments: ${e.attachments.map((a) => `${a.path ?? a.name} (${a.bytes} B, sha256:${a.sha256.slice(0, 8)})`).join(", ")}_`);
+        }
         break;
       case "assistant":
         out.push(`### ${e.model}`, "", e.text);
@@ -242,6 +247,21 @@ export async function cmdChat(rt: BatchRuntime, rest: string[], ctx: ExtensionCo
       if (!isInside(root, abs)) throw new Error(`Refusing to write outside the workspace: ${file}`);
       writeFileAtomicExclusive(abs, md, parsed.booleans.has("overwrite"));
       rt.notify(`Exported ${id} to ${abs}`, "info");
+      return;
+    }
+    case "send": {
+      const id = activeThread(rt);
+      const parsed = parseArgs(args, { repeatable: ["file", "context"] });
+      if (parsed.errors.length) throw new Error(`/batch chat send: ${parsed.errors.join("; ")}`);
+      const text = parsed.positionals.join(" ").trim();
+      const files = parsed.lists.file ?? [];
+      const contexts = parsed.lists.context ?? [];
+      if (!text && files.length === 0 && contexts.length === 0) {
+        throw new Error('Usage: /batch chat send [--file <path>] [--context <dir>] "<message>"');
+      }
+      await rt.requireChat().send(id, text, { files, contexts });
+      rt.poller.updateBadge();
+      rt.requireChatSession().sync();
       return;
     }
     case "retry": {

@@ -41,8 +41,10 @@ function maxAssistantSeq(entries: TranscriptEntry[]): number {
 function toDisplay(thread: ThreadState, e: TranscriptEntry): ChatEntryData {
   const base = { threadId: thread.id, seq: e.seq, title: thread.title };
   switch (e.type) {
-    case "user":
-      return { ...base, role: "user", text: e.text };
+    case "user": {
+      const badge = e.attachments?.length ? `\n📎 ${e.attachments.map((a) => a.path ?? a.name).join(", ")}` : "";
+      return { ...base, role: "user", text: `${e.text}${badge}`.trim() };
+    }
     case "assistant":
       return { ...base, role: "assistant", text: e.text, model: e.model, ...(e.finishReason === "length" ? { truncated: true } : {}) };
     case "model":

@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { prepareAttachments, type ChatAttachmentMeta, type UploadedFileInput } from "./attachments.js";
 import type { BatchConfig } from "./config.js";
 import { buildContextPackage, SYSTEM_PROMPT, type ContextPackage, type PackageInput } from "./context/package.js";
 import { formatSecretFindings, scanForSecrets } from "./context/secrets.js";
@@ -10,7 +11,7 @@ import { nullLogger, type Logger } from "./logger.js";
 import { normalizeBatchModelSlug } from "./models.js";
 import { OpenRouterBatchClient, OpenRouterError, type RawExchange } from "./openrouter/client.js";
 import { normaliseBatchResult, type NormalisedBatchResult } from "./openrouter/normalise-result.js";
-import { buildSubmitBody, submitBodyProblems, type BatchRequestItem, type ChatMessage, type ProviderPin, type SubmitBody } from "./openrouter/types.js";
+import { buildSubmitBody, messageText, submitBodyProblems, type BatchRequestItem, type ChatMessage, type ProviderPin, type SubmitBody } from "./openrouter/types.js";
 import { compileOutputSchema, type OutputValidator } from "./workflows/structured.js";
 import { findWorkflow, formatDiagnostics, type WorkflowDefinition, type WorkflowEntry } from "./workflows/definition.js";
 import { planDatasetRun, type DatasetPlan, type EffectiveLimits } from "./workflows/dataset-run.js";
@@ -50,6 +51,7 @@ export interface AskOptions {
   objective: string;
   files: string[];
   contexts: string[];
+  uploads?: UploadedFileInput[];
   model?: string;
   account?: string;
   /** Upstream provider slug to pin via `provider.only` (with allow_fallbacks: false). */
@@ -64,6 +66,7 @@ export interface PreparedAsk {
   account: string;
   pin?: ProviderPin;
   pkg: ContextPackage;
+  uploads?: ChatAttachmentMeta[];
   messages: ChatMessage[];
   contentSha256: string;
   /** Reasons the request must not be submitted (empty = OK). */
@@ -324,6 +327,7 @@ export class BatchService {
     const model = normalizeBatchModelSlug(options.model ?? config.defaultModel);
     const account = options.account ?? config.defaultAccount;
     const pin: ProviderPin | undefined = options.providerPin ? { only: [options.providerPin], allow_fallbacks: false } : undefined;
+    const knownSecrets = await this.knownSecrets(account);
     const pkg = buildContextPackage({
       workspaceRoot: this.deps.workspaceRoot,
       objective,
@@ -332,18 +336,45 @@ export class BatchService {
       includeInstructions: options.includeInstructions,
       format: options.format,
       config,
-      knownSecrets: await this.knownSecrets(account),
+      knownSecrets,
       gitIgnored: this.deps.gitIgnored,
     });
-    const messages = withSystemPrompt(options.includeInstructions, pkg.contextText);
 
     const blockers: string[] = [];
     if (!objective) blockers.push("objective is empty");
     for (const p of pkg.problems) blockers.push(p.message);
     if (pkg.secretFindings.length > 0 && config.security.blockOnSecret) blockers.push(formatSecretFindings(pkg.secretFindings));
 
+    let uploadsMeta: ChatAttachmentMeta[] | undefined;
+    let userText = pkg.contextText;
+    let userParts: ChatMessage["parts"];
+    if (options.uploads && options.uploads.length > 0) {
+      const up = await prepareAttachments({
+        workspaceRoot: this.deps.workspaceRoot,
+        config,
+        knownSecrets,
+        input: { uploads: options.uploads },
+      });
+      uploadsMeta = up.attachments;
+      pkg.warnings.push(...up.warnings);
+      pkg.secretFindings.push(...up.secretFindings);
+      blockers.push(...up.blockers);
+      if (up.inlinedText) {
+        userText = `${userText.trimEnd()}\n\n${up.inlinedText}\n`;
+        pkg.contextText = userText;
+        pkg.characters = userText.length;
+      }
+      if (up.parts.length > 0) userParts = up.parts;
+    }
+
+    const messages = withSystemPrompt(options.includeInstructions, userText);
+    if (userParts && userParts.length > 0) {
+      const last = messages[messages.length - 1];
+      if (last && last.role === "user") last.parts = userParts;
+    }
+
     const contentSha256 = contentHash(buildSubmitBody({ model, provider: pin, requests: [{ custom_id: "{custom_id}", body: this.requestBody(messages) }] }));
-    return { options, model, account, pin, pkg, messages, contentSha256, blockers };
+    return { options, model, account, pin, pkg, ...(uploadsMeta ? { uploads: uploadsMeta } : {}), messages, contentSha256, blockers };
   }
 
   public findActiveDuplicate(contentSha256: string, excludeId?: string): JobManifest | undefined {
@@ -1521,7 +1552,7 @@ export class BatchService {
     }
 
     const model = opts.model ? normalizeBatchModelSlug(opts.model) : srcBody.model;
-    const promptOf = (body: BatchRequestItem["body"]) => body.messages.filter((m) => m.role === "user").map((m) => m.content).join("\n\n");
+    const promptOf = (body: BatchRequestItem["body"]) => body.messages.filter((m) => m.role === "user").map((m) => messageText(m)).join("\n\n");
     const child = this.persistJob({
       kind: source.kind ?? "goal",
       objective: source.objective,

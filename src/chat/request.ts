@@ -67,6 +67,11 @@ export function conversationOrder(entries: TranscriptEntry[]): TranscriptEntry[]
   return keyed.sort((a, b) => a.key - b.key || rank(a) - rank(b) || a.i - b.i).map((x) => x.e);
 }
 
+function userTurnText(e: Extract<TranscriptEntry, { type: "user" }>): string {
+  if (!e.inlinedText) return e.text;
+  return e.text ? `${e.text}\n\n${e.inlinedText}` : e.inlinedText;
+}
+
 export function buildTurnMessages(
   thread: ThreadState,
   entries: TranscriptEntry[],
@@ -76,8 +81,23 @@ export function buildTurnMessages(
   const messages: ChatMessage[] = [{ role: "system", content: systemContent(thread, prompt) }];
   for (const e of turnsBetween(thread, entries, throughSeq)) {
     const last = messages[messages.length - 1];
-    if (e.type === "user" && last?.role === "user") last.content += `\n\n${e.text}`;
-    else messages.push({ role: e.type, content: e.text });
+    if (e.type === "user") {
+      const text = userTurnText(e);
+      if (last?.role === "user") {
+        last.content += `\n\n${text}`;
+        if (e.parts && e.parts.length > 0) {
+          last.parts = [...(last.parts ?? []), ...e.parts];
+        }
+      } else {
+        messages.push({
+          role: "user",
+          content: text,
+          ...(e.parts && e.parts.length > 0 ? { parts: [...e.parts] } : {}),
+        });
+      }
+    } else {
+      messages.push({ role: e.type, content: e.text });
+    }
   }
   return messages;
 }
@@ -106,7 +126,11 @@ export function compactionBoundary(
 
 function plainTranscript(turns: Turn[]): string {
   return turns
-    .map((e) => (e.type === "user" ? `User: ${e.text}` : `Assistant (${e.model}): ${e.text}`))
+    .map((e) => {
+      if (e.type !== "user") return `Assistant (${e.model}): ${e.text}`;
+      const body = userTurnText(e);
+      return `User: ${body}`;
+    })
     .join("\n\n");
 }
 

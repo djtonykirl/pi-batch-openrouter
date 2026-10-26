@@ -1,4 +1,5 @@
-import type { ProviderPin } from "../openrouter/types.js";
+import type { ChatAttachmentMeta } from "../attachments.js";
+import type { ChatContentPart, ProviderPin } from "../openrouter/types.js";
 
 export interface ThreadState {
   schemaVersion: 1;
@@ -19,7 +20,7 @@ export interface ThreadState {
 }
 
 export type TranscriptEntry = { seq: number; at: string } & (
-  | { type: "user"; text: string }
+  | { type: "user"; text: string; attachments?: ChatAttachmentMeta[]; inlinedText?: string; parts?: ChatContentPart[] }
   /** `throughSeq`: the last user seq the reply answers (messages typed while it was pending have lower seqs). */
   | { type: "assistant"; text: string; model: string; jobId: string; finishReason?: string; throughSeq?: number }
   | { type: "model"; from: string; to: string }

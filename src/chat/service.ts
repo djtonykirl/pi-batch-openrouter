@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { prepareAttachments, type AttachmentRequestInput, type PreparedAttachments } from "../attachments.js";
 import type { BatchConfig } from "../config.js";
 import { formatSecretFindings, scanForSecrets } from "../context/secrets.js";
 import { isUsable, itemText, jobItems } from "../items.js";
@@ -107,19 +108,53 @@ export class ChatService {
     return this.store.list()[0];
   }
 
+  public async prepareSend(threadId: string, text: string, attachments?: AttachmentRequestInput): Promise<PreparedAttachments> {
+    const thread = this.store.read(threadId);
+    const config = this.deps.getConfig();
+    const knownSecrets = await this.deps.batch.knownSecrets(thread.account);
+    const prep = await prepareAttachments({
+      workspaceRoot: this.deps.workspaceRoot,
+      config,
+      knownSecrets,
+      input: attachments,
+    });
+    if (config.security.scanSecrets && text.trim()) {
+      const msgFindings = scanForSecrets(text, "<chat message>", knownSecrets);
+      if (msgFindings.length > 0) {
+        prep.secretFindings.push(...msgFindings);
+        if (config.security.blockOnSecret) prep.blockers.push(formatSecretFindings(msgFindings));
+      }
+    }
+    return prep;
+  }
+
   /**
    * Scans, then appends the message. If the thread is idle, submits it (with any earlier unsent messages) as a turn;
    * otherwise it stays queued. A secret refuses the message before anything is written (ChatBlockedError), and a
    * held thread lock propagates as ThreadBusyError with nothing written.
    */
-  public async send(threadId: string, text: string): Promise<{ queued: boolean; jobId?: string }> {
-    if (text.trim() === "") return { queued: true };
+  public async send(threadId: string, text: string, attachments?: AttachmentRequestInput): Promise<{ queued: boolean; jobId?: string }> {
+    const hasAtt = Boolean((attachments?.files?.length ?? 0) + (attachments?.contexts?.length ?? 0) + (attachments?.uploads?.length ?? 0));
+    if (text.trim() === "" && !hasAtt) return { queued: true };
     const thread = this.store.read(threadId);
     const prompt = await this.checkedPrompt(thread.account, text);
+    const prep = hasAtt ? await this.prepareSend(threadId, "", attachments) : undefined;
+    if (prep && prep.blockers.length > 0) {
+      throw new ChatBlockedError(`${prep.blockers.join("\n\n")}\n\nYour message was not saved.`);
+    }
     const claim = this.store.update(threadId, (t, append) => {
       const entries = this.store.transcript(threadId).entries;
-      const entry = append({ type: "user", text });
-      if (t.title === "(untitled)") t.title = provisionalTitle(text);
+      const entry = append({
+        type: "user",
+        text,
+        ...(prep && prep.attachments.length > 0 ? { attachments: prep.attachments } : {}),
+        ...(prep && prep.inlinedText ? { inlinedText: prep.inlinedText } : {}),
+        ...(prep && prep.parts.length > 0 ? { parts: prep.parts } : {}),
+      });
+      if (t.title === "(untitled)") {
+        const titleSource = text.trim() || prep?.attachments.map((a) => a.name).join(", ") || "(attachment)";
+        t.title = provisionalTitle(titleSource);
+      }
       return this.claim(t, [...entries, entry]);
     });
     if (!claim) return { queued: true };
