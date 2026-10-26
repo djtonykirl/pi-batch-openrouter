@@ -10,11 +10,27 @@ const TITLE_MAX = 60;
 
 type Turn = Extract<TranscriptEntry, { type: "user" | "assistant" }>;
 
+/**
+ * Index just past the entry at `seq` in `entries` (conversation order): the entry with that seq if there is one,
+ * otherwise the last entry with a lower seq. Bounds are positions, not seq ranges: a message queued while a reply
+ * was pending has a lower seq than the reply but follows it in the conversation.
+ */
+function endOf(entries: TranscriptEntry[], seq: number): number {
+  const exact = entries.findIndex((e) => e.seq === seq);
+  if (exact >= 0) return exact + 1;
+  let end = 0;
+  entries.forEach((e, i) => {
+    if (e.seq <= seq) end = i + 1;
+  });
+  return end;
+}
+
+/** The user and assistant entries after the summary's position, up to and including the entry at `throughSeq`. */
 function turnsBetween(thread: ThreadState, entries: TranscriptEntry[], throughSeq: number): Turn[] {
-  const from = thread.summary?.throughSeq ?? 0;
-  return entries.filter(
-    (e): e is Turn => (e.type === "user" || e.type === "assistant") && e.seq > from && e.seq <= throughSeq,
-  );
+  const from = thread.summary ? endOf(entries, thread.summary.throughSeq) : 0;
+  return entries
+    .slice(from, endOf(entries, throughSeq))
+    .filter((e): e is Turn => e.type === "user" || e.type === "assistant");
 }
 
 function systemContent(thread: ThreadState, prompt: ChatPrompt): string {
@@ -26,25 +42,29 @@ function systemContent(thread: ThreadState, prompt: ChatPrompt): string {
 
 /**
  * Messages typed while a reply is pending are appended before that reply lands, so the transcript holds them ahead
- * of it. In the conversation they follow it. Returns the entries in conversation order; a reply that has queued
- * messages ahead of it gets `seq = throughSeq` (the last user seq it answers), so the `seq` filters on `throughSeq`
- * and `summary.throughSeq` keep working. Without queued messages the entries are returned unchanged.
- * Pass the result to the builders in this module.
+ * of it. In the conversation they follow it. Returns the entries in conversation order (each such reply directly
+ * after the last user entry it answers, its `throughSeq`), with their seqs unchanged. Every builder in this module
+ * expects this order and reads a seq bound (a turn's `throughSeq`, `summary.throughSeq`, a compaction boundary) as
+ * a position in it. Without queued messages the entries are returned unchanged.
  */
 export function conversationOrder(entries: TranscriptEntry[]): TranscriptEntry[] {
   const userSeqs = entries.filter((e) => e.type === "user").map((e) => e.seq);
   let moved = false;
-  const out = entries.map((e) => {
-    if (e.type !== "assistant" || e.throughSeq === undefined) return e;
-    const through = e.throughSeq;
-    if (!userSeqs.some((s) => s > through && s < e.seq)) return e;
-    moved = true;
-    return { ...e, seq: through };
+  const keyed = entries.map((e, i) => {
+    let key = e.seq;
+    if (e.type === "assistant" && e.throughSeq !== undefined) {
+      const through = e.throughSeq;
+      if (userSeqs.some((s) => s > through && s < e.seq)) {
+        key = through;
+        moved = true;
+      }
+    }
+    return { e, i, key };
   });
   if (!moved) return entries;
-  // Stable: a reply sorts directly after the user entry whose seq it now shares.
-  const rank = (e: TranscriptEntry) => (e.type === "assistant" ? 1 : 0);
-  return out.map((e, i) => ({ e, i })).sort((a, b) => a.e.seq - b.e.seq || rank(a.e) - rank(b.e) || a.i - b.i).map((x) => x.e);
+  // Stable: a moved reply sorts directly after the user entry it answers (whose seq is its key).
+  const rank = (x: { e: TranscriptEntry; key: number }) => (x.key !== x.e.seq ? 1 : 0);
+  return keyed.sort((a, b) => a.key - b.key || rank(a) - rank(b) || a.i - b.i).map((x) => x.e);
 }
 
 export function buildTurnMessages(
@@ -62,6 +82,10 @@ export function buildTurnMessages(
   return messages;
 }
 
+/**
+ * The seq of the reply that ends the last exchange before the `keepRecentExchanges` most recent ones (after the
+ * current summary): a compaction covers everything up to and including it. Undefined when there is nothing to compact.
+ */
 export function compactionBoundary(
   thread: ThreadState,
   entries: TranscriptEntry[],

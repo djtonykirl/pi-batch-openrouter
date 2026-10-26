@@ -10,9 +10,11 @@ import { TERMINAL_STATUSES } from "../state.js";
 import { isoToEpochMs, nowIso } from "../time.js";
 import type { JobManifest } from "../types.js";
 import {
+  buildCompactionMessages,
   buildTitleMessages,
   buildTurnMessages,
   cleanTitle,
+  compactionBoundary,
   conversationOrder,
   estimateTokens,
   provisionalTitle,
@@ -45,6 +47,7 @@ export interface ChatServiceDeps {
 }
 
 type Pending = NonNullable<ThreadState["pending"]>;
+type Compacting = NonNullable<ThreadState["compacting"]>;
 type Append = (e: TranscriptEntryInput) => TranscriptEntry;
 
 /** The last user seq a reply has answered (0 if none). */
@@ -63,8 +66,16 @@ function unsentUserSeqs(entries: TranscriptEntry[]): number[] {
   return entries.filter((e) => e.type === "user" && e.seq > through).map((e) => e.seq);
 }
 
-function sameClaim(p: Pending | undefined, claim: Pending): boolean {
+function sameClaim(p: Pending | Compacting | undefined, claim: Pending | Compacting): boolean {
   return p !== undefined && p.throughSeq === claim.throughSeq && p.claimedAt === claim.claimedAt && p.jobId === claim.jobId;
+}
+
+/** Under the lock: adopts a title a job generated, unless the user set the title by hand. */
+function applyAutoTitle(t: ThreadState, append: Append, title: string | undefined): void {
+  if (!title || t.titleLocked) return;
+  t.title = title;
+  t.retitled = true;
+  append({ type: "title", title, source: "auto" });
 }
 
 function errorMessage(err: unknown): string {
@@ -157,6 +168,19 @@ export class ChatService {
     return r.jobId;
   }
 
+  /**
+   * Starts a compaction job: everything before the `keepRecentExchanges` most recent exchanges (after the current
+   * summary) is summarised, on top of that summary. `instructions` steer the focus. Returns the job ID. Sending is
+   * unaffected while it runs; the summary takes effect from the next request after it lands.
+   */
+  public async compact(threadId: string, instructions?: string): Promise<string> {
+    const focus = instructions?.trim() || undefined;
+    if (focus !== undefined) await this.scanInstructions(this.store.read(threadId).account, focus);
+    const r = await this.startCompaction(threadId, focus);
+    if (!r.jobId) throw new Error(r.error);
+    return r.jobId;
+  }
+
   /** Changes the model from the next turn on. A reply already pending keeps the model it was sent with. */
   public setModel(threadId: string, slug: string): void {
     const to = normalizeBatchModelSlug(slug.trim());
@@ -230,6 +254,18 @@ export class ChatService {
       }
     }
     return this.basePrompt(instructions);
+  }
+
+  /** Secret scan for compaction instructions (they are sent and stored like a message). */
+  private async scanInstructions(account: string, text: string): Promise<void> {
+    const { security } = this.deps.getConfig();
+    if (!security.scanSecrets) return;
+    const findings = scanForSecrets(text, "<compaction instructions>", await this.deps.batch.knownSecrets(account));
+    if (findings.length === 0) return;
+    if (security.blockOnSecret) {
+      throw new ChatBlockedError(`${formatSecretFindings(findings)}\n\nNothing was compacted. Remove the secret from the instructions and try again.`);
+    }
+    this.logger.log("warn", "chat_secret_not_blocked", { findings: findings.length });
   }
 
   /** Under the lock: claims the thread for a turn covering every unsent message, if it is idle. */
@@ -309,17 +345,24 @@ export class ChatService {
     append({ type: "failure", purpose: "turn", ...(jobId ? { jobId } : {}), message });
   }
 
-  /** What a settled turn job produced. Reads only the job's own (immutable once terminal) files. */
-  private turnOutcome(job: JobManifest): { reply?: { text: string; finishReason?: string }; title?: string; error: string } {
+  /**
+   * What a settled chat job produced: item 1 (the reply or the summary) and the optional title item. Reads only the
+   * job's own (immutable once terminal) files.
+   */
+  private jobOutcome(job: JobManifest): { reply?: { text: string; finishReason?: string }; title?: string; error: string } {
+    const compact = job.chat?.purpose === "compact";
+    const what = compact ? "summary" : "reply";
+    const next = compact ? "The thread is unchanged." : "Use /batch chat retry.";
     if (job.localStatus !== "ready" && job.localStatus !== "partial") {
-      return { error: `The reply job ${job.localId} ended ${job.localStatus}${job.error ? `: ${job.error.message}` : ""}. Use /batch chat retry.` };
+      return { error: `The ${what} job ${job.localId} ended ${job.localStatus}${job.error ? `: ${job.error.message}` : ""}. ${next}` };
     }
     const registry = this.deps.batch.registry;
     const items = jobItems(registry, job);
     const replyItem = items.find((i) => i.ordinal === 1);
     const text = replyItem && isUsable(replyItem) ? itemText(registry, job, replyItem)?.trimEnd() : undefined;
-    if (!replyItem || text === undefined) {
-      return { error: `The reply in job ${job.localId} failed${replyItem?.error ? `: ${replyItem.error.message}` : ""}. Use /batch chat retry.` };
+    // An empty summary would silently drop the conversation it replaces.
+    if (!replyItem || text === undefined || (compact && text.trim() === "")) {
+      return { error: `The ${what} in job ${job.localId} failed${replyItem?.error ? `: ${replyItem.error.message}` : ""}. ${next}` };
     }
     let title: string | undefined;
     if (job.chat?.titleItem) {
@@ -335,12 +378,15 @@ export class ChatService {
   private settle(job: JobManifest): boolean {
     const chat = job.chat;
     if (!chat || !TERMINAL_STATUSES.has(job.localStatus)) return false;
-    if (chat.purpose !== "turn") return false; // compaction jobs: Task 6
+    if (chat.purpose === "compact") {
+      this.settleCompaction(job);
+      return false;
+    }
     const threadId = chat.threadId;
     try {
       // Cheap pre-check; the decision is re-made under the lock.
       if (this.store.read(threadId).pending?.jobId !== job.localId) return false;
-      const outcome = this.turnOutcome(job);
+      const outcome = this.jobOutcome(job);
       const replied = this.store.update(
         threadId,
         (t, append) => {
@@ -358,11 +404,7 @@ export class ChatService {
             throughSeq: t.pending.throughSeq,
           });
           delete t.pending;
-          if (outcome.title && !t.titleLocked) {
-            t.title = outcome.title;
-            t.retitled = true;
-            append({ type: "title", title: outcome.title, source: "auto" });
-          }
+          applyAutoTitle(t, append, outcome.title);
           return true;
         },
         BACKGROUND_LOCK_WAIT_MS,
@@ -377,10 +419,160 @@ export class ChatService {
     }
   }
 
-  /** Hook after a reply is appended. Task 6 fills this in (automatic compaction). */
-  private afterReply(_threadId: string): void {}
+  /**
+   * Automatic compaction, after a reply is appended: starts one in the background when the next request is over
+   * `chat.autoCompactTokens` and there is something to compact. A failed compaction is not retried until the next
+   * reply. Never throws and never delays the send of queued messages.
+   */
+  private afterReply(threadId: string): void {
+    const { chat } = this.deps.getConfig();
+    if (!chat.autoCompact) return;
+    try {
+      const thread = this.store.read(threadId);
+      if (thread.compacting) return;
+      if (this.nextRequestEstimate(threadId).tokens <= chat.autoCompactTokens) return;
+      const entries = conversationOrder(this.store.transcript(threadId).entries);
+      if (compactionBoundary(thread, entries, chat.keepRecentExchanges) === undefined) return;
+    } catch (err) {
+      this.logger.log("warn", "chat_auto_compact_failed", { threadId, error: errorMessage(err) });
+      return;
+    }
+    void this.startCompaction(threadId, undefined, BACKGROUND_LOCK_WAIT_MS).then(
+      (r) => this.logger.log(r.jobId ? "info" : "warn", r.jobId ? "chat_auto_compact_started" : "chat_auto_compact_failed", { threadId, localId: r.jobId }),
+      (err: unknown) => this.logger.log("warn", "chat_auto_compact_failed", { threadId, error: errorMessage(err) }),
+    );
+  }
+
+  /**
+   * Claims the thread for a compaction through the current boundary, then submits it. Throws "Already compacting" or
+   * "Nothing to compact yet" (or a lock error) before anything is claimed; after the claim it never throws.
+   */
+  private async startCompaction(threadId: string, instructions: string | undefined, lockWaitMs?: number): Promise<{ jobId?: string; error?: string }> {
+    const keep = this.deps.getConfig().chat.keepRecentExchanges;
+    const claim = this.store.update(
+      threadId,
+      (t) => {
+        if (t.compacting) throw new Error(`Already compacting ${threadId}. The summary is applied when that job lands.`);
+        const boundary = compactionBoundary(t, conversationOrder(this.store.transcript(threadId).entries), keep);
+        if (boundary === undefined) {
+          throw new Error(`Nothing to compact yet in ${threadId}: the ${keep} most recent exchanges are always sent in full.`);
+        }
+        t.compacting = { throughSeq: boundary, claimedAt: nowIso(), ...(instructions ? { instructions } : {}) };
+        return { ...t.compacting };
+      },
+      lockWaitMs,
+    );
+    let jobId: string | undefined;
+    try {
+      const thread = this.store.read(threadId);
+      const entries = conversationOrder(this.store.transcript(threadId).entries);
+      const prompt: ChatPrompt = { systemPrompt: this.deps.getConfig().chat.systemPrompt };
+      const job = await this.deps.batch.createChatJob({
+        threadId,
+        purpose: "compact",
+        throughSeq: claim.throughSeq,
+        model: thread.model,
+        account: thread.account,
+        ...(thread.providerPin ? { pin: thread.providerPin } : {}),
+        main: buildCompactionMessages(thread, entries, claim.throughSeq, prompt, claim.instructions),
+        ...(!thread.titleLocked ? { title: buildTitleMessages(thread, entries, Number.MAX_SAFE_INTEGER) } : {}),
+      });
+      jobId = job.localId;
+      if (job.localStatus === "failed") throw new Error(job.error?.message ?? "the provider rejected the batch");
+    } catch (err) {
+      const message = `The compaction could not be submitted${jobId ? ` (job ${jobId})` : ""}: ${errorMessage(err)}. The thread is unchanged.`;
+      this.recordCompactionFailure(threadId, claim, message, jobId);
+      return { error: message };
+    }
+    try {
+      this.store.update(
+        threadId,
+        (t) => {
+          if (sameClaim(t.compacting, claim)) t.compacting!.jobId = jobId;
+        },
+        BACKGROUND_LOCK_WAIT_MS,
+      );
+    } catch (err) {
+      // The claim stays without a job ID and expires as stale.
+      this.logger.log("warn", "chat_job_link_failed", { threadId, localId: jobId, error: errorMessage(err) });
+    }
+    return { jobId };
+  }
+
+  /**
+   * Records a failed compaction: clears the claim (only if it is still `claim`) and appends a failure entry. The
+   * summary and `lastFailure` are untouched, so sending carries on as before. Never throws.
+   */
+  private recordCompactionFailure(threadId: string, claim: Compacting, message: string, jobId?: string): void {
+    try {
+      const recorded = this.store.update(
+        threadId,
+        (t, append) => {
+          if (!sameClaim(t.compacting, claim)) return false;
+          delete t.compacting;
+          append({ type: "failure", purpose: "compact", ...(jobId ? { jobId } : {}), message });
+          return true;
+        },
+        BACKGROUND_LOCK_WAIT_MS,
+      );
+      if (recorded) this.logger.log("warn", "chat_compaction_failed", { threadId, localId: jobId });
+    } catch (err) {
+      this.logger.log("error", "chat_record_failure_failed", { threadId, localId: jobId, error: errorMessage(err) });
+    }
+  }
+
+  /**
+   * Applies a terminal compaction job. The summary is adopted only if it covers more than the current one; a
+   * compaction entry is appended either way. A failed job leaves the summary as it was. Never throws.
+   */
+  private settleCompaction(job: JobManifest): void {
+    const chat = job.chat!;
+    const threadId = chat.threadId;
+    try {
+      if (this.store.read(threadId).compacting?.jobId !== job.localId) return;
+      const outcome = this.jobOutcome(job);
+      const adopted = this.store.update(
+        threadId,
+        (t, append) => {
+          if (t.compacting?.jobId !== job.localId) return undefined;
+          const { instructions } = t.compacting;
+          delete t.compacting;
+          if (!outcome.reply) {
+            append({ type: "failure", purpose: "compact", jobId: job.localId, message: outcome.error });
+            return false;
+          }
+          const text = outcome.reply.text;
+          const adopt = !t.summary || t.summary.throughSeq < chat.throughSeq;
+          if (adopt) t.summary = { text, throughSeq: chat.throughSeq, jobId: job.localId };
+          append({ type: "compaction", summary: text, throughSeq: chat.throughSeq, jobId: job.localId, model: job.model, ...(instructions ? { instructions } : {}) });
+          applyAutoTitle(t, append, outcome.title);
+          return adopt;
+        },
+        BACKGROUND_LOCK_WAIT_MS,
+      );
+      if (adopted !== undefined) {
+        const event = !outcome.reply ? "chat_compaction_failed" : adopted ? "chat_summary_adopted" : "chat_summary_stale";
+        this.logger.log(outcome.reply ? "info" : "warn", event, { threadId, localId: job.localId });
+      }
+    } catch (err) {
+      // Left compacting; the next tick retries.
+      this.logger.log("warn", "chat_settle_failed", { threadId, localId: job.localId, error: errorMessage(err) });
+    }
+  }
 
   private async tickThread(thread: ThreadState): Promise<void> {
+    const c = thread.compacting;
+    if (c?.jobId) {
+      let job: JobManifest | undefined;
+      try {
+        job = this.deps.batch.registry.read(c.jobId);
+      } catch (err) {
+        this.recordCompactionFailure(thread.id, c, `The compaction job ${c.jobId} can no longer be read (${errorMessage(err)}). The thread is unchanged.`, c.jobId);
+      }
+      if (job && TERMINAL_STATUSES.has(job.localStatus)) this.settleCompaction(job);
+    } else if (c && Date.now() - isoToEpochMs(c.claimedAt) > STALE_CLAIM_MS) {
+      this.recordCompactionFailure(thread.id, c, "The compaction was never submitted (Pi stopped while sending it). The thread is unchanged.");
+    }
     const p = thread.pending;
     if (p?.jobId) {
       let job: JobManifest | undefined;
@@ -393,8 +585,8 @@ export class ChatService {
     } else if (p && Date.now() - isoToEpochMs(p.claimedAt) > STALE_CLAIM_MS) {
       this.recordFailure(thread.id, p, "The turn was never submitted (Pi stopped while sending it). Use /batch chat retry.");
     }
+    // A reply settled here starts automatic compaction too (settle calls afterReply).
     await this.sendUnsent(thread.id);
-    // Task 6: automatic compaction runs here too.
   }
 
   /** Sends unsent messages as one turn if the thread is idle (no pending turn, no failure). Returns the job ID. */

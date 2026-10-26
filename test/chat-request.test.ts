@@ -133,9 +133,30 @@ describe("conversationOrder", () => {
   it("moves messages queued while a reply was pending after that reply", () => {
     // A(1) sent; B(2), C(3) typed while pending; reply(4) to A; reply(5) to B+C.
     const ordered = conversationOrder([u(1, "A"), u(2, "B"), u(3, "C"), ra(4, 1), ra(5, 3)]);
-    assert.deepEqual(ordered.map((e) => [e.type, e.seq]), [["user", 1], ["assistant", 1], ["user", 2], ["user", 3], ["assistant", 5]]);
+    assert.deepEqual(ordered.map((e) => [e.type, e.seq]), [["user", 1], ["assistant", 4], ["user", 2], ["user", 3], ["assistant", 5]]);
     const m = buildTurnMessages(thread(), ordered, 3, prompt);
     assert.deepEqual(m.slice(1).map((x) => x.content), ["A", "a4", "B\n\nC"]);
+  });
+  it("a summary through a reply covers its position, not a seq range", () => {
+    // A(1) sent; B(2) typed while pending; reply(3) to A; reply(4) to B.
+    const ordered = conversationOrder([u(1, "A"), u(2, "B"), ra(3, 1), ra(4, 2)]);
+    assert.equal(compactionBoundary(thread(), ordered, 1), 3);
+    const c = buildCompactionMessages(thread(), ordered, 3, prompt);
+    assert.ok(c[1]?.content.includes("User: A"));
+    assert.ok(c[1]?.content.includes("a3"));
+    assert.ok(!c[1]?.content.includes("User: B"));
+    const t = thread({ summary: { text: "S", throughSeq: 3, jobId: "J" } });
+    const m = buildTurnMessages(t, [...ordered, u(5, "C")], 5, prompt);
+    assert.deepEqual(m.slice(1).map((x) => x.content), ["B", "a4", "C"]);
+    assert.ok(buildTitleMessages(t, ordered, Number.MAX_SAFE_INTEGER)[0]?.content.includes("User: B"));
+    assert.ok(!buildTitleMessages(t, ordered, Number.MAX_SAFE_INTEGER)[0]?.content.includes("User: A"));
+    assert.equal(compactionBoundary(t, ordered, 0), 4);
+  });
+  it("a turn built while a reply is pending keeps the earlier reply", () => {
+    // A(1), B(2) queued, reply(3) to A; B is claimed through 2 and C(4) is typed before the request is built.
+    const ordered = conversationOrder([u(1, "A"), u(2, "B"), ra(3, 1), u(4, "C")]);
+    const m = buildTurnMessages(thread(), ordered, 2, prompt);
+    assert.deepEqual(m.slice(1).map((x) => x.content), ["A", "a3", "B"]);
   });
   it("leaves an unqueued transcript unchanged", () => {
     const plain = [u(1), ra(2, 1), u(3), { seq: 4, at: AT, type: "model", from: "a", to: "b" } as TranscriptEntry, ra(5, 3)];
