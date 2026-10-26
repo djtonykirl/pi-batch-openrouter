@@ -6,6 +6,7 @@ import {
   buildTurnMessages,
   cleanTitle,
   compactionBoundary,
+  conversationOrder,
   estimateTokens,
   provisionalTitle,
 } from "../src/chat/request.js";
@@ -124,5 +125,21 @@ describe("helpers", () => {
     assert.equal(cleanTitle('  "Title: Auth redesign"\nmore'), "Auth redesign");
     assert.equal(cleanTitle("  \n "), undefined);
     assert.equal(cleanTitle("\n## **Hello**"), "Hello");
+  });
+});
+
+describe("conversationOrder", () => {
+  const ra = (seq: number, throughSeq: number): TranscriptEntry => ({ seq, at: AT, type: "assistant", text: `a${seq}`, model: "m/x", jobId: "J", throughSeq });
+  it("moves messages queued while a reply was pending after that reply", () => {
+    // A(1) sent; B(2), C(3) typed while pending; reply(4) to A; reply(5) to B+C.
+    const ordered = conversationOrder([u(1, "A"), u(2, "B"), u(3, "C"), ra(4, 1), ra(5, 3)]);
+    assert.deepEqual(ordered.map((e) => [e.type, e.seq]), [["user", 1], ["assistant", 1], ["user", 2], ["user", 3], ["assistant", 5]]);
+    const m = buildTurnMessages(thread(), ordered, 3, prompt);
+    assert.deepEqual(m.slice(1).map((x) => x.content), ["A", "a4", "B\n\nC"]);
+  });
+  it("leaves an unqueued transcript unchanged", () => {
+    const plain = [u(1), ra(2, 1), u(3), { seq: 4, at: AT, type: "model", from: "a", to: "b" } as TranscriptEntry, ra(5, 3)];
+    assert.deepEqual(conversationOrder(plain), plain);
+    assert.equal(compactionBoundary(thread(), conversationOrder(exchanges(6)), 4), 4);
   });
 });

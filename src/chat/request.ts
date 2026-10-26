@@ -24,6 +24,29 @@ function systemContent(thread: ThreadState, prompt: ChatPrompt): string {
   return content;
 }
 
+/**
+ * Messages typed while a reply is pending are appended before that reply lands, so the transcript holds them ahead
+ * of it. In the conversation they follow it. Returns the entries in conversation order; a reply that has queued
+ * messages ahead of it gets `seq = throughSeq` (the last user seq it answers), so the `seq` filters on `throughSeq`
+ * and `summary.throughSeq` keep working. Without queued messages the entries are returned unchanged.
+ * Pass the result to the builders in this module.
+ */
+export function conversationOrder(entries: TranscriptEntry[]): TranscriptEntry[] {
+  const userSeqs = entries.filter((e) => e.type === "user").map((e) => e.seq);
+  let moved = false;
+  const out = entries.map((e) => {
+    if (e.type !== "assistant" || e.throughSeq === undefined) return e;
+    const through = e.throughSeq;
+    if (!userSeqs.some((s) => s > through && s < e.seq)) return e;
+    moved = true;
+    return { ...e, seq: through };
+  });
+  if (!moved) return entries;
+  // Stable: a reply sorts directly after the user entry whose seq it now shares.
+  const rank = (e: TranscriptEntry) => (e.type === "assistant" ? 1 : 0);
+  return out.map((e, i) => ({ e, i })).sort((a, b) => a.e.seq - b.e.seq || rank(a.e) - rank(b.e) || a.i - b.i).map((x) => x.e);
+}
+
 export function buildTurnMessages(
   thread: ThreadState,
   entries: TranscriptEntry[],

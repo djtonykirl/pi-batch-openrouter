@@ -20,7 +20,8 @@ export interface ThreadState {
 
 export type TranscriptEntry = { seq: number; at: string } & (
   | { type: "user"; text: string }
-  | { type: "assistant"; text: string; model: string; jobId: string; finishReason?: string }
+  /** `throughSeq`: the last user seq the reply answers (messages typed while it was pending have lower seqs). */
+  | { type: "assistant"; text: string; model: string; jobId: string; finishReason?: string; throughSeq?: number }
   | { type: "model"; from: string; to: string }
   | { type: "title"; title: string; source: "auto" | "manual" }
   | { type: "compaction"; summary: string; throughSeq: number; jobId: string; model: string; instructions?: string }
