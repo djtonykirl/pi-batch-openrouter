@@ -39,6 +39,11 @@ export function staleClaimMs(config: BatchConfig): number {
   return Math.max(MIN_STALE_CLAIM_MS, config.polling.requestTimeoutSeconds * 1000 + STALE_CLAIM_MARGIN_MS);
 }
 
+/** The job error code for a submit whose outcome is unknown: OpenRouter may have accepted (and billed) it. */
+export const SUBMISSION_UNKNOWN = "submission_unknown";
+/** What to do after a `submission_unknown` turn failure. Never a plain retry. */
+export const SUBMISSION_UNKNOWN_ADVICE =
+  "Check your OpenRouter activity first; only if the turn was not billed, use /batch chat retry --force (a plain retry is refused to avoid paying twice).";
 /** Consecutive poller ticks a job manifest may fail to read (Windows EBUSY/EPERM) before a turn is failed. */
 const READ_FAILURE_TICKS = 5;
 /** Lock wait for updates no user is waiting on (settling, recording a job ID or a failure). */
@@ -199,14 +204,25 @@ export class ChatService {
     }
   }
 
-  /** Clears the last failure and sends every unsent message as one turn. Returns the new job ID. */
-  public async retry(threadId: string): Promise<string> {
+  /**
+   * Clears the last failure and sends every unsent message as one turn. Returns the new job ID. When the failed turn
+   * may have reached OpenRouter (`submission_unknown`), it is refused unless `force` is set: resubmitting could bill
+   * the same turn twice.
+   */
+  public async retry(threadId: string, opts: { force?: boolean } = {}): Promise<string> {
     const nothing = `Nothing to retry: the last turn in ${threadId} did not fail.`;
     const thread = this.store.read(threadId);
     if (!thread.lastFailure) throw new Error(nothing);
+    const refuse = (f: NonNullable<ThreadState["lastFailure"]>) => {
+      if (!opts.force && this.submissionUnknown(f)) {
+        throw new Error(`The last turn in ${threadId} may have reached OpenRouter: it got no response when it was submitted${f.jobId ? ` (job ${f.jobId})` : ""}. ${SUBMISSION_UNKNOWN_ADVICE}`);
+      }
+    };
+    refuse(thread.lastFailure);
     const prompt = await this.checkedPrompt(thread.account);
     const claim = this.store.update(threadId, (t) => {
       if (!t.lastFailure) throw new Error(nothing);
+      refuse(t.lastFailure);
       if (t.pending) throw new Error(`A reply is already pending in ${threadId}.`);
       delete t.lastFailure;
       const c = this.claim(t, this.store.transcript(threadId).entries);
@@ -274,6 +290,18 @@ export class ChatService {
 
   // ------------------------------------------------------------- internals
 
+  /** True when the failed turn's job may have been accepted (and billed) by OpenRouter. */
+  private submissionUnknown(f: NonNullable<ThreadState["lastFailure"]>): boolean {
+    if (f.code === SUBMISSION_UNKNOWN) return true;
+    if (f.code !== undefined || !f.jobId) return false;
+    // Failures recorded before `code` existed: ask the job itself.
+    try {
+      return this.deps.batch.registry.read(f.jobId).error?.code === SUBMISSION_UNKNOWN;
+    } catch {
+      return false;
+    }
+  }
+
   private projectInstructions(): string | undefined {
     const file = path.join(this.deps.workspaceRoot, ...PROJECT_INSTRUCTIONS_FILE.split("/"));
     if (!fs.existsSync(file)) return undefined;
@@ -330,6 +358,7 @@ export class ChatService {
   /** Creates and submits the turn for a claim, then records its job ID (or the failure). Never throws. */
   private async submitTurn(threadId: string, claim: Pending, prompt: ChatPrompt): Promise<{ jobId?: string; error?: string }> {
     let jobId: string | undefined;
+    let code: string | undefined;
     try {
       const thread = this.store.read(threadId);
       const entries = conversationOrder(this.store.transcript(threadId).entries);
@@ -346,10 +375,16 @@ export class ChatService {
         ...(retitle ? { title: buildTitleMessages(thread, entries, claim.throughSeq) } : {}),
       });
       jobId = job.localId;
-      if (job.localStatus === "failed") throw new Error(job.error?.message ?? "the provider rejected the batch");
+      if (job.localStatus === "failed") {
+        code = job.error?.code;
+        throw new Error(job.error?.message ?? "the provider rejected the batch");
+      }
     } catch (err) {
-      const message = `The turn could not be submitted${jobId ? ` (job ${jobId})` : ""}: ${errorMessage(err)}`;
-      this.recordFailure(threadId, claim, message, jobId);
+      const message =
+        code === SUBMISSION_UNKNOWN
+          ? `No response from OpenRouter while submitting the turn${jobId ? ` (job ${jobId})` : ""}; it MAY have been accepted. ${SUBMISSION_UNKNOWN_ADVICE}`
+          : `The turn could not be submitted${jobId ? ` (job ${jobId})` : ""}: ${errorMessage(err)}`;
+      this.recordFailure(threadId, claim, message, jobId, code);
       return { error: message };
     }
     const link = this.linkClaim(threadId, "turn", claim, jobId!);
@@ -465,13 +500,13 @@ export class ChatService {
    * sets `lastFailure` and appends a failure entry. Never throws: if the thread stays locked, a claim is left to
    * expire as stale.
    */
-  private recordFailure(threadId: string, claim: Pending | undefined, message: string, jobId?: string): void {
+  private recordFailure(threadId: string, claim: Pending | undefined, message: string, jobId?: string, code?: string): void {
     try {
       const recorded = this.store.update(
         threadId,
         (t, append) => {
           if (claim ? !sameClaim(t.pending, claim) : t.pending) return false;
-          this.fail(t, append, message, jobId);
+          this.fail(t, append, message, jobId, code);
           return true;
         },
         BACKGROUND_LOCK_WAIT_MS,
@@ -482,22 +517,27 @@ export class ChatService {
     }
   }
 
-  private fail(t: ThreadState, append: Append, message: string, jobId?: string): void {
+  private fail(t: ThreadState, append: Append, message: string, jobId?: string, code?: string): void {
     delete t.pending;
-    t.lastFailure = { purpose: "turn", ...(jobId ? { jobId } : {}), message, at: nowIso() };
-    append({ type: "failure", purpose: "turn", ...(jobId ? { jobId } : {}), message });
+    const ids = { ...(jobId ? { jobId } : {}), ...(code ? { code } : {}) };
+    t.lastFailure = { purpose: "turn", ...ids, message, at: nowIso() };
+    append({ type: "failure", purpose: "turn", ...ids, message });
   }
 
   /**
    * What a settled chat job produced: item 1 (the reply or the summary) and the optional title item. Reads only the
    * job's own (immutable once terminal) files.
    */
-  private jobOutcome(job: JobManifest): { reply?: { text: string; finishReason?: string }; title?: string; error: string } {
+  private jobOutcome(job: JobManifest): { reply?: { text: string; finishReason?: string }; title?: string; error: string; code?: string } {
     const compact = job.chat?.purpose === "compact";
     const what = compact ? "summary" : "reply";
     const next = compact ? "The thread is unchanged." : "Use /batch chat retry.";
     if (job.localStatus !== "ready" && job.localStatus !== "partial") {
-      return { error: `The ${what} job ${job.localId} ended ${job.localStatus}${job.error ? `: ${job.error.message}` : ""}. ${next}` };
+      const code = job.error?.code;
+      if (code === SUBMISSION_UNKNOWN && !compact) {
+        return { code, error: `The ${what} job ${job.localId} ended ${job.localStatus}: OpenRouter may or may not have accepted it. ${SUBMISSION_UNKNOWN_ADVICE}` };
+      }
+      return { ...(code ? { code } : {}), error: `The ${what} job ${job.localId} ended ${job.localStatus}${job.error ? `: ${job.error.message}` : ""}. ${next}` };
     }
     const registry = this.deps.batch.registry;
     const items = jobItems(registry, job);
@@ -535,7 +575,7 @@ export class ChatService {
         (t, append) => {
           if (t.pending?.jobId !== job.localId) return false;
           if (!outcome.reply) {
-            this.fail(t, append, outcome.error, job.localId);
+            this.fail(t, append, outcome.error, job.localId, outcome.code);
             return false;
           }
           append({

@@ -29,7 +29,8 @@ export const CHAT_HELP = `/batch chat — chat with a model at batch prices (rep
   chat off                  leave chat mode; typing goes to the live model again
   chat send [--file <path>] [--context <dir>] "<message>"
                             send a message with attached workspace files or context directories
-  chat retry                resubmit the last turn if it failed
+  chat retry [--force]      resubmit the last turn if it failed; after "no response from OpenRouter" it is
+                            refused unless --force (check your OpenRouter activity first: it may be billed)
   chat help                 this list
 
 Chat mode is per Pi session and is off when Pi starts. Lines starting with / are always commands.`;
@@ -266,7 +267,9 @@ export async function cmdChat(rt: BatchRuntime, rest: string[], ctx: ExtensionCo
     }
     case "retry": {
       const id = activeThread(rt);
-      const jobId = await rt.requireChat().retry(id);
+      const parsed = parseArgs(args, { booleans: ["force"] });
+      if (parsed.errors.length) throw new Error(`/batch chat retry: ${parsed.errors.join("; ")}`);
+      const jobId = await rt.requireChat().retry(id, { force: parsed.booleans.has("force") });
       rt.poller.updateBadge();
       rt.requireChatSession().sync();
       rt.notify(`Resubmitted as ${jobId}.`, "info");

@@ -1,5 +1,5 @@
 import type { BatchConfig } from "../config.js";
-import { ChatBlockedError, type ChatService } from "./service.js";
+import { ChatBlockedError, SUBMISSION_UNKNOWN, type ChatService } from "./service.js";
 import { ThreadBusyError, type ThreadStore } from "./store.js";
 import type { ThreadState, TranscriptEntry } from "./types.js";
 
@@ -57,7 +57,12 @@ function toDisplay(thread: ThreadState, e: TranscriptEntry): ChatEntryData {
       return {
         ...base,
         role: "status",
-        text: e.purpose === "compact" ? `⚠ Compaction failed: ${e.message} (thread unchanged)` : `⚠ Turn failed: ${e.message} — /batch chat retry`,
+        text:
+          e.purpose === "compact"
+            ? `⚠ Compaction failed: ${e.message} (thread unchanged)`
+            : e.code === SUBMISSION_UNKNOWN
+              ? `⚠ Turn failed: ${e.message}${e.message.includes("retry --force") ? "" : " — check your OpenRouter activity first; only if it was not billed, /batch chat retry --force"}`
+              : `⚠ Turn failed: ${e.message} — /batch chat retry`,
       };
     case "status":
       return { ...base, role: "status", text: e.text };

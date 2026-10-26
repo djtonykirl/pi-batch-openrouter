@@ -294,3 +294,52 @@ test(
     assert.equal(entries(s, t.id).some((e) => e.type === "failure"), false);
   }),
 );
+
+// ------------------------------------------------------------------ C-I3
+
+/** A send whose submit gets no answer from OpenRouter: the job fails as submission_unknown. */
+async function unknownSubmission(s: Setup): Promise<string> {
+  const t = s.chat.newThread();
+  s.fake.offline = true;
+  const r = await s.chat.send(t.id, "did this get billed?");
+  s.fake.offline = false;
+  assert.equal(r.jobId, undefined);
+  const thread = s.store.read(t.id);
+  assert.equal(thread.lastFailure?.code, "submission_unknown");
+  return t.id;
+}
+
+test(
+  "C-I3: retry after a submission_unknown failure is refused without --force and says to check OpenRouter first",
+  withSetup(async (s) => {
+    const id = await unknownSubmission(s);
+    const submitsBefore = s.fake.accepted.length;
+    await assert.rejects(s.chat.retry(id), (e: unknown) => /OpenRouter activity/.test((e as Error).message) && /--force/.test((e as Error).message));
+    assert.equal(s.fake.accepted.length, submitsBefore, "nothing resubmitted");
+    const thread = s.store.read(id);
+    assert.ok(thread.lastFailure, "the failure stays");
+    assert.equal(thread.pending, undefined);
+  }),
+);
+
+test(
+  "C-I3: retry with force resubmits after a submission_unknown failure",
+  withSetup(async (s) => {
+    const id = await unknownSubmission(s);
+    const jobId = await s.chat.retry(id, { force: true });
+    assert.ok(jobId);
+    assert.equal(s.store.read(id).pending?.jobId, jobId);
+    assert.equal(s.store.read(id).lastFailure, undefined);
+  }),
+);
+
+test(
+  "C-I3: the failure entry for a submission_unknown turn does not suggest a plain retry",
+  withSetup(async (s) => {
+    const id = await unknownSubmission(s);
+    const failure = entries(s, id).find((e) => e.type === "failure")!;
+    assert.equal(failure.type === "failure" && failure.code, "submission_unknown");
+    assert.match(failure.type === "failure" ? failure.message : "", /retry --force/);
+  }),
+);
+

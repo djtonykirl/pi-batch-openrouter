@@ -231,6 +231,21 @@ test(
 );
 
 test(
+  "a submission_unknown failure does not suggest a plain retry (C-I3)",
+  withSetup(async (s) => {
+    const t = s.chat.newThread();
+    s.store.update(t.id, (_th, append) => {
+      append({ type: "failure", purpose: "turn", code: "submission_unknown", message: "No response from OpenRouter" });
+    });
+    s.session.enter(t.id);
+    const line = s.shown.find((d) => d.text.startsWith("⚠ Turn failed"))!.text;
+    assert.doesNotMatch(line, /— \/batch chat retry$/);
+    assert.match(line, /OpenRouter activity/);
+    assert.match(line, /\/batch chat retry --force/);
+  }),
+);
+
+test(
   "footer",
   withSetup(async (s) => {
     const t = s.chat.newThread();

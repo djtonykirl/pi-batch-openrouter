@@ -1468,10 +1468,13 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
               );
             }
             if (e.type === "failure") {
+              const unknown = e.code === "submission_unknown";
               return (
                 '<div class="alert-box alert-danger" style="display:flex; align-items:center; justify-content:space-between; gap:12px;">' +
                 "<span>⚠️ Turn failed: " + escapeHtml(e.message) + "</span>" +
-                '<button class="btn btn-sm" onclick="window.retryActiveChatTurn()">🔄 Retry Turn</button>' +
+                (unknown
+                  ? '<button class="btn btn-sm" onclick="window.retryActiveChatTurn(true)">⚠️ Retry anyway (check OpenRouter first)</button>'
+                  : '<button class="btn btn-sm" onclick="window.retryActiveChatTurn(false)">🔄 Retry Turn</button>') +
                 "</div>"
               );
             }
@@ -1617,10 +1620,11 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
       }
     };
 
-    window.retryActiveChatTurn = async () => {
+    window.retryActiveChatTurn = async (force) => {
       if (!state.activeThreadId) return;
+      if (force && !confirm("OpenRouter may already have accepted (and billed) this turn. Check your OpenRouter activity first. Resubmit anyway?")) return;
       try {
-        const res = await api("/api/threads/" + encodeURIComponent(state.activeThreadId) + "/retry", { method: "POST" });
+        const res = await api("/api/threads/" + encodeURIComponent(state.activeThreadId) + "/retry", { method: "POST", body: force ? { force: true } : {} });
         showToast("Resubmitted turn as " + res.jobId);
         await refreshStateQuiet();
       } catch (err) {

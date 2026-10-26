@@ -15,7 +15,8 @@ export interface ThreadState {
   nextSeq: number;
   pending?: { throughSeq: number; claimedAt: string; jobId?: string };
   compacting?: { throughSeq: number; claimedAt: string; jobId?: string; instructions?: string };
-  lastFailure?: { purpose: "turn" | "compact"; jobId?: string; message: string; at: string };
+  /** `code`: the failed job's error code; "submission_unknown" means OpenRouter may have accepted (and billed) it. */
+  lastFailure?: { purpose: "turn" | "compact"; jobId?: string; code?: string; message: string; at: string };
   summary?: { text: string; throughSeq: number; jobId: string };
 }
 
@@ -26,7 +27,7 @@ export type TranscriptEntry = { seq: number; at: string } & (
   | { type: "model"; from: string; to: string }
   | { type: "title"; title: string; source: "auto" | "manual" }
   | { type: "compaction"; summary: string; throughSeq: number; jobId: string; model: string; instructions?: string }
-  | { type: "failure"; purpose: "turn" | "compact"; jobId?: string; message: string }
+  | { type: "failure"; purpose: "turn" | "compact"; jobId?: string; code?: string; message: string }
   | { type: "status"; text: string }
 );
 

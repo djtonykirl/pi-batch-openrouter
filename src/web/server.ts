@@ -726,7 +726,8 @@ export class BatchWebServer {
         }
 
         if (method === "POST" && action === "retry") {
-          const jobId = await this.deps.chat.retry(threadId);
+          const body = await this.readJson<{ force?: boolean }>(req);
+          const jobId = await this.deps.chat.retry(threadId, { force: body.force === true });
           this.deps.poller.updateBadge();
           this.broadcast({ type: "thread_updated", threadId });
           this.sendJson(res, 200, { jobId });
