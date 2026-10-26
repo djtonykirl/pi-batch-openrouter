@@ -68,6 +68,7 @@ The API key comes from Pi's model registry/`auth.json` for the selected account 
 | `/batch artifact <id> [--synthesis\|--item <sel>] --format markdown\|html\|pdf\|text [--template <name>] [--out <path>] [--overwrite] [--allow-partial]` | Write a controlled file from validated results (see [Artifacts](#artifacts)). |
 | `/artifact list [--job <id>]` · `show <id>` · `render <file.md> --format html\|pdf` · `regenerate <id>` · `templates` | Inspect artifacts, render Pi/user-edited Markdown, re-render without a model call, list templates. |
 | `/batch metadata plan --context <context.md> --input <tables.jsonl> [--preview]` · `summary` · `review` · `approved` · `validate-approved` | Databricks table descriptions and column comments: proposals, review and a handoff file (see [Databricks metadata enrichment](#databricks-metadata-enrichment-phase-1)). |
+| `/batch chat [continue\|resume\|clear\|rename\|model\|compact\|context\|cost\|export\|retry\|off\|help]` | Chat with a batch model; replies arrive when the batch completes (see [Batch chat](#batch-chat)). |
 | `/batch import-legacy <jobs.json> --preview` | Read-only inventory of pre-Release-1 jobs (see [Known limitations](#known-limitations)). |
 | `/batch submit <id>` | Submit a job created with `--preview` (goal, workflow, retry or synthesis). |
 | `/batch list [--status active\|done\|ready\|failed\|…\|all] [--limit n]` | List jobs from **local** state (no network). `ITEMS` shows usable/total for multi-request jobs. |
@@ -588,6 +589,77 @@ The default is **never generated automatically**:
 - `/batch artifact <job>` with no format, template or `--out` uses this default, read from the definition stored
   with the job.
 
+## Batch chat
+
+`/batch chat` is a conversation with a batch-capable model at batch prices. Each message is one single-request
+batch job, so a reply arrives when that batch completes (typically well within 24 hours), not immediately.
+Close Pi and come back: threads are stored on disk and the background poller delivers the reply.
+
+```
+/batch chat                  start a thread; plain text now goes to the batch model
+hello, can you review my plan?
+/batch chat off              plain text goes to the live Pi model again
+/batch chat continue         come back later
+```
+
+Chat mode is per Pi session and is off when Pi starts. Lines starting with `/` are always commands.
+
+| Command | Purpose |
+|---|---|
+| `/batch chat` | Start a new thread and enter chat mode. |
+| `/batch chat continue` | Re-enter the most recently active thread. |
+| `/batch chat resume [thread]` | Pick a thread, or give an ID suffix or exact title. |
+| `/batch chat clear` | Start a fresh thread. The old one stays resumable. |
+| `/batch chat rename <title>` · `rename --auto` | Rename the thread (this locks the title) · unlock auto-titling. |
+| `/batch chat model [slug]` | Change the model from the next message on. No slug opens a picker. |
+| `/batch chat compact [focus]` | Summarise older messages now, with optional focus instructions. |
+| `/batch chat context` | Estimated size of the next request and distance to auto-compact. |
+| `/batch chat cost` | Usage and cost totals the provider reported for this thread. |
+| `/batch chat export [file] [--overwrite]` | Write the transcript as Markdown to a workspace-relative file, or show it. |
+| `/batch chat retry` | Resubmit the last turn if it failed. |
+| `/batch chat off` | Leave chat mode. |
+| `/batch chat help` | List these commands. |
+
+**Footer.** In chat mode the footer shows `💬 <title> · <model>`, with `· waiting` while a reply is pending and
+`· compacting` while a compaction runs. Once usage reaches 80% of `chat.autoCompactTokens`, it adds
+`· N% until compact`, where N is the percentage **remaining**.
+
+**Isolation.** Chat text is stored in `.pi/batches/threads/` and is never added to the live model's context.
+After `/batch chat off`, the live model does not know what you said to the batch model.
+
+**Queueing.** One reply is awaited per thread. Messages you type while a reply is pending are queued and sent
+together as one message once the reply lands. In exports, a reply is shown before the messages queued behind
+it. After a failed turn, new messages are queued until you run `/batch chat retry`.
+
+**Compaction.** Everything before the `chat.keepRecentExchanges` most recent exchanges can be replaced by a
+summary in later requests; the full transcript is kept. It runs automatically when the estimated next request
+exceeds `chat.autoCompactTokens` (estimate: characters / 4), or on demand with `/batch chat compact`. Sending
+continues while it runs, and the summary applies from the next request after it lands.
+
+**Titles.** A thread is titled from its first message. Once, around message `chat.retitleAtTurn`, the model
+proposes a better title. `/batch chat rename` locks the title; `rename --auto` unlocks it.
+
+**Project instructions.** If `.pi/BATCH_CHAT.md` exists, its text is sent with every chat request, alongside
+`chat.systemPrompt`.
+
+**Secret scan.** Messages and `.pi/BATCH_CHAT.md` get the same secret scan as other submissions. A message with
+a finding is refused **before it is saved**: remove the secret and type it again. A finding in
+`.pi/BATCH_CHAT.md` sends nothing; fix the file, then `/batch chat retry`.
+
+**Chat jobs and other commands.** Chat jobs appear in `/batch list`, `show` and `view` and in the badge.
+`/batch inject`, `retry`, `retry-items`, `synthesize`, `export` and `artifact` refuse them, as do the extension's
+LLM tools. Use `/batch chat retry` and `/batch chat export` instead.
+
+**Configuration** (`chat` section; defaults shown):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `chat.autoCompact` | `true` | Compact automatically when the limit is exceeded. |
+| `chat.autoCompactTokens` | `60000` | Estimated request size that triggers automatic compaction. |
+| `chat.keepRecentExchanges` | `4` | Most recent exchanges left out of a compaction. |
+| `chat.retitleAtTurn` | `3` | Message number at which the model is asked for a better title. |
+| `chat.systemPrompt` | a short general-assistant prompt | System prompt for every chat request. |
+
 ## Databricks metadata enrichment (Phase 1)
 
 This proposes **table descriptions and column comments** for Databricks tables from evidence exported by
@@ -877,6 +949,7 @@ All tools call the same `BatchService` as the slash commands, so they get the sa
 - **JSON Schema** support is draft-07 through Ajv in strict mode. `format` keywords are rejected as unknown, because no format plugin is loaded. Patterns run with JavaScript's regular expression engine, and workflow schemas are trusted local configuration.
 - **Model eligibility is decided by OpenRouter.** A model having a normal endpoint does not mean it has a `:batch` endpoint. The extension does not claim eligibility; it preserves the provider's 400/404/422 response and never switches models on its own.
 - **Item-level usage** appears only when the upstream provider includes it per item. Otherwise only batch totals are shown.
+- **Batch chat reads.** Chat threads are plain files in `.pi/batches/threads/`. They are never put in the live model's context, but the live model's own file tools can read that folder if it is asked to.
 - **Print mode.** In `pi -p`, Pi has no UI, so command output (`notify`) is not displayed. The state on disk is still correct.
 
 ## Development
