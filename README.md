@@ -69,6 +69,7 @@ The API key comes from Pi's model registry/`auth.json` for the selected account 
 | `/artifact list [--job <id>]` · `show <id>` · `render <file.md> --format html\|pdf` · `regenerate <id>` · `templates` | Inspect artifacts, render Pi/user-edited Markdown, re-render without a model call, list templates. |
 | `/batch metadata plan --context <context.md> --input <tables.jsonl> [--preview]` · `summary` · `review` · `approved` · `validate-approved` | Databricks table descriptions and column comments: proposals, review and a handoff file (see [Databricks metadata enrichment](#databricks-metadata-enrichment-phase-1)). |
 | `/batch chat [continue\|resume\|clear\|rename\|model\|compact\|context\|cost\|export\|retry\|off\|help]` | Chat with a batch model; replies arrive when the batch completes (see [Batch chat](#batch-chat)). |
+| `/batch web [--port n] [stop]` | Local web UI on 127.0.0.1 with a one-time sign-in link (see [Web UI](#web-ui-batch-web)). |
 | `/batch import-legacy <jobs.json> --preview` | Read-only inventory of pre-Release-1 jobs (see [Known limitations](#known-limitations)). |
 | `/batch submit <id>` | Submit a job created with `--preview` (goal, workflow, retry or synthesis). |
 | `/batch list [--status active\|done\|ready\|failed\|…\|all] [--limit n]` | List jobs from **local** state (no network). `ITEMS` shows usable/total for multi-request jobs. |
@@ -616,7 +617,8 @@ Chat mode is per Pi session and is off when Pi starts. Lines starting with `/` a
 | `/batch chat context` | Estimated size of the next request and distance to auto-compact. |
 | `/batch chat cost` | Usage and cost totals the provider reported for this thread. |
 | `/batch chat export [file] [--overwrite]` | Write the transcript as Markdown to a workspace-relative file, or show it. |
-| `/batch chat retry` | Resubmit the last turn if it failed. |
+| `/batch chat send [--file <path>] [--context <dir>] "<message>"` | Send a message with workspace files or directories attached. |
+| `/batch chat retry [--force]` | Resubmit the last turn if it failed. `--force` is needed after "no response from OpenRouter" (see below). |
 | `/batch chat off` | Leave chat mode. |
 | `/batch chat help` | List these commands. |
 
@@ -630,6 +632,30 @@ After `/batch chat off`, the live model does not know what you said to the batch
 **Queueing.** One reply is awaited per thread. Messages you type while a reply is pending are queued and sent
 together as one message once the reply lands. In exports, a reply is shown before the messages queued behind
 it. After a failed turn, new messages are queued until you run `/batch chat retry`.
+
+**Retry after "no response from OpenRouter".** If a submit times out or the network drops, OpenRouter may still
+have accepted, and billed, the turn. That failure is marked as *submission unknown*, and a plain
+`/batch chat retry` is refused so you do not pay twice. Check your OpenRouter activity first. Only if the turn was
+not billed, run `/batch chat retry --force`. A submit that is still in flight (or that Pi was stopped during) is
+never declared lost while its batch job exists: the poller links the job back to the thread and the reply
+arrives as usual.
+
+**Attachments.** `/batch chat send --file`/`--context` (and the web UI) attach workspace files; the web UI also
+uploads text files, PDFs and images. What is scanned for secrets, and what is not:
+
+| Attachment | Sent as | Secret scan |
+|---|---|---|
+| Workspace files and directories | text | Yes, with the same exclusions as `/batch ask` (hard-deny, `.pi/batchignore`, `.gitignore`, size limits). |
+| Uploaded text, code, CSV, JSON, Markdown | text | Yes. |
+| PDF, text mode (default) | extracted text | Yes, on the extracted text. A PDF with no extractable text (for example a scan) is **refused**, never sent raw. |
+| PDF, multimodal mode | the raw file | **No.** Needs an explicit per-file opt-in (`allowUnscanned`; the web UI asks per file). |
+| Image (PNG, JPEG, WEBP, GIF) | the raw image | **No.** Needs the same per-file opt-in. |
+
+A message with a finding is refused before anything is saved. Each binary file sent unscanned adds a warning to
+the thread. A binary attachment is sent only with the turn it belongs to; later turns carry a short
+`[attached: name (type, size)]` placeholder instead, so it is not paid for again on every turn. The context
+estimate counts attachments (base64 characters / 4). PDF text extraction is bounded (time, decompressed size),
+and a PDF that exceeds a limit is refused as "could not extract".
 
 **Compaction.** Everything before the `chat.keepRecentExchanges` most recent exchanges can be replaced by a
 summary in later requests; the full transcript is kept. It runs automatically when the estimated next request
@@ -659,6 +685,33 @@ LLM tools. Use `/batch chat retry` and `/batch chat export` instead.
 | `chat.keepRecentExchanges` | `4` | Most recent exchanges left out of a compaction. |
 | `chat.retitleAtTurn` | `3` | Message number at which the model is asked for a better title. |
 | `chat.systemPrompt` | a short general-assistant prompt | System prompt for every chat request. |
+
+## Web UI (`/batch web`)
+
+`/batch web [--port <n>]` starts a local web UI for batch jobs, chat threads, attachments and artifacts, and
+prints a one-time sign-in link. `/batch web stop` closes it; it also stops when the Pi session changes. Outside
+Pi, `npm run web [-- --port 3456 --cwd <workspace>]` runs the same UI standalone, with its own poller so chat
+replies still land.
+
+Security model:
+
+- **Local only.** The server binds to `127.0.0.1` and refuses any request whose `Host` header is not
+  `127.0.0.1:<port>` or `localhost:<port>`, which blocks DNS-rebinding attacks.
+- **Session cookie.** The printed link carries a one-time token. Opening it sets an HttpOnly, SameSite=Strict
+  session cookie and drops the token from the address bar. The page and every `/api` request, reads and the event
+  stream included, need that session. Run `/batch web` again for a fresh link (for another browser, say).
+- **No cross-site requests.** API calls with a foreign `Origin` or `Sec-Fetch-Site: cross-site` are refused, and
+  changes also need the per-server CSRF token that only the signed-in page has. Tokens are compared in constant
+  time.
+- **Headers.** A Content-Security-Policy (the page's single script runs by nonce; no inline handlers),
+  `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`. Rendered HTML artifacts are served in a
+  script-less sandbox.
+- **Keys.** Standalone, the server uses only the selected account's key from `~/.pi/agent/auth.json`, or
+  `OPENROUTER_API_KEY` for the configured default account, and never falls back to another account's key. Keys
+  are redacted from its log.
+
+Anyone who can run programs as you on this machine can still reach the server; it is not a multi-user service.
+Switching the workspace in the UI never stops Pi's own poller: the UI polls the other workspace itself.
 
 ## Databricks metadata enrichment (Phase 1)
 
