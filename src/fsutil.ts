@@ -215,6 +215,13 @@ function removeStaleLock(lockPath: string, judged: string, hooks: LockTestHooks)
   }
 }
 
+export class LockTimeoutError extends Error {
+  constructor(public readonly lockPath: string) {
+    super(`Job is busy (lock held: ${lockPath}). Try again shortly.`);
+    this.name = "LockTimeoutError";
+  }
+}
+
 /** Acquire with short synchronous retries; for user commands that must not silently skip. */
 export function acquireLock(lockPath: string, waitMs = 3000): FileLock {
   const deadline = Date.now() + waitMs;
@@ -222,7 +229,7 @@ export function acquireLock(lockPath: string, waitMs = 3000): FileLock {
     const lock = tryAcquireLock(lockPath);
     if (lock) return lock;
     if (Date.now() > deadline) {
-      throw new Error(`Job is busy (lock held: ${lockPath}). Try again shortly.`);
+      throw new LockTimeoutError(lockPath);
     }
     sleepSync(50);
   }

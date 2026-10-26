@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { acquireLock, appendJsonl, atomicWriteJson, readJsonl } from "../fsutil.js";
+import { acquireLock, appendJsonl, LockTimeoutError, atomicWriteJson, readJsonl } from "../fsutil.js";
 import { isThreadId, newThreadId } from "../ids.js";
 import type { ProviderPin } from "../openrouter/types.js";
 import { nowIso } from "../time.js";
@@ -112,11 +112,14 @@ export class ThreadStore {
     let lock;
     try {
       lock = acquireLock(path.join(dir, FILES.lock), waitMs);
-    } catch {
-      throw new ThreadBusyError(id);
+    } catch (err) {
+      if (err instanceof LockTimeoutError) throw new ThreadBusyError(id);
+      throw err;
     }
     try {
       const state = this.read(id);
+      // A crash after appending but before the snapshot leaves transcript seqs the snapshot doesn't know about.
+      state.nextSeq = Math.max(state.nextSeq, this.lastSeq(id) + 1);
       const entries: TranscriptEntry[] = [];
       const append = (e: TranscriptEntryInput): TranscriptEntry => {
         const entry = { ...e, seq: state.nextSeq++, at: nowIso() } as TranscriptEntry;
@@ -131,6 +134,14 @@ export class ThreadStore {
     } finally {
       lock.release();
     }
+  }
+
+  private lastSeq(id: string): number {
+    let max = 0;
+    for (const e of readJsonl<TranscriptEntry>(path.join(this.dir(id), FILES.transcript)).records) {
+      if (typeof e.seq === "number" && e.seq > max) max = e.seq;
+    }
+    return max;
   }
 
   public transcript(id: string): { entries: TranscriptEntry[]; malformedLines: number } {

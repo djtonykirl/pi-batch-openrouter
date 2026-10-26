@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import * as fs from "node:fs";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import * as path from "node:path";
-import { afterEach, beforeEach, describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it, mock } from "node:test";
 import { ThreadBusyError, ThreadNotFoundError, ThreadStore } from "../src/chat/store.js";
 import { acquireLock } from "../src/fsutil.js";
 import { isThreadId } from "../src/ids.js";
@@ -80,8 +81,12 @@ describe("ThreadStore", () => {
 
   it("update throws ThreadBusyError while another holder has the lock", () => {
     const t = mk();
-    const lock = acquireLock(path.join(store.root, t.id, "thread.lock"));
     let ran = false;
+    const tFile = path.join(store.root, t.id, "transcript.jsonl");
+    const sFile = path.join(store.root, t.id, "thread.json");
+    store.update(t.id, (_s, append) => append({ type: "user", text: "hi" }));
+    const before = [fs.readFileSync(tFile), fs.readFileSync(sFile)];
+    const lock = acquireLock(path.join(store.root, t.id, "thread.lock"));
     try {
       assert.throws(
         () =>
@@ -98,6 +103,40 @@ describe("ThreadStore", () => {
       lock.release();
     }
     assert.equal(ran, false);
+    assert.ok(fs.readFileSync(tFile).equals(before[0]!));
+    assert.ok(fs.readFileSync(sFile).equals(before[1]!));
+  });
+
+  it("a non-timeout lock error is not converted to ThreadBusyError", () => {
+    const t = mk();
+    const orig = fs.openSync;
+    const m = mock.method(fs, "openSync", ((...a: Parameters<typeof fs.openSync>) => {
+      if (String(a[0]).endsWith("thread.lock")) throw Object.assign(new Error("denied"), { code: "EPERM" });
+      return orig(...a);
+    }) as typeof fs.openSync);
+    syncBuiltinESMExports();
+    try {
+      assert.throws(
+        () => store.update(t.id, () => {}, 100),
+        (e: unknown) => !(e instanceof ThreadBusyError) && /denied/.test((e as Error).message),
+      );
+    } finally {
+      m.mock.restore();
+      syncBuiltinESMExports();
+    }
+  });
+
+  it("seqs stay unique after a crash between append and snapshot", () => {
+    const t = mk();
+    const file = path.join(store.root, t.id, "transcript.jsonl");
+    fs.appendFileSync(file, JSON.stringify({ seq: 1, at: new Date().toISOString(), type: "user", text: "orphan" }) + "\n");
+    const e = store.update(t.id, (_s, append) => append({ type: "user", text: "next" }));
+    assert.equal(e.seq, 2);
+    assert.deepEqual(
+      store.transcript(t.id).entries.map((x) => x.seq),
+      [1, 2],
+    );
+    assert.equal(store.read(t.id).nextSeq, 3);
   });
 
   it("transcript counts malformed lines", () => {
