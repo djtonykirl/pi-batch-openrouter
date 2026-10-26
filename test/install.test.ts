@@ -50,5 +50,7 @@ test("U-C1: every runtime import resolves to a dependency or peer dependency, no
 test("U-C1: pdf-lib is loaded lazily, so a missing package degrades only PDF handling", () => {
   const text = readFileSync(join(root, "src", "attachments.ts"), "utf8");
   assert.doesNotMatch(text, /^import[^;]*from\s+"pdf-lib"/m);
-  assert.match(text, /import\(\s*"pdf-lib"\s*\)/);
+  // Loaded on first use, inside the PDF worker (U-I3).
+  assert.ok(text.includes("require(workerData.pdfLibPath)"));
+  assert.ok(text.includes('resolve("pdf-lib")'));
 });

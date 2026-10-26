@@ -1,4 +1,6 @@
+import { createRequire } from "node:module";
 import * as path from "node:path";
+import { Worker } from "node:worker_threads";
 import * as zlib from "node:zlib";
 import type { BatchConfig } from "./config.js";
 import { buildContextPackage, heading, isProbablyBinary } from "./context/package.js";
@@ -67,6 +69,10 @@ export interface PreparedAttachments {
 const IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"]);
 const MAX_IMAGE_BYTES = 5_000_000;
 const MAX_PDF_BYTES = 10_000_000;
+/** Text extraction limits: one decompressed stream, and all streams of one PDF together. */
+const MAX_PDF_STREAM_OUTPUT = 16 * 1024 * 1024;
+const MAX_PDF_DECODED_TOTAL = 32 * 1024 * 1024;
+const PDF_STRUCTURE_TIMEOUT_MS = 20_000;
 
 function sanitizeName(name: string): string {
   const base = path.basename(name.trim() || "attachment");
@@ -123,51 +129,51 @@ export function isValidImageBuffer(buf: Buffer, mime: string): boolean {
  * Extracts readable text from a PDF buffer without external native binaries.
  * Decompresses FlateDecode streams and decodes literal `(text)` and hex `<hex>` strings
  * inside `BT ... ET` text blocks, plus document title/subject metadata via pdf-lib.
+ * Bounded: pdf-lib parsing gets `structureTimeoutMs`, each inflated stream and the total are capped, and every scan
+ * is linear. Exceeding a limit returns "could not extract".
  */
-export async function extractPdfText(buf: Buffer): Promise<{ ok: true; pages: number; text: string } | { ok: false; message: string }> {
+export async function extractPdfText(
+  buf: Buffer,
+  opts: { structureTimeoutMs?: number } = {},
+): Promise<{ ok: true; pages: number; text: string } | { ok: false; message: string }> {
   if (buf.length < 8 || !buf.subarray(0, 1024).toString("latin1").includes("%PDF-")) {
     return { ok: false, message: "not a valid PDF file (missing %PDF- header)" };
   }
-  let pageCount = 0;
   const metaParts: string[] = [];
-  // Loaded on first use: if the package is missing, only PDF handling is affected, never the whole extension.
-  let PDFDocument: typeof import("pdf-lib").PDFDocument;
-  try {
-    ({ PDFDocument } = await import("pdf-lib"));
-  } catch (err) {
-    return { ok: false, message: `PDF support is unavailable (could not load pdf-lib: ${(err as Error).message})` };
-  }
-  try {
-    const doc = await PDFDocument.load(buf, { ignoreEncryption: true, updateMetadata: false });
-    pageCount = doc.getPageCount();
-    const title = doc.getTitle();
-    const subject = doc.getSubject();
-    if (title) metaParts.push(`Title: ${title}`);
-    if (subject) metaParts.push(`Subject: ${subject}`);
-  } catch (err) {
-    return { ok: false, message: `unreadable PDF structure: ${(err as Error).message}` };
-  }
+  const structure = await readPdfStructure(buf, opts.structureTimeoutMs ?? PDF_STRUCTURE_TIMEOUT_MS);
+  if (!structure.ok) return structure;
+  const pageCount = structure.pages;
+  if (structure.title) metaParts.push(`Title: ${structure.title}`);
+  if (structure.subject) metaParts.push(`Subject: ${structure.subject}`);
 
   const rawLatin1 = buf.toString("latin1");
   const streamChunks: string[] = [];
-  const streamRegex = /stream\r?\n([\s\S]*?)\r?\nendstream/g;
-  let match: RegExpExecArray | null;
-  while ((match = streamRegex.exec(rawLatin1)) !== null) {
-    const bodyLatin1 = match[1]!;
-    const streamBuf = Buffer.from(bodyLatin1, "latin1");
-    let decoded = bodyLatin1;
-    try {
-      decoded = zlib.inflateSync(streamBuf).toString("latin1");
-    } catch {
+  const tooBig = (what: string) => ({ ok: false as const, message: `could not extract text: ${what}` });
+  let decodedTotal = 0;
+  try {
+    // Linear scan (a regex with a lazy body is quadratic when "stream" keywords have no matching "endstream").
+    for (const bodyLatin1 of pdfStreamBodies(rawLatin1)) {
+      const streamBuf = Buffer.from(bodyLatin1, "latin1");
+      let decoded = bodyLatin1;
       try {
-        decoded = zlib.inflateRawSync(streamBuf).toString("latin1");
-      } catch {
-        // Keep raw stream text if not Flate-compressed
+        decoded = zlib.inflateSync(streamBuf, { maxOutputLength: MAX_PDF_STREAM_OUTPUT }).toString("latin1");
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ERR_BUFFER_TOO_LARGE") return tooBig(`a compressed stream expands beyond ${MAX_PDF_STREAM_OUTPUT} bytes`);
+        try {
+          decoded = zlib.inflateRawSync(streamBuf, { maxOutputLength: MAX_PDF_STREAM_OUTPUT }).toString("latin1");
+        } catch (rawErr) {
+          if ((rawErr as NodeJS.ErrnoException).code === "ERR_BUFFER_TOO_LARGE") return tooBig(`a compressed stream expands beyond ${MAX_PDF_STREAM_OUTPUT} bytes`);
+          // Keep raw stream text if not Flate-compressed
+        }
+      }
+      decodedTotal += decoded.length;
+      if (decodedTotal > MAX_PDF_DECODED_TOTAL) return tooBig(`its streams expand beyond ${MAX_PDF_DECODED_TOTAL} bytes in total`);
+      if (decoded.includes("BT") && decoded.includes("ET")) {
+        streamChunks.push(extractTextFromPdfContentStream(decoded));
       }
     }
-    if (decoded.includes("BT") && decoded.includes("ET")) {
-      streamChunks.push(extractTextFromPdfContentStream(decoded));
-    }
+  } catch (err) {
+    return tooBig((err as Error).message);
   }
 
   const bodyText = streamChunks
@@ -177,6 +183,87 @@ export async function extractPdfText(buf: Buffer): Promise<{ ok: true; pages: nu
     .trim();
   const combined = [...metaParts, ...(bodyText ? [bodyText] : [])].join("\n\n").trim();
   return { ok: true, pages: pageCount, text: combined };
+}
+
+/**
+ * Runs in a worker thread: pdf-lib parses synchronously for long stretches (seconds per few hundred KB of crafted
+ * junk), which would freeze Pi. The worker is terminated at the time limit. pdf-lib is loaded there, on first use, so
+ * a missing package only affects PDF handling.
+ */
+const PDF_STRUCTURE_WORKER = `
+const { parentPort, workerData } = require("node:worker_threads");
+let lib;
+try {
+  lib = require(workerData.pdfLibPath);
+} catch (err) {
+  parentPort.postMessage({ ok: false, unavailable: true, message: String((err && err.message) || err) });
+  return;
+}
+lib.PDFDocument.load(workerData.bytes, { ignoreEncryption: true, updateMetadata: false }).then(
+  (doc) => parentPort.postMessage({ ok: true, pages: doc.getPageCount(), title: doc.getTitle() || "", subject: doc.getSubject() || "" }),
+  (err) => parentPort.postMessage({ ok: false, message: String((err && err.message) || err) }),
+);
+`;
+
+function pdfLibPath(): string {
+  try {
+    return createRequire(import.meta.url).resolve("pdf-lib");
+  } catch {
+    return "pdf-lib";
+  }
+}
+
+async function readPdfStructure(
+  buf: Buffer,
+  timeoutMs: number,
+): Promise<{ ok: true; pages: number; title: string; subject: string } | { ok: false; message: string }> {
+  // A wrapper function so the worker script may `return` early.
+  const worker = new Worker(`(function () {${PDF_STRUCTURE_WORKER}})();`, { eval: true, workerData: { pdfLibPath: pdfLibPath(), bytes: buf } });
+  try {
+    const outcome = await new Promise<Record<string, unknown> | "timeout">((resolve, reject) => {
+      const timer = setTimeout(() => resolve("timeout"), timeoutMs);
+      worker.once("message", (m: Record<string, unknown>) => {
+        clearTimeout(timer);
+        resolve(m);
+      });
+      worker.once("error", (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+    });
+    if (outcome === "timeout") return { ok: false, message: `could not extract text: the PDF structure took longer than ${timeoutMs} ms to parse` };
+    if (outcome.ok !== true) {
+      const detail = String(outcome.message ?? "");
+      return { ok: false, message: outcome.unavailable ? `PDF support is unavailable (could not load pdf-lib: ${detail})` : `unreadable PDF structure: ${detail}` };
+    }
+    return { ok: true, pages: Number(outcome.pages) || 0, title: String(outcome.title ?? ""), subject: String(outcome.subject ?? "") };
+  } catch (err) {
+    return { ok: false, message: `could not extract text: ${(err as Error).message}` };
+  } finally {
+    void worker.terminate();
+  }
+}
+
+/** Bodies of `stream\r?\n … \r?\nendstream` sections, found with indexOf (linear in the input). */
+export function* pdfStreamBodies(text: string): Generator<string> {
+  let pos = 0;
+  for (;;) {
+    const s = text.indexOf("stream", pos);
+    if (s < 0) return;
+    let bodyStart = s + "stream".length;
+    if (text[bodyStart] === "\r") bodyStart++;
+    if (text[bodyStart] !== "\n") {
+      pos = s + "stream".length;
+      continue;
+    }
+    bodyStart++;
+    const end = text.indexOf("\nendstream", bodyStart);
+    // No terminator after this point means none after any later "stream" either.
+    if (end < 0) return;
+    const bodyEnd = end > bodyStart && text[end - 1] === "\r" ? end - 1 : end;
+    yield text.slice(bodyStart, bodyEnd);
+    pos = end + "\nendstream".length;
+  }
 }
 
 function decodePdfLiteralString(raw: string): string {
@@ -223,15 +310,23 @@ function decodePdfHexString(hex: string): string {
   return buf.toString("utf8");
 }
 
-function extractTextFromPdfContentStream(content: string): string {
+export function extractTextFromPdfContentStream(content: string): string {
   const lines: string[] = [];
-  const btEtRegex = /BT\b([\s\S]*?)\bET/g;
-  let blockMatch: RegExpExecArray | null;
-  while ((blockMatch = btEtRegex.exec(content)) !== null) {
-    const block = blockMatch[1]!;
+  // `BT … ET` blocks (shortest), found linearly: once no ET follows a BT, none follows any later BT either.
+  const btRegex = /BT\b/g;
+  const etRegex = /\bET/g;
+  let bt: RegExpExecArray | null;
+  while ((bt = btRegex.exec(content)) !== null) {
+    etRegex.lastIndex = bt.index + 2;
+    const et = etRegex.exec(content);
+    if (!et) break;
+    const block = content.slice(bt.index + 2, et.index);
+    btRegex.lastIndex = et.index + 2;
     const tokens: string[] = [];
-    // Match TJ arrays `[...] TJ`, literal strings `(...) Tj`, or hex strings `<...> Tj`
-    const opRegex = /\[((?:[^[\]]|\((?:\\.|[^\\()])*\))*)\]\s*TJ|\(((?:\\.|[^\\()])*)\)\s*(?:Tj|'|")|<([0-9A-Fa-f\s]+)>\s*(?:Tj|'|")|\b(T\*|TD|Td)\b/g;
+    // Match TJ arrays `[...] TJ`, literal strings `(...) Tj`, or hex strings `<...> Tj`. Inside an array a character
+    // is either part of a `( … )` string or not a parenthesis at all, so the match is unambiguous (no backtracking
+    // blow-up on input like "[(a)(a)(a)…" with no closing bracket).
+    const opRegex = /\[((?:[^[\]()]|\((?:\\.|[^\\()])*\))*)\]\s*TJ|\(((?:\\.|[^\\()])*)\)\s*(?:Tj|'|")|<([0-9A-Fa-f\s]+)>\s*(?:Tj|'|")|\b(T\*|TD|Td)\b/g;
     let op: RegExpExecArray | null;
     while ((op = opRegex.exec(block)) !== null) {
       if (op[1] !== undefined) {
