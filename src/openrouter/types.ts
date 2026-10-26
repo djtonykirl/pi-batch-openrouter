@@ -122,9 +122,10 @@ export function buildSubmitBody(input: {
   const requests: BatchRequestItem[] = input.requests.map((req) => {
     const messages = req.body.messages.map((m): ChatMessage | WireChatMessage => {
       if ("parts" in m && Array.isArray(m.parts) && m.parts.length > 0) {
+        // No empty text part for an image-only message (providers may reject it).
         return {
           role: m.role,
-          content: [{ type: "text", text: m.content }, ...m.parts],
+          content: m.content.trim() ? [{ type: "text", text: m.content }, ...m.parts] : [...m.parts],
         };
       }
       if ("parts" in m) {
