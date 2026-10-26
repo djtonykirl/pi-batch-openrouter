@@ -7,10 +7,11 @@ import type { TranscriptEntry } from "../src/chat/types.js";
 import type { BatchConfig } from "../src/config.js";
 import type { LogFields, Logger, LogLevel } from "../src/logger.js";
 import type { BatchService } from "../src/service.js";
+import { CorruptManifestError, JobNotFoundError } from "../src/registry.js";
 import type { JobManifest } from "../src/types.js";
 import { FakeOpenRouter, accepted, makeConfig, makeService } from "./fixtures/fake-openrouter.js";
 import { completed, successItem } from "./fixtures/openrouter.js";
-import { rm, tempWorkspace } from "./helpers.js";
+import { rm, tempWorkspace, writeFiles } from "./helpers.js";
 
 interface Setup {
   root: string;
@@ -202,5 +203,94 @@ test(
     assert.equal(r.queued, false);
     assert.equal(r.jobId, undefined);
     assert.ok(s.logs.some((l) => l.event === "chat_job_link_failed"));
+  }),
+);
+
+// ------------------------------------------------------------------ C-I2
+
+/** Makes the next `count` registry reads of `jobId` throw `err`. */
+function failReads(s: Setup, jobId: string, count: number, err: () => Error): void {
+  const registry = s.batch.registry;
+  const real = registry.read.bind(registry);
+  let left = count;
+  registry.read = (id: string) => {
+    if (id === jobId && left > 0) {
+      left--;
+      throw err();
+    }
+    return real(id);
+  };
+}
+
+test(
+  "C-I2: a transient manifest read error leaves the pending turn intact, and the reply is applied on the next tick",
+  withSetup(async (s) => {
+    const t = s.chat.newThread();
+    const r = await s.chat.send(t.id, "hello");
+    await settle(s, r.jobId!, "Hi there");
+    failReads(s, r.jobId!, 1, () => new CorruptManifestError(r.jobId!, "EBUSY: resource busy or locked"));
+    await s.chat.tick();
+    let thread = s.store.read(t.id);
+    assert.equal(thread.pending?.jobId, r.jobId);
+    assert.equal(thread.lastFailure, undefined);
+    assert.equal(entries(s, t.id).some((e) => e.type === "failure"), false);
+    await s.chat.tick();
+    thread = s.store.read(t.id);
+    assert.equal(thread.pending, undefined);
+    const last = entries(s, t.id).at(-1)!;
+    assert.equal(last.type === "assistant" && last.text, "Hi there");
+  }),
+);
+
+test(
+  "C-I2: a read error that persists across several ticks records the failure",
+  withSetup(async (s) => {
+    const t = s.chat.newThread();
+    const r = await s.chat.send(t.id, "hello");
+    failReads(s, r.jobId!, 100, () => new CorruptManifestError(r.jobId!, "Unexpected end of JSON input"));
+    for (let i = 0; i < 10 && !s.store.read(t.id).lastFailure; i++) await s.chat.tick();
+    const thread = s.store.read(t.id);
+    assert.equal(thread.pending, undefined);
+    assert.match(thread.lastFailure?.message ?? "", /can no longer be read/);
+  }),
+);
+
+test(
+  "C-I2: a job that no longer exists fails the turn on the first tick",
+  withSetup(async (s) => {
+    const t = s.chat.newThread();
+    const r = await s.chat.send(t.id, "hello");
+    failReads(s, r.jobId!, 100, () => new JobNotFoundError(r.jobId!));
+    await s.chat.tick();
+    assert.match(s.store.read(t.id).lastFailure?.message ?? "", /can no longer be read/);
+  }),
+);
+
+test(
+  "C-I2: a stale claim is not expired on the first tick while a manifest that could be its job is unreadable",
+  withSetup(async (s) => {
+    const t = s.chat.newThread();
+    claimed(s, t.id, 200_000);
+    const day = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+    writeFiles(s.batch.registry.root, { [`B-${day}-ZZZZ/manifest.json`]: "{ half-written" });
+    await s.chat.tick();
+    assert.ok(s.store.read(t.id).pending, "kept while the unreadable manifest might be its job");
+    for (let i = 0; i < 10 && s.store.read(t.id).pending; i++) await s.chat.tick();
+    assert.match(s.store.read(t.id).lastFailure?.message ?? "", /never submitted/);
+  }),
+);
+
+test(
+  "C-I2: a transient read error on a compaction job leaves the compaction claim intact",
+  withSetup(async (s) => {
+    const t = s.chat.newThread();
+    const job = await s.batch.createChatJob({ threadId: t.id, purpose: "compact", throughSeq: 2, model: "m/x", account: "openrouter", main: [{ role: "user", content: "summarise" }] });
+    s.store.update(t.id, (th) => {
+      th.compacting = { throughSeq: 2, claimedAt: agoIso(1000), jobId: job.localId };
+    });
+    failReads(s, job.localId, 1, () => new CorruptManifestError(job.localId, "EPERM: operation not permitted"));
+    await s.chat.tick();
+    assert.equal(s.store.read(t.id).compacting?.jobId, job.localId);
+    assert.equal(entries(s, t.id).some((e) => e.type === "failure"), false);
   }),
 );

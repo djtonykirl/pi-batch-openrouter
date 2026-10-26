@@ -8,6 +8,7 @@ import { nullLogger, type Logger } from "../logger.js";
 import { normalizeBatchModelSlug } from "../models.js";
 import type { BatchService } from "../service.js";
 import { TERMINAL_STATUSES } from "../state.js";
+import { JobNotFoundError } from "../registry.js";
 import { isoToEpochMs, nowIso } from "../time.js";
 import type { JobManifest } from "../types.js";
 import {
@@ -38,6 +39,8 @@ export function staleClaimMs(config: BatchConfig): number {
   return Math.max(MIN_STALE_CLAIM_MS, config.polling.requestTimeoutSeconds * 1000 + STALE_CLAIM_MARGIN_MS);
 }
 
+/** Consecutive poller ticks a job manifest may fail to read (Windows EBUSY/EPERM) before a turn is failed. */
+const READ_FAILURE_TICKS = 5;
 /** Lock wait for updates no user is waiting on (settling, recording a job ID or a failure). */
 const BACKGROUND_LOCK_WAIT_MS = 10_000;
 
@@ -100,6 +103,8 @@ function errorMessage(err: unknown): string {
  */
 export class ChatService {
   private readonly logger: Logger;
+  /** Consecutive transient read failures per job ID (or claim key). In memory only: a restart starts over. */
+  private readonly readFailures = new Map<string, number>();
 
   constructor(private readonly deps: ChatServiceDeps) {
     this.logger = deps.logger ?? nullLogger;
@@ -390,26 +395,69 @@ export class ChatService {
   /**
    * The chat job a claim created, if there is one: same thread, purpose and `throughSeq`, created at or after the
    * claim. A claim whose job exists must never be expired as "never submitted": that job may be live and billed.
+   * `uncertain`: a manifest from the claim's day or later could not be read, so the job may exist but be hidden.
    */
-  private claimJob(threadId: string, purpose: "turn" | "compact", claim: Pending | Compacting): JobManifest | undefined {
+  private claimJob(threadId: string, purpose: "turn" | "compact", claim: Pending | Compacting): { job?: JobManifest; uncertain: boolean } {
     const since = isoToEpochMs(claim.claimedAt);
-    return this.deps.batch.registry
-      .list()
-      .jobs.filter((j) => j.chat?.threadId === threadId && j.chat.purpose === purpose && j.chat.throughSeq === claim.throughSeq && isoToEpochMs(j.createdAt) >= since)
+    const { jobs, unreadable } = this.deps.batch.registry.list();
+    const job = jobs
+      .filter((j) => j.chat?.threadId === threadId && j.chat.purpose === purpose && j.chat.throughSeq === claim.throughSeq && isoToEpochMs(j.createdAt) >= since)
       .sort((a, b) => isoToEpochMs(a.createdAt) - isoToEpochMs(b.createdAt))[0];
+    const claimDay = claim.claimedAt.slice(0, 10).replace(/-/g, "");
+    const uncertain = unreadable.some((u) => (/^B-(\d{8})-/.exec(u.localId)?.[1] ?? "") >= claimDay);
+    return { job, uncertain };
   }
 
   /**
-   * A stale claim with no job ID: adopts the job it created if one exists (returns the claim as linked), otherwise
-   * returns undefined and the caller expires it.
+   * A stale claim with no job ID. Adopts the job it created if one exists (`adopted`: the claim as linked). `expire`
+   * is true only when no such job exists, so the caller may record "never submitted". While a manifest that could be
+   * that job is unreadable, expiry waits up to READ_FAILURE_TICKS ticks.
    */
-  private adoptStale(threadId: string, purpose: "turn" | "compact", claim: Pending | Compacting): { adopted?: Pending | Compacting; found: boolean } {
-    const job = this.claimJob(threadId, purpose, claim);
-    if (!job) return { found: false };
+  private adoptStale(threadId: string, purpose: "turn" | "compact", claim: Pending | Compacting): { adopted?: Pending | Compacting; expire: boolean } {
+    const { job, uncertain } = this.claimJob(threadId, purpose, claim);
+    const key = `claim:${threadId}:${purpose}:${claim.claimedAt}`;
+    if (!job) {
+      if (uncertain && this.transientFailure(key) < READ_FAILURE_TICKS) {
+        this.logger.log("warn", "chat_claim_expiry_deferred", { threadId, purpose, reason: "unreadable manifests" });
+        return { expire: false };
+      }
+      this.readFailures.delete(key);
+      return { expire: true };
+    }
+    this.readFailures.delete(key);
     const { linked } = this.linkClaim(threadId, purpose, claim, job.localId);
-    if (!linked) return { found: true };
+    if (!linked) return { expire: false };
     this.logger.log("warn", "chat_claim_adopted", { threadId, purpose, localId: job.localId });
-    return { found: true, adopted: { ...claim, jobId: job.localId } };
+    return { expire: false, adopted: { ...claim, jobId: job.localId } };
+  }
+
+  /** Counts one more consecutive transient failure for `key` (in memory only) and returns the count. */
+  private transientFailure(key: string): number {
+    const n = (this.readFailures.get(key) ?? 0) + 1;
+    this.readFailures.set(key, n);
+    return n;
+  }
+
+  /**
+   * Reads a linked job for the tick. A missing job is a failure at once; any other read error (Windows EBUSY/EPERM
+   * surface as CorruptManifestError) is retried on later ticks, and only becomes a failure after READ_FAILURE_TICKS
+   * consecutive ticks. Returns `failure` when the caller should record one.
+   */
+  private readLinkedJob(threadId: string, jobId: string): { job?: JobManifest; failure?: string } {
+    try {
+      const job = this.deps.batch.registry.read(jobId);
+      this.readFailures.delete(jobId);
+      return { job };
+    } catch (err) {
+      if (err instanceof JobNotFoundError) return { failure: errorMessage(err) };
+      const n = this.transientFailure(jobId);
+      if (n >= READ_FAILURE_TICKS) {
+        this.readFailures.delete(jobId);
+        return { failure: `${errorMessage(err)}; failed on ${n} consecutive checks` };
+      }
+      this.logger.log("warn", "chat_job_read_retry", { threadId, localId: jobId, attempt: n, error: errorMessage(err) });
+      return {};
+    }
   }
 
   /**
@@ -652,7 +700,7 @@ export class ChatService {
     if (c && !c.jobId && isStale(c)) {
       const r = this.adoptStale(thread.id, "compact", c);
       if (r.adopted) c = r.adopted;
-      else if (!r.found) {
+      else if (r.expire) {
         this.recordCompactionFailure(thread.id, c, "The compaction was never submitted (Pi stopped while sending it). The thread is unchanged.");
       }
     }
@@ -660,24 +708,16 @@ export class ChatService {
     if (p && !p.jobId && isStale(p)) {
       const r = this.adoptStale(thread.id, "turn", p);
       if (r.adopted) p = r.adopted;
-      else if (!r.found) this.recordFailure(thread.id, p, "The turn was never submitted (Pi stopped while sending it). Use /batch chat retry.");
+      else if (r.expire) this.recordFailure(thread.id, p, "The turn was never submitted (Pi stopped while sending it). Use /batch chat retry.");
     }
     if (c?.jobId) {
-      let job: JobManifest | undefined;
-      try {
-        job = this.deps.batch.registry.read(c.jobId);
-      } catch (err) {
-        this.recordCompactionFailure(thread.id, c, `The compaction job ${c.jobId} can no longer be read (${errorMessage(err)}). The thread is unchanged.`, c.jobId);
-      }
+      const { job, failure } = this.readLinkedJob(thread.id, c.jobId);
+      if (failure) this.recordCompactionFailure(thread.id, c, `The compaction job ${c.jobId} can no longer be read (${failure}). The thread is unchanged.`, c.jobId);
       if (job && TERMINAL_STATUSES.has(job.localStatus)) this.settleCompaction(job);
     }
     if (p?.jobId) {
-      let job: JobManifest | undefined;
-      try {
-        job = this.deps.batch.registry.read(p.jobId);
-      } catch (err) {
-        this.recordFailure(thread.id, p, `The reply job ${p.jobId} can no longer be read (${errorMessage(err)}). Use /batch chat retry.`, p.jobId);
-      }
+      const { job, failure } = this.readLinkedJob(thread.id, p.jobId);
+      if (failure) this.recordFailure(thread.id, p, `The reply job ${p.jobId} can no longer be read (${failure}). Use /batch chat retry.`, p.jobId);
       if (job && TERMINAL_STATUSES.has(job.localStatus)) this.settle(job);
     }
     // A reply settled here starts automatic compaction too (settle calls afterReply).
