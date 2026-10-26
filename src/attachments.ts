@@ -1,6 +1,5 @@
 import * as path from "node:path";
 import * as zlib from "node:zlib";
-import { PDFDocument } from "pdf-lib";
 import type { BatchConfig } from "./config.js";
 import { buildContextPackage, heading, isProbablyBinary } from "./context/package.js";
 import { formatSecretFindings, scanForSecrets, type SecretFinding } from "./context/secrets.js";
@@ -131,6 +130,13 @@ export async function extractPdfText(buf: Buffer): Promise<{ ok: true; pages: nu
   }
   let pageCount = 0;
   const metaParts: string[] = [];
+  // Loaded on first use: if the package is missing, only PDF handling is affected, never the whole extension.
+  let PDFDocument: typeof import("pdf-lib").PDFDocument;
+  try {
+    ({ PDFDocument } = await import("pdf-lib"));
+  } catch (err) {
+    return { ok: false, message: `PDF support is unavailable (could not load pdf-lib: ${(err as Error).message})` };
+  }
   try {
     const doc = await PDFDocument.load(buf, { ignoreEncryption: true, updateMetadata: false });
     pageCount = doc.getPageCount();
