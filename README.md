@@ -67,7 +67,8 @@ The API key comes from Pi's model registry/`auth.json` for the selected account 
 | `/batch export <id> --format jsonl\|csv [--out <path>] [--overwrite] [--job-only]` | Write a finished job's results with provenance to a file (see [Export](#export)). |
 | `/batch artifact <id> [--synthesis\|--item <sel>] --format markdown\|html\|pdf\|text [--template <name>] [--out <path>] [--overwrite] [--allow-partial]` | Write a controlled file from validated results (see [Artifacts](#artifacts)). |
 | `/artifact list [--job <id>]` · `show <id>` · `render <file.md> --format html\|pdf` · `regenerate <id>` · `templates` | Inspect artifacts, render Pi/user-edited Markdown, re-render without a model call, list templates. |
-| `/batch metadata plan --context <context.md> --input <tables.jsonl> [--preview]` · `summary` · `review` · `approved` · `validate-approved` | Databricks table descriptions and column comments: proposals, review and a handoff file (see [Databricks metadata enrichment](#databricks-metadata-enrichment-phase-1)). |
+| `/batch metadata plan --context <context.md> --input <tables.jsonl> [--domain <slug> --uc-prefix <PREFIX>] [--preview]` · `summary` · `review` · `approved` · `validate-approved` | Databricks table descriptions and column comments: proposals, review and a handoff file (see [Databricks metadata enrichment](#databricks-metadata-enrichment-phase-1) and [UC metadata standards mode](#uc-metadata-standards-mode)). |
+| `/batch [--global] privacy [standard\|no-training\|zdr\|attest\|unattest\|refresh]` | Show or set the project privacy level, record or clear the no-training attestation, or reload the model catalog (see [Privacy levels and free models](#privacy-levels-and-free-models)). |
 | `/batch chat [continue\|resume\|clear\|rename\|model\|compact\|context\|cost\|export\|retry\|off\|help]` | Chat with a batch model; replies arrive when the batch completes (see [Batch chat](#batch-chat)). |
 | `/batch web [--port n] [stop]` | Local web UI on 127.0.0.1 with a one-time sign-in link (see [Web UI](#web-ui-batch-web)). |
 | `/batch import-legacy <jobs.json> --preview` | Read-only inventory of pre-Release-1 jobs (see [Known limitations](#known-limitations)). |
@@ -112,6 +113,106 @@ If the injected text would exceed `injection.maxCharacters` (default 30,000), no
 
 - `--summary` injects a bounded, explicitly marked **excerpt**. This is the start of the result, not a model-generated summary.
 - `--full` injects everything.
+
+## Privacy levels and free models
+
+Each project has a privacy level. It only ever **tightens what this extension sends**; it does not change your
+OpenRouter account settings.
+
+| Level | Meaning | Batch jobs | Immediate requests (free models) |
+|---|---|---|---|
+| `standard` (default) | No extra restriction. Batch request bodies are byte-identical to earlier versions. | No privacy fields added. | No privacy fields added. |
+| `no-training` | Providers must not train on your data. | Allowed only after you attest (below). | `provider: { data_collection: "deny" }` |
+| `zdr` | Zero data retention providers only. | Pinned to the model's ZDR endpoints (see below). | `provider: { zdr: true }` |
+
+```
+/batch privacy                      show the level, attestation and catalog state
+/batch privacy zdr                  set this project's level (--global for every project)
+/batch chat privacy no-training     raise one chat thread (never below the project level)
+```
+
+The effective level of a job or thread is the **stricter** of the thread and the project. Lowering the project level
+later does not lower an existing thread. The extension never sends anything less strict than the effective level.
+
+### What is enforced per route
+
+- **Batch route.** The Batch API accepts only `provider.only` and `provider.allow_fallbacks`, so the extension never
+  adds `data_collection` or `zdr` to a batch body.
+  - At `no-training`, batch jobs are refused unless `privacy.accountNoTraining` is true.
+  - At `zdr`, the job is pinned with `provider.only` set to the **full ZDR endpoint tags** from
+    `/api/v1/endpoints/zdr` for that model (for example `azure/eu`), not base provider slugs, plus
+    `allow_fallbacks: false`. It is refused when the model has no ZDR endpoint, when your own `--provider` pin has none
+    in the ZDR list, or when the catalog was not loaded successfully this session.
+- **Immediate route.** Models with the `:free` suffix run through `POST /chat/completions` and carry the
+  `data_collection` or `zdr` field above.
+- Refusals read `Privacy level <level>: <reason>` and nothing is sent.
+- **Model names** are normalised before any catalog lookup by stripping `:batch` and `:free`.
+- **Stale previews.** Submitting a previewed job is refused if the project level has been raised above the level the job
+  was prepared at. Recreate the job.
+- **Retries** keep their source job's level (the stricter of the source and the project).
+- Metadata, map-files, dataset and synthesis jobs go through the same enforcement point as any other job.
+
+### Attestation
+
+OpenRouter's account-level privacy settings control whether providers may train on your data, and the extension cannot
+read them. `/batch privacy attest` (or the web attest control) records that **you** confirm your account disables
+training, and stores `privacy.accountNoTraining: true` with `privacy.attestedAt`. The extension cannot verify it.
+`/batch privacy unattest` clears both.
+
+### Account settings the extension cannot see
+
+These are yours to set at OpenRouter, and the extension never checks them:
+- [Privacy settings](https://openrouter.ai/settings/privacy): logging, and the use of inputs and outputs for training.
+- The training settings for free and paid models (same page).
+
+A one-time notice repeats this the first time you raise a project above `standard`.
+
+### Remote deletion and retention
+
+OpenRouter keeps batch results for 30 days unless you delete them. At `no-training` and `zdr`
+(`privacy.deleteRemoteBatches`, default `true`), a finished batch is deleted at OpenRouter with `DELETE /batches/{id}`
+**after** its raw final response is saved locally.
+- The decision uses **each job's own recorded level**, never the current config. A job made at `standard` is never
+  deleted remotely, even if the project is raised later.
+- Deletion is attempted after each poll. After 10 failed attempts the job's remote deletion is marked `failed` and
+  reported; delete the batch yourself.
+- Local files are unaffected.
+
+### Model catalog
+
+The extension loads `/api/v1/models` and `/api/v1/endpoints/zdr` once on every Pi `session_start`, web server start
+and web workspace switch. Loads are deduplicated. A last-known copy is kept on disk **for display only**: a catalog read
+from disk is never used to authorise a `zdr` send. If the load fails, `zdr` batch sends are refused until
+`/batch privacy refresh` (or `/batch chat model --refresh`, or the web "Refresh models" button) succeeds; no restart is
+needed. The model picker labels models `batch`, `free` and `ZDR`, and hides the ones the level rules out.
+
+### Free models
+
+Models ending in `:free` run immediately, not as a batch. They work **only in batch chat** (`/batch chat`):
+`/batch ask`, map-files, datasets, metadata and synthesis refuse them with "Free models run only in batch chat
+(/batch chat); /batch ask and workflows need a batch model". Each chat turn is still a job and settles through the
+usual retrieval path.
+- **Per-minute 429:** the request is rescheduled using `Retry-After`, or with exponential backoff capped at 15 minutes.
+- **Daily 429:** the job fails with "Free-model daily limit reached; try later or switch model".
+- **Crashes:** an immediate request is never sent twice. If the outcome is unknown after a crash, the job becomes
+  `submission_unknown` and you decide whether to retry.
+
+### Probe script
+
+`scripts/privacy-probe.mjs` checks live that the Batch API accepts the privacy-related `provider` fields. **It
+submits real batches and bills your account**, so you run it yourself:
+
+```
+node scripts/privacy-probe.mjs <model> [--account <alias>]
+```
+
+It reads the key like the standalone web server (the account's entry in `~/.pi/agent/auth.json`, or
+`OPENROUTER_API_KEY` for the default account), prints a cost note, and requires typing `yes`. It submits up to three
+one-request batches (`max_tokens: 1`, content "ping") and reports `ACCEPTED` or `REJECTED (<status>: <detail>)` for
+`provider: { data_collection: "deny" }`, `provider: { zdr: true }`, and `provider: { only: [<first ZDR endpoint tag>],
+allow_fallbacks: false }` (skipped if the model has no ZDR endpoint). Accepted batches cannot be cancelled, so their
+IDs are printed and the script polls for up to 10 minutes, then deletes them. Exit codes: 0 done, 1 usage error or no
+key, 2 not confirmed.
 
 ## Multi-request workflows
 
@@ -612,7 +713,8 @@ Chat mode is per Pi session and is off when Pi starts. Lines starting with `/` a
 | `/batch chat resume [thread]` | Pick a thread, or give an ID suffix or exact title. |
 | `/batch chat clear` | Start a fresh thread. The old one stays resumable. |
 | `/batch chat rename <title>` · `rename --auto` | Rename the thread (this locks the title) · unlock auto-titling. |
-| `/batch chat model [slug]` | Change the model from the next message on. No slug opens a picker. |
+| `/batch chat model [slug] [--refresh]` | Change the model from the next message on. No slug opens a picker. `--refresh` reloads the model catalog first. |
+| `/batch chat privacy <level>` | Raise this thread to `no-training` or `zdr`. It never goes below the project level. |
 | `/batch chat compact [focus]` | Summarise older messages now, with optional focus instructions. |
 | `/batch chat context` | Estimated size of the next request and distance to auto-compact. |
 | `/batch chat cost` | Usage and cost totals the provider reported for this thread. |
@@ -844,6 +946,60 @@ the prose is right.
                 "input_sha256": "…", "context_sha256": "…", "proposal_sha256": "…"}}
 ```
 
+### UC metadata standards mode
+
+Standards mode is **opt-in**. Give a plan both a domain slug and a Unity Catalog prefix (giving only one is an error):
+
+```
+/batch metadata plan --context metadata/pinpoint/context.md --input metadata/pinpoint/tables.jsonl \
+    --domain pinpoint --uc-prefix PIN_ --preview
+```
+
+`--domain` matches `^[a-z][a-z0-9_]*$`; `--uc-prefix` matches `^[A-Z0-9]+_$`. Without them, requests, proposals, review
+and `approved.jsonl` are unchanged. Standards jobs record `version: 2` and `standards: { domain, ucPrefix }`; earlier
+jobs keep working. The web UI's **UC Metadata** studio tab offers the same options plus the review and handoff actions.
+A table whose name does not start with the prefix, or whose schema has no `bronze`/`silver`/`gold` layer, blocks the
+plan and is listed.
+
+**Description and comment rules.**
+- A table description has the lines `GRAIN:`, `PURPOSE:`, `SOURCE:`, `REFRESH:`, `OWNER:` and `CLASSIFICATION:`, in
+  that order, and is at least 30 characters. Use a team name on the `OWNER:` line: an email address there is flagged as
+  PII by the checks.
+- A column comment is a plain-English definition line, then `TYPE:` (`Dimension`, `Measure`, `Key`, `Flag` or
+  `Timestamp`), `VALUES:`, `SYNONYMS:` and `NULL MEANS:`, with optional `UNIT:`, `FORMULA:` and `JOIN:`. It is at
+  least 30 characters.
+
+**Tags.**
+- Table tags are exactly `classification` (`public|internal|confidential|restricted|pii_scan_required`), `data_domain`,
+  `uc_prefix`, `medallion_layer` (`bronze|silver|gold`) and `pii` (`true|false`).
+- The model proposes **only** `classification` and the column PII tags. Pi derives `data_domain`, `uc_prefix`,
+  `medallion_layer` (from the schema name) and the table `pii` (`true` if and only if some column is PII).
+- **Sparse PII column tags.** A column carries either no tags or exactly `pii: "true"` with `pii_type` (`email`,
+  `phone`, `ssn`, `name`, `address`, `dob`, `ip_address`, `device_id`, `financial`, `health`, `biometric`,
+  `location`), `sensitivity` (`low|medium|high`) and `requires_masking` (`true|false`). `pii: "false"` is never
+  emitted. A PII column in a `public` table, or a column with `pii: "false"`, makes the item `corrupt` and retryable.
+
+**Audit columns.** `fw_pipelinerowchecksum`, `fw_ingestdate` and `pipeline_timestamp` (any case) are never sent to the
+model, and their approved values are their existing values. The Lighthouse applier assigns their standard definitions.
+
+**The draft rule.** In standards mode the `approved` draft keeps an existing value only if it passes the standards
+checks, and otherwise takes the proposal. The review marks such a value as replacing a non-standard one, and
+`validate-approved` reports any non-standard approved value. A valid existing PII tag is never dropped. A table with no
+proposal gets derived tags with classification `pii_scan_required` (or its existing taxonomy value). A description whose
+`CLASSIFICATION:` line conflicts with the tags is withheld (null) and marked. A null approved value (insufficient
+evidence) stays allowed; it is counted and listed.
+
+**Notebooks.** A `.ipynb` used as context or as an attachment has its outputs, execution counts, attachments, raw cells
+and metadata stripped before sending, so nothing from cell outputs reaches the provider. Standards mode refuses a
+`.ipynb` given as `--context` or `--input`.
+
+**Two-pass flow.** The TDD's Pass 1 (reverse-engineering the domain context) needs no new workflow: run `/batch ask`
+(or the studio **Goal** tab) over the scoped files, review the output into `<Domain>_context.md`, then use that as
+`--context` for Pass 2 above.
+
+**Privacy.** Tables that carry `sample_values` put real data in the request. The preview warns when that happens at
+`standard`; use `zdr` for such tables.
+
 ## What happens to your data
 
 - **Exclusions are applied before the request is built.** Evaluation order (the first match decides):
@@ -956,7 +1112,8 @@ Invalid values fall back to the default and are reported. Legacy keys (`defaultP
   "security": { "scanSecrets": true, "blockOnSecret": true, "allowOutsideWorkspace": false },
   "injection": { "maxCharacters": 30000, "includeObjective": true, "includeArtefactPaths": true },
   "submission": { "showPreview": true, "requireConfirmation": false },
-  "workflows": { "maxRequestsPerBatch": 100, "maxCharactersPerItem": 500000, "maxTotalCharacters": 5000000, "maxSynthesisCharacters": 1000000, "maxRowsPerRun": 1000, "maxDatasetBytes": 20000000 }
+  "workflows": { "maxRequestsPerBatch": 100, "maxCharactersPerItem": 500000, "maxTotalCharacters": 5000000, "maxSynthesisCharacters": 1000000, "maxRowsPerRun": 1000, "maxDatasetBytes": 20000000 },
+  "privacy": { "level": "standard", "accountNoTraining": false, "deleteRemoteBatches": true, "noticeShown": false }
 }
 ```
 
@@ -965,6 +1122,8 @@ payload limit and no maximum request count. Setting `excludePatterns` replaces t
 `workflows` section is optional; Release 1 configuration files keep working unchanged. For dataset workflows,
 `maxRowsPerRun` caps the selected rows (each row is one request) and `maxDatasetBytes` the dataset file size.
 A workflow's own `limits` can only lower these.
+
+The `privacy` section is described in [Privacy levels and free models](#privacy-levels-and-free-models). `/batch privacy attest` also writes `privacy.attestedAt` (an ISO time) next to `accountNoTraining`.
 
 ## LLM tools
 
