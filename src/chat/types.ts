@@ -1,4 +1,5 @@
 import type { ChatAttachmentMeta } from "../attachments.js";
+import type { PrivacyLevel, Route } from "../privacy/policy.js";
 import type { ChatContentPart, ProviderPin } from "../openrouter/types.js";
 
 export interface ThreadState {
@@ -10,6 +11,10 @@ export interface ThreadState {
   model: string;
   account: string;
   providerPin?: ProviderPin;
+  /** Raises (never lowers) the project privacy level for this thread. */
+  privacyLevel?: PrivacyLevel;
+  /** Set by the model picker; absent means derived from the model ID. */
+  route?: Route;
   createdAt: string;
   updatedAt: string;
   nextSeq: number;

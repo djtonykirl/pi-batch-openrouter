@@ -4,6 +4,7 @@ import { parseArgs } from "../args.js";
 import { showText } from "../commands.js";
 import { isInside, writeFileAtomicExclusive } from "../fsutil.js";
 import { discoverBatchModels } from "../models.js";
+import { isPrivacyLevel, PRIVACY_LEVELS } from "../privacy/policy.js";
 import type { BatchRuntime } from "../runtime.js";
 import type { JobManifest } from "../types.js";
 import { conversationOrder } from "./request.js";
@@ -21,7 +22,8 @@ export const CHAT_HELP = `/batch chat — chat with a model at batch prices (rep
   chat clear                start a fresh thread (the old one stays resumable)
   chat rename <title>       rename the thread (locks the title); rename --auto unlocks auto-titling
   chat model [slug]         change the model from the next message on (no slug: picker)
-  chat compact [focus]      summarise older messages now; optional focus instructions
+  chat privacy <level>      raise this thread to no-training or zdr (never below the project level)
+  chat compact [focus]     summarise older messages now; optional focus instructions
   chat context              estimated size of the next request and distance to auto-compact
   chat cost                 usage and cost totals the provider reported for this thread
   chat export [file] [--overwrite]
@@ -35,13 +37,14 @@ export const CHAT_HELP = `/batch chat — chat with a model at batch prices (rep
 
 Chat mode is per Pi session and is off when Pi starts. Lines starting with / are always commands.`;
 
-export function formatContext(e: ReturnType<ChatService["nextRequestEstimate"]>): string {
+export function formatContext(e: ReturnType<ChatService["nextRequestEstimate"]>, retention?: string): string {
   const pct = e.limit > 0 ? Math.round((e.tokens / e.limit) * 100) : 0;
   return [
     `Next request: about ${e.tokens} tokens (estimate: characters / 4)`,
     `  Summary of earlier conversation: ${e.summaryTokens} tokens`,
     `  Recent messages and prompt:      ${e.recentTokens} tokens`,
     `Auto-compact limit: ${e.limit} tokens (${pct}% of auto-compact limit used)`,
+    ...(retention ? [retention] : []),
   ].join("\n");
 }
 
@@ -208,9 +211,22 @@ export async function cmdChat(rt: BatchRuntime, rest: string[], ctx: ExtensionCo
       const id = activeThread(rt);
       const slug = args.join(" ").trim() || (await pickModel(rt, ctx));
       if (!slug) return;
-      rt.requireChat().setModel(id, slug);
+      await rt.requireChat().setModel(id, slug);
       rt.requireChatSession().sync();
       rt.notify(`Chat model set to ${slug} from the next message on.`, "info");
+      return;
+    }
+    case "privacy": {
+      const id = activeThread(rt);
+      const level = args.join(" ").trim();
+      if (!level) {
+        rt.notify(`Privacy level for this thread: ${rt.requireChat().effectiveLevel(id)}. Usage: /batch chat privacy ${PRIVACY_LEVELS.join("|")}`, "info");
+        return;
+      }
+      if (!isPrivacyLevel(level)) throw new Error(`Usage: /batch chat privacy ${PRIVACY_LEVELS.join("|")}`);
+      rt.requireChat().raisePrivacy(id, level);
+      rt.requireChatSession().sync();
+      rt.notify(`Privacy level for this thread raised to ${level}.`, "info");
       return;
     }
     case "compact": {
@@ -223,7 +239,7 @@ export async function cmdChat(rt: BatchRuntime, rest: string[], ctx: ExtensionCo
     }
     case "context": {
       const id = activeThread(rt);
-      await showText(rt, ctx, "Chat context", formatContext(rt.requireChat().nextRequestEstimate(id)));
+      await showText(rt, ctx, "Chat context", formatContext(rt.requireChat().nextRequestEstimate(id), rt.requireChat().batchRetentionLine(id)));
       return;
     }
     case "cost": {

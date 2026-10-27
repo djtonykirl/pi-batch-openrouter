@@ -1,4 +1,5 @@
 import type { BatchConfig } from "../config.js";
+import { routeForModel } from "../privacy/policy.js";
 import { ChatBlockedError, SUBMISSION_UNKNOWN, type ChatService } from "./service.js";
 import { ThreadBusyError, type ThreadStore } from "./store.js";
 import type { ThreadState, TranscriptEntry } from "./types.js";
@@ -144,6 +145,9 @@ export class ChatSession {
       const t = this.deps.store.read(this.active);
       const title = t.title.replace(/\s+/g, " ").trim().slice(0, FOOTER_TITLE_MAX);
       let line = `💬 ${title} · ${t.model}`;
+      const level = this.deps.chat.effectiveLevel(this.active);
+      if (level !== "standard") line += ` · 🔒 ${level === "zdr" ? "zdr" : "no-train"}`;
+      if ((t.route ?? routeForModel(t.model)) === "immediate") line += " · free";
       if (t.pending) line += " · waiting";
       if (t.compacting) line += " · compacting";
       const { tokens, limit } = this.deps.chat.nextRequestEstimate(this.active);

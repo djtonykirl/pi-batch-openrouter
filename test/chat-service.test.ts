@@ -190,7 +190,7 @@ test(
     const t = s.chat.newThread();
     const x = t.model;
     const r = await s.chat.send(t.id, "first");
-    s.chat.setModel(t.id, "y/model:batch");
+    await s.chat.setModel(t.id, "y/model:batch");
     assert.equal(s.store.read(t.id).model, "y/model");
     const job = await settle(s, r.jobId!, (c) => [successItem(c[0]!, "reply")]);
     s.chat.applySettled(job);
@@ -426,7 +426,7 @@ test("a free-model reply that settles inside submit is in the transcript when se
     const store = new ThreadStore(join(root, ".pi/batches/threads"));
     chat = new ChatService({ store, batch, workspaceRoot: root, getConfig: () => cfg });
     const t = chat.newThread();
-    chat.setModel(t.id, "meta/llama-free:free");
+    await chat.setModel(t.id, "meta/llama-free:free");
 
     const r = await chat.send(t.id, "hello");
     assert.equal(r.queued, false);

@@ -6,6 +6,15 @@ import { formatSecretFindings, scanForSecrets } from "../context/secrets.js";
 import { isUsable, itemText, jobItems } from "../items.js";
 import { nullLogger, type Logger } from "../logger.js";
 import { normalizeBatchModelSlug } from "../models.js";
+import {
+  effectiveLevel as effectiveLevelOf,
+  normaliseModelSlug,
+  PRIVACY_LEVELS,
+  resolveBatchProvider,
+  routeForModel,
+  type PrivacyLevel,
+  type Route,
+} from "../privacy/policy.js";
 import type { BatchService } from "../service.js";
 import { TERMINAL_STATUSES } from "../state.js";
 import { JobNotFoundError } from "../registry.js";
@@ -251,14 +260,61 @@ export class ChatService {
     return r.jobId;
   }
 
-  /** Changes the model from the next turn on. A reply already pending keeps the model it was sent with. */
-  public setModel(threadId: string, slug: string): void {
+  /** The stricter of the project level and the thread's own level. */
+  public effectiveLevel(threadId: string): PrivacyLevel {
+    return effectiveLevelOf(this.deps.getConfig().privacy.level, this.store.read(threadId).privacyLevel);
+  }
+
+  /** Raises the thread's level. Only a level stricter than both the thread's and the project's is accepted. */
+  public raisePrivacy(threadId: string, level: PrivacyLevel): void {
+    if (!PRIVACY_LEVELS.includes(level)) throw new Error(`Unknown privacy level "${level}". Use ${PRIVACY_LEVELS.join(", ")}.`);
+    const project = this.deps.getConfig().privacy.level;
+    this.store.update(threadId, (t, append) => {
+      const current = effectiveLevelOf(project, t.privacyLevel);
+      if (PRIVACY_LEVELS.indexOf(level) <= PRIVACY_LEVELS.indexOf(current)) {
+        throw new Error("Privacy level: can't lower a thread below the project level");
+      }
+      t.privacyLevel = level;
+      append({ type: "status", text: `Privacy level for this thread raised to ${level}.` });
+    });
+  }
+
+  /** The batch-retention line for `/batch chat context`. */
+  public batchRetentionLine(threadId: string): string {
+    const strict = this.effectiveLevel(threadId) !== "standard";
+    return strict && this.deps.getConfig().privacy.deleteRemoteBatches
+      ? "Batch jobs are held at OpenRouter until finished; deleted after retrieval"
+      : "Batch jobs are kept up to 30 days";
+  }
+
+  /**
+   * Changes the model from the next turn on. A reply already pending keeps the model it was sent with. The model is
+   * checked against the effective privacy level first; the refusal reason is thrown.
+   */
+  public async setModel(threadId: string, slug: string, opts: { route?: Route } = {}): Promise<void> {
     const to = normalizeBatchModelSlug(slug.trim());
     if (!to) throw new Error("Model slug is empty.");
+    const route = routeForModel(to, opts.route);
+    const config = this.deps.getConfig();
+    const thread = this.store.read(threadId);
+    const level = effectiveLevelOf(config.privacy.level, thread.privacyLevel);
+    const catalog = level === "zdr" ? await this.deps.batch.catalog?.whenLoaded(config.polling.requestTimeoutSeconds * 1000) : undefined;
+    if (route === "batch") {
+      const d = resolveBatchProvider({ level, model: to, userPin: thread.providerPin, catalog, accountNoTraining: config.privacy.accountNoTraining });
+      if (!d.ok) throw new Error(d.reason);
+    } else if (level === "zdr") {
+      const base = normaliseModelSlug(to);
+      if (!catalog?.fresh) {
+        throw new Error("Privacy level zdr: model catalog not loaded this session, so ZDR endpoints can't be verified (run /batch privacy refresh)");
+      }
+      if (!catalog.zdr.some((e) => e.model === base)) throw new Error(`Privacy level zdr: no ZDR endpoint available for ${base}`);
+    }
     this.store.update(threadId, (t, append) => {
-      if (t.model === to) return;
-      append({ type: "model", from: t.model, to });
-      t.model = to;
+      if (t.model !== to) {
+        append({ type: "model", from: t.model, to });
+        t.model = to;
+      }
+      t.route = route;
     });
   }
 
@@ -374,6 +430,8 @@ export class ChatService {
         throughSeq: claim.throughSeq,
         model: thread.model,
         account: thread.account,
+        route: thread.route ?? routeForModel(thread.model),
+        privacyLevel: effectiveLevelOf(this.deps.getConfig().privacy.level, thread.privacyLevel),
         ...(thread.providerPin ? { pin: thread.providerPin } : {}),
         main: buildTurnMessages(thread, entries, claim.throughSeq, prompt),
         ...(retitle ? { title: buildTitleMessages(thread, entries, claim.throughSeq) } : {}),
@@ -676,6 +734,8 @@ export class ChatService {
         throughSeq: claim.throughSeq,
         model: thread.model,
         account: thread.account,
+        route: thread.route ?? routeForModel(thread.model),
+        privacyLevel: effectiveLevelOf(this.deps.getConfig().privacy.level, thread.privacyLevel),
         ...(thread.providerPin ? { pin: thread.providerPin } : {}),
         main: buildCompactionMessages(thread, entries, claim.throughSeq, prompt, claim.instructions),
         ...(!thread.titleLocked ? { title: buildTitleMessages(thread, entries, Number.MAX_SAFE_INTEGER) } : {}),

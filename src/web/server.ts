@@ -845,7 +845,7 @@ export class BatchWebServer {
       if (method === "POST" && pathname === "/api/threads") {
         const body = await this.readJson<{ model?: string; title?: string }>(req);
         const thread = this.deps.chat.newThread();
-        if (body.model?.trim()) this.deps.chat.setModel(thread.id, body.model.trim());
+        if (body.model?.trim()) await this.deps.chat.setModel(thread.id, body.model.trim());
         if (body.title?.trim()) this.deps.chat.rename(thread.id, body.title.trim());
         this.broadcast({ type: "thread_created", threadId: thread.id });
         this.sendJson(res, 201, { thread: this.deps.chatStore.read(thread.id) });
@@ -905,7 +905,7 @@ export class BatchWebServer {
 
         if (method === "POST" && action === "model") {
           const body = await this.readJson<{ model: string }>(req);
-          this.deps.chat.setModel(threadId, body.model ?? "");
+          await this.deps.chat.setModel(threadId, body.model ?? "");
           this.broadcast({ type: "thread_updated", threadId });
           this.sendJson(res, 200, { thread: this.deps.chatStore.read(threadId) });
           return;

@@ -307,6 +307,10 @@ export class BatchService {
     return this.deps.registry;
   }
 
+  public get catalog(): ModelCatalog | undefined {
+    return this.deps.catalog;
+  }
+
   public get workspaceRoot(): string {
     return this.deps.workspaceRoot;
   }
