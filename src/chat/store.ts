@@ -78,6 +78,11 @@ export class ThreadStore {
   }
 
   /** Most recently updated first. Unreadable threads are skipped. */
+  /** Deletes a thread directory. Only for rolling back a thread that was just created and never used. */
+  public remove(id: string): void {
+    fs.rmSync(this.dir(id), { recursive: true, force: true });
+  }
+
   public list(): ThreadState[] {
     if (!fs.existsSync(this.root)) return [];
     const out: ThreadState[] = [];

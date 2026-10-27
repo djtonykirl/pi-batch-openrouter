@@ -577,6 +577,12 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
           <label style="font-size:12px; color:var(--text-muted);">Model:</label>
           <input type="text" id="chatModelInput" list="knownModelsList" style="width:220px; font-family:var(--mono); font-size:12px;">
           <button class="btn btn-sm" id="setChatModelBtn">Set</button>
+          <span class="badge-pill" id="chatPrivacyBadge" style="display:none;"></span>
+          <select id="threadPrivacyLevel" title="Raise this thread's privacy level. Lowering is disabled: a thread cannot go below the project level or its own raised level." style="font-size:12px; padding:3px 6px;">
+            <option value="standard">standard</option>
+            <option value="no-training">no-training</option>
+            <option value="zdr">zdr</option>
+          </select>
           <div class="context-meter" title="Estimated next request size vs auto-compact threshold">
             <span id="contextMeterText">0 tok</span>
             <div class="meter-bar"><div class="meter-fill" id="contextMeterFill" style="width:0%"></div></div>
@@ -585,6 +591,15 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
           <button class="btn btn-sm" id="exportThreadBtn" title="Download Markdown transcript">⬇️ Export .md</button>
         </div>
       </div>
+
+      <div id="chatModelPickerBar" style="display:none; padding:6px 16px; gap:10px; align-items:center; flex-wrap:wrap; border-bottom:1px solid var(--border); font-size:12px;">
+        <label style="color:var(--text-muted);">Pick a model:</label>
+        <select id="chatModelPicker" style="max-width:320px; font-family:var(--mono); font-size:12px;"></select>
+        <label style="color:var(--text-muted); display:flex; align-items:center; gap:4px;"><input type="checkbox" id="show-blocked-toggle"> Show blocked</label>
+        <button class="btn btn-sm" id="refresh-models-chat" title="Reload the model list and ZDR providers from OpenRouter">Refresh models</button>
+        <span style="color:var(--text-muted);" id="chatCatalogState"></span>
+      </div>
+      <div id="chatModelAlert" style="padding:0 16px;"></div>
 
       <div class="chat-stream" id="chatStream">
         <div style="margin:auto; text-align:center; color:var(--text-muted);">
@@ -658,6 +673,39 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
             </div>
             <button class="btn btn-primary" id="openSwitchWorkspaceSettingsBtn">📁 Switch Workspace Folder…</button>
           </div>
+        </div>
+
+        <div class="msg-card">
+          <h3 style="margin-top:0;">🔒 Privacy</h3>
+          <p style="font-size:12px; color:var(--text-muted); margin-top:0;">
+            The level only tightens what this extension sends. OpenRouter's own logging and training settings are controlled in your account at
+            <a href="https://openrouter.ai/settings/privacy" target="_blank" rel="noopener noreferrer" style="color:#a5b4fc;">openrouter.ai/settings/privacy</a>; the extension cannot check them.
+          </p>
+          <div id="privacyNotice" style="display:none;"></div>
+          <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:12px;">
+            <label for="privacy-level-select" style="font-size:12px; color:var(--text-muted);">Project privacy level</label>
+            <select id="privacy-level-select">
+              <option value="standard">standard</option>
+              <option value="no-training">no-training</option>
+              <option value="zdr">zdr</option>
+            </select>
+            <span style="font-size:12px; color:var(--text-muted);" id="privacyLevelSource"></span>
+          </div>
+          <div style="border:1px solid var(--border); border-radius:8px; padding:10px 12px; margin-bottom:12px;">
+            <label style="display:flex; align-items:center; gap:8px; font-size:13px;">
+              <input type="checkbox" id="attest-privacy-chk"> My OpenRouter account disables training for these model groups
+            </label>
+            <div style="display:flex; align-items:center; gap:8px; margin-top:8px; flex-wrap:wrap;">
+              <button class="btn btn-sm btn-primary" id="attest-privacy-confirm" disabled>Confirm attestation</button>
+              <button class="btn btn-sm" id="attest-privacy-remove" style="display:none;">Remove attestation</button>
+              <span style="font-size:12px; color:var(--text-muted);" id="attestState"></span>
+            </div>
+          </div>
+          <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+            <button class="btn btn-sm" id="refresh-models-settings">Refresh models</button>
+            <span style="font-size:12px; color:var(--text-muted);" id="settingsCatalogState"></span>
+          </div>
+          <div id="privacyAlert" style="margin-top:10px;"></div>
         </div>
 
         <div class="msg-card">
@@ -925,6 +973,9 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
       chatAttachments: { files: [], contexts: [], uploads: [] },
       jobAttachments: { files: [], contexts: [], uploads: [] },
       jobStudioKind: "ask",
+      privacy: null,
+      picker: { entries: [], catalog: null, key: "" },
+      showBlocked: false,
     };
 
     function updateWorkspaceDisplay(rootPath) {
@@ -1183,6 +1234,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
 
       renderThreadList();
       renderJobList();
+      await loadPrivacy();
 
       if (!state.activeThreadId && state.threads.length > 0) {
         await selectThread(state.threads[0].id);
@@ -1222,6 +1274,10 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
             await bootstrap();
             if (state.activeTab === "workspace") await loadWorkspaceFiles();
             return;
+          }
+          if (payload.type === "privacy" || payload.type === "catalog") {
+            state.picker.key = "";
+            await loadPrivacy();
           }
           await refreshStateQuiet();
         } catch {}
@@ -1425,6 +1481,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
       if (document.activeElement !== document.getElementById("chatModelInput")) {
         document.getElementById("chatModelInput").value = detail.thread.model;
       }
+      renderThreadPrivacy(detail);
 
       const est = detail.estimate;
       const pct = est.limit > 0 ? Math.min(100, Math.round((est.tokens / est.limit) * 100)) : 0;
@@ -1695,9 +1752,11 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
           method: "POST",
           body: { model: slug },
         });
+        document.getElementById("chatModelAlert").innerHTML = "";
         showToast("Thread model updated to " + slug);
         await selectThread(state.activeThreadId, true);
       } catch (err) {
+        document.getElementById("chatModelAlert").innerHTML = '<div class="alert-box alert-danger">' + escapeHtml(err.message) + "</div>";
         showToast(err.message, "error");
       }
     });
@@ -2170,6 +2229,8 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         '<div class="kv-grid">' +
         '<div class="kv-label">Objective</div><div class="kv-val">' + escapeHtml(j.objective) + "</div>" +
         '<div class="kv-label">Model / Account</div><div class="kv-val">' + escapeHtml(j.model + " (" + j.account + ")") + "</div>" +
+        '<div class="kv-label">Privacy</div><div class="kv-val">' + escapeHtml(describeJobPrivacy(j)) + "</div>" +
+        '<div class="kv-label">Remote deletion</div><div class="kv-val">' + escapeHtml(describeRemoteDeletion(j)) + "</div>" +
         '<div class="kv-label">Provider Batch ID</div><div class="kv-val">' + escapeHtml(j.providerBatchId || "—") + "</div>" +
         '<div class="kv-label">Context / Requests</div><div class="kv-val">' + j.requestCount + " request(s) · " + j.context.fileCount + " file(s) · " + j.context.characters + " chars</div>" +
         '<div class="kv-label">Usage & Cost</div><div class="kv-val">' +
@@ -2418,6 +2479,208 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
       } catch (err) {
         alertEl.innerHTML = '<div class="alert-box alert-danger">' + escapeHtml(err.message) + "</div>";
       }
+    });
+
+    // ---------------- Privacy, model catalog and picker ----------------
+    // Display and requests only: the server re-checks every level, model and route before anything is sent.
+    const LEVEL_ORDER = ["standard", "no-training", "zdr"];
+
+    function describeJobPrivacy(j) {
+      if (!j.privacy) return "standard (made before privacy levels, or at the default level)";
+      return j.privacy.level + " · route: " + j.privacy.route + " · " + j.privacy.enforcement;
+    }
+
+    function describeRemoteDeletion(j) {
+      const d = j.remoteDeletion;
+      if (d) {
+        if (d.state === "done") return "deleted at OpenRouter " + (d.at || "");
+        if (d.state === "pending") return "deletion pending (attempt " + d.attempts + ")" + (d.lastError ? ": " + d.lastError : "");
+        return "deletion failed after " + d.attempts + " attempt(s)" + (d.lastError ? ": " + d.lastError : "") + "; kept up to 30 days";
+      }
+      if ((j.route || "batch") === "immediate") return "not applicable (no provider batch)";
+      return "kept up to 30 days";
+    }
+
+    function catalogText(c) {
+      return c && c.text ? c.text : "";
+    }
+
+    function renderPrivacySettings() {
+      const p = state.privacy;
+      if (!p) return;
+      document.getElementById("privacy-level-select").value = p.level;
+      document.getElementById("privacyLevelSource").textContent = "(" + p.source + ")" + (p.deleteRemoteBatches ? " · finished batches are deleted at OpenRouter at no-training and zdr" : "");
+      document.getElementById("attestState").textContent = p.accountNoTraining
+        ? "Attested" + (p.attestedAt ? " " + p.attestedAt : "") + ". " + p.attestNote
+        : "Not attested. Batch models are refused at no-training until you attest. " + p.attestNote;
+      document.getElementById("attest-privacy-remove").style.display = p.accountNoTraining ? "" : "none";
+      document.getElementById("attest-privacy-chk").checked = p.accountNoTraining;
+      document.getElementById("attest-privacy-confirm").disabled = p.accountNoTraining || !document.getElementById("attest-privacy-chk").checked;
+      document.getElementById("settingsCatalogState").textContent = catalogText(p.catalog);
+    }
+
+    async function loadPrivacy() {
+      try {
+        state.privacy = await api("/api/privacy");
+        renderPrivacySettings();
+        if (state.activeThreadDetail) renderThreadPrivacy(state.activeThreadDetail);
+      } catch {}
+    }
+
+    function showPrivacyNotice(text) {
+      const box = document.getElementById("privacyNotice");
+      box.style.display = "";
+      box.innerHTML = '<div class="alert-box alert-warning">' + escapeHtml(text) +
+        ' <a href="https://openrouter.ai/settings/privacy" target="_blank" rel="noopener noreferrer" style="color:#fde68a;">openrouter.ai/settings/privacy</a>' +
+        ' <button class="btn btn-sm" id="privacyNoticeDismiss">Dismiss</button></div>';
+      document.getElementById("privacyNoticeDismiss").addEventListener("click", () => {
+        box.style.display = "none";
+        box.innerHTML = "";
+      });
+    }
+
+    function privacyError(err) {
+      document.getElementById("privacyAlert").innerHTML = '<div class="alert-box alert-danger">' + escapeHtml(err.message) + "</div>";
+    }
+
+    document.getElementById("privacy-level-select").addEventListener("change", async (ev) => {
+      document.getElementById("privacyAlert").innerHTML = "";
+      try {
+        const res = await api("/api/privacy", { method: "POST", body: { level: ev.target.value } });
+        state.privacy = res;
+        state.picker.key = "";
+        renderPrivacySettings();
+        if (res.notice) showPrivacyNotice(res.notice);
+        if (state.activeThreadId) await selectThread(state.activeThreadId, true);
+      } catch (err) {
+        privacyError(err);
+        renderPrivacySettings();
+      }
+    });
+
+    document.getElementById("attest-privacy-chk").addEventListener("change", (ev) => {
+      document.getElementById("attest-privacy-confirm").disabled = !ev.target.checked || (state.privacy && state.privacy.accountNoTraining);
+    });
+
+    async function setAttestation(attested) {
+      document.getElementById("privacyAlert").innerHTML = "";
+      try {
+        state.privacy = await api("/api/privacy/attest", { method: "POST", body: { attested } });
+        state.picker.key = "";
+        renderPrivacySettings();
+        if (state.activeThreadId) await selectThread(state.activeThreadId, true);
+      } catch (err) {
+        privacyError(err);
+      }
+    }
+    document.getElementById("attest-privacy-confirm").addEventListener("click", () => setAttestation(true));
+    document.getElementById("attest-privacy-remove").addEventListener("click", () => setAttestation(false));
+
+    async function refreshModels() {
+      const status = [document.getElementById("chatCatalogState"), document.getElementById("settingsCatalogState")];
+      status.forEach((el) => { el.textContent = "loading models…"; });
+      try {
+        await api("/api/models/refresh", { method: "POST" });
+      } catch (err) {
+        privacyError(err);
+        showToast(err.message, "error");
+      }
+      state.picker.key = "";
+      await loadPrivacy();
+      if (state.activeThreadDetail) renderThreadPrivacy(state.activeThreadDetail);
+    }
+    document.getElementById("refresh-models-chat").addEventListener("click", refreshModels);
+    document.getElementById("refresh-models-settings").addEventListener("click", refreshModels);
+
+    function renderThreadPrivacy(detail) {
+      const level = detail.effectiveLevel || "standard";
+      const t = detail.thread;
+      const free = t.route === "immediate" || /:free$/.test(t.model);
+      const badge = document.getElementById("chatPrivacyBadge");
+      const parts = [];
+      if (level === "zdr") parts.push("🔒 zdr");
+      else if (level === "no-training") parts.push("🔒 no-train");
+      if (free) parts.push("free");
+      badge.style.display = parts.length ? "" : "none";
+      badge.textContent = parts.join(" · ");
+
+      const sel = document.getElementById("threadPrivacyLevel");
+      sel.value = level;
+      Array.from(sel.options).forEach((o) => {
+        const lower = LEVEL_ORDER.indexOf(o.value) < LEVEL_ORDER.indexOf(level);
+        o.disabled = lower;
+        o.title = lower ? "Can't lower below the project level or this thread's raised level" : "";
+      });
+      sel.disabled = level === "zdr";
+      sel.dataset.level = level;
+
+      const key = [t.id, level, t.model, state.privacy && state.privacy.accountNoTraining].join("|");
+      if (state.picker.key !== key) {
+        state.picker.key = key;
+        loadPicker(t.id);
+      } else {
+        renderPicker();
+      }
+    }
+
+    document.getElementById("threadPrivacyLevel").addEventListener("change", async (ev) => {
+      if (!state.activeThreadId) return;
+      const alertEl = document.getElementById("chatModelAlert");
+      alertEl.innerHTML = "";
+      try {
+        await api("/api/threads/" + encodeURIComponent(state.activeThreadId) + "/privacy", { method: "POST", body: { level: ev.target.value } });
+        showToast("Thread privacy level raised to " + ev.target.value);
+      } catch (err) {
+        alertEl.innerHTML = '<div class="alert-box alert-danger">' + escapeHtml(err.message) + "</div>";
+      }
+      await selectThread(state.activeThreadId, true);
+    });
+
+    async function loadPicker(threadId) {
+      try {
+        const res = await api("/api/models?threadId=" + encodeURIComponent(threadId));
+        if (threadId !== state.activeThreadId) return;
+        state.picker.entries = res.entries || [];
+        state.picker.catalog = res.catalog;
+        renderPicker();
+      } catch (err) {
+        state.picker.key = "";
+      }
+    }
+
+    function pickerLabel(e) {
+      return e.id + "  " + e.labels.map((l) => "[" + l + "]").join(" ");
+    }
+
+    function renderPicker() {
+      const bar = document.getElementById("chatModelPickerBar");
+      bar.style.display = "flex";
+      document.getElementById("chatCatalogState").textContent = catalogText(state.picker.catalog);
+      const pick = document.getElementById("chatModelPicker");
+      const groups = [
+        ["batch", "Batch (cheaper, slower)"],
+        ["immediate", "Immediate (free)"],
+      ];
+      let html = '<option value="">Choose a model…</option>';
+      groups.forEach(([route, title]) => {
+        const rows = state.picker.entries.filter((e) => e.route === route && (state.showBlocked || !e.blocked));
+        if (!rows.length) return;
+        html += '<optgroup label="' + escapeHtml(title) + '">' +
+          rows.map((e) => '<option value="' + escapeHtml(e.id) + '"' + (e.blocked ? ' disabled title="' + escapeHtml(e.blocked) + '"' : "") + ">" +
+            escapeHtml(pickerLabel(e) + (e.blocked ? "  (blocked)" : "")) + "</option>").join("") +
+          "</optgroup>";
+      });
+      pick.innerHTML = html;
+      const blocked = state.picker.entries.filter((e) => e.blocked).length;
+      document.getElementById("show-blocked-toggle").title = blocked + " model(s) hidden by the privacy level";
+    }
+
+    document.getElementById("chatModelPicker").addEventListener("change", (ev) => {
+      if (ev.target.value) document.getElementById("chatModelInput").value = ev.target.value;
+    });
+    document.getElementById("show-blocked-toggle").addEventListener("change", (ev) => {
+      state.showBlocked = ev.target.checked;
+      renderPicker();
     });
 
     bootstrap();

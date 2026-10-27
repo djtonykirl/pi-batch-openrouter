@@ -191,6 +191,7 @@ export class BatchRuntime {
       chatStore: this.chatStore,
       artifacts: this.artifacts,
       poller: this.poller,
+      catalog: this.catalog ?? undefined,
       getConfig: () => this.loaded.config,
       reloadConfig: () => {
         this.loaded = loadConfig(this.cwd);

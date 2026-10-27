@@ -78,6 +78,9 @@ test("formatPrivacyStatus covers fresh, stale and loading catalogs", () => {
   const loading = formatPrivacyStatus({ ...base, snapshot: undefined });
   assert.match(loading, /loading/);
   assert.match(formatPrivacyStatus({ ...base, accountNoTraining: true, snapshot: undefined }), /attested/);
+  const at = formatPrivacyStatus({ ...base, accountNoTraining: true, attestedAt: "2026-10-27T10:00:00.000Z", snapshot: undefined });
+  assert.match(at, /attested .*2026-10-27/);
+  assert.match(at, /cannot verify/);
 });
 
 function fakeRt(dir: string): { rt: BatchRuntime; notes: string[] } {
@@ -116,8 +119,10 @@ test("cmdPrivacy standard does not show the notice; attest and unattest toggle t
   assert.equal(rt.loaded.config.privacy.noticeShown, false);
   await cmdPrivacy(rt, ["attest"], false);
   assert.equal(rt.loaded.config.privacy.accountNoTraining, true);
+  assert.match(rt.loaded.config.privacy.attestedAt ?? "", /^\d{4}-\d{2}-\d{2}T/);
   await cmdPrivacy(rt, ["unattest"], false);
   assert.equal(rt.loaded.config.privacy.accountNoTraining, false);
+  assert.equal(rt.loaded.config.privacy.attestedAt, undefined);
   await assert.rejects(() => cmdPrivacy(rt, ["bogus"], false), /Usage/);
 });
 

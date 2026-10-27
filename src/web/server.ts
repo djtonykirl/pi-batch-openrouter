@@ -17,6 +17,10 @@ import { formatSecretFindings, scanForSecrets } from "../context/secrets.js";
 import { atomicWriteFile, isInside, sha256Hex, writeFileAtomicExclusive } from "../fsutil.js";
 import { jobItems, sourceLabel } from "../items.js";
 import { FileLogger } from "../logger.js";
+import { ModelCatalog, type CatalogModel } from "../models/catalog.js";
+import { OpenRouterBatchClient } from "../openrouter/client.js";
+import { ATTEST_NOTE, attestationUpdate, catalogStateLine, levelSource, levelUpdate, pickerEntries, PRIVACY_NOTICE, PRIVACY_SETTINGS_URL } from "../privacy/commands.js";
+import { isPrivacyLevel, type PrivacyLevel, type Route, type ZdrEndpoint } from "../privacy/policy.js";
 import { badgeText, BatchPoller } from "../poller.js";
 import { JobRegistry } from "../registry.js";
 import { BatchService } from "../service.js";
@@ -34,6 +38,8 @@ export interface WebServerDeps {
   getConfig: () => BatchConfig;
   reloadConfig?: () => void;
   getKnownModels?: () => string[];
+  /** The project model catalog (shared with the service); loaded on server start and workspace switch. */
+  catalog?: ModelCatalog;
   /**
    * True when `poller` was created for this server (standalone, or a workspace switched to in the UI): the server
    * starts and stops it. False for Pi's runtime poller, which the server must never stop.
@@ -228,6 +234,12 @@ export function inspectWorkspaceFiles(workspaceRoot: string, config: BatchConfig
   return entries;
 }
 
+function parseRoute(value: unknown): Route | undefined {
+  if (value === undefined || value === "") return undefined;
+  if (value === "batch" || value === "immediate") return value;
+  throw new Error(`Unknown route "${String(value)}". Use batch or immediate.`);
+}
+
 /** Constant-time string comparison (length is not secret). */
 function safeEqual(a: string, b: string): boolean {
   const ab = Buffer.from(a, "utf8");
@@ -295,8 +307,19 @@ export class BatchWebServer {
     const keys = createStandaloneKeyResolver(() => loaded.config.defaultAccount, resolveKey);
     const logger = new FileLogger(path.join(storage, "extension.log"), keys.secrets);
 
+    const catalog = new ModelCatalog({
+      file: path.join(storage, "model-catalog.json"),
+      logger,
+      fetch: async (): Promise<{ models: CatalogModel[]; zdr: ZdrEndpoint[] }> => {
+        const apiKey = await keys.resolve(loaded.config.defaultAccount);
+        const client = new OpenRouterBatchClient({ apiKey, timeoutMs: loaded.config.polling.requestTimeoutSeconds * 1000 });
+        const [models, zdr] = await Promise.all([client.listModels(), client.listZdrEndpoints()]);
+        return { models: models.models, zdr: zdr.endpoints };
+      },
+    });
     const service = new BatchService({
       registry,
+      catalog,
       workspaceRoot,
       getConfig: () => loaded.config,
       resolveApiKey: keys.resolve,
@@ -343,6 +366,7 @@ export class BatchWebServer {
       chatStore,
       artifacts,
       poller,
+      catalog,
       getConfig: () => loaded.config,
       reloadConfig: () => {
         loaded = loadConfig(workspaceRoot);
@@ -407,6 +431,7 @@ export class BatchWebServer {
       // fs.watch is optional
     }
     if (this.deps.ownsPoller && this.isRunning) this.deps.poller.start();
+    this.loadCatalog();
     this.broadcast({ type: "workspace_changed", workspaceRoot: posixRoot });
     return posixRoot;
   }
@@ -472,7 +497,10 @@ export class BatchWebServer {
     this.boundHost = host;
     this.server = srv;
     // Standalone (or a switched-to workspace): nothing else polls this storage, so replies would never land.
-    if (this.deps.ownsPoller) this.deps.poller.start();
+    if (this.deps.ownsPoller) {
+      this.deps.poller.start();
+      this.loadCatalog(); // Pi loads its own catalog on session_start
+    }
 
     try {
       this.deps.service.registry.ensureRoot();
@@ -483,6 +511,46 @@ export class BatchWebServer {
       // fs.watch is optional
     }
     return this.url!;
+  }
+
+  /** Non-blocking: a failed load is logged by the catalog and leaves it stale (fail-safe). */
+  private loadCatalog(): void {
+    void this.deps.catalog?.load().then(
+      () => this.broadcast({ type: "catalog" }),
+      () => {},
+    );
+  }
+
+  private catalogInfo(): { state: "unavailable" | "loading" | "fresh" | "stale"; loadedAt?: string; error?: string; text: string } {
+    if (!this.deps.catalog) return { state: "unavailable", text: "no model catalog" };
+    const snap = this.deps.catalog.snapshot();
+    if (!snap) return { state: "loading", text: "loading models…" };
+    return {
+      state: snap.fresh ? "fresh" : "stale",
+      loadedAt: snap.loadedAt,
+      ...(snap.error ? { error: snap.error } : {}),
+      text: snap.fresh ? `models ${catalogStateLine(snap)}` : `model list ${catalogStateLine(snap)}`,
+    };
+  }
+
+  private privacyState(): Record<string, unknown> {
+    const p = this.deps.getConfig().privacy;
+    return {
+      level: p.level,
+      source: levelSource(this.deps.workspaceRoot),
+      accountNoTraining: p.accountNoTraining,
+      ...(p.attestedAt ? { attestedAt: p.attestedAt } : {}),
+      attestNote: ATTEST_NOTE,
+      deleteRemoteBatches: p.deleteRemoteBatches,
+      noticeShown: p.noticeShown,
+      settingsUrl: PRIVACY_SETTINGS_URL,
+      catalog: this.catalogInfo(),
+    };
+  }
+
+  private savePrivacy(update: Record<string, unknown>): void {
+    saveConfigUpdate({ privacy: update as never }, { cwd: this.deps.workspaceRoot, global: false });
+    this.deps.reloadConfig?.();
   }
 
   public async stop(): Promise<void> {
@@ -843,10 +911,17 @@ export class BatchWebServer {
       }
 
       if (method === "POST" && pathname === "/api/threads") {
-        const body = await this.readJson<{ model?: string; title?: string }>(req);
+        const body = await this.readJson<{ model?: string; title?: string; route?: string }>(req);
+        const route = parseRoute(body.route);
         const thread = this.deps.chat.newThread();
-        if (body.model?.trim()) await this.deps.chat.setModel(thread.id, body.model.trim());
-        if (body.title?.trim()) this.deps.chat.rename(thread.id, body.title.trim());
+        try {
+          if (body.model?.trim()) await this.deps.chat.setModel(thread.id, body.model.trim(), { route });
+          if (body.title?.trim()) this.deps.chat.rename(thread.id, body.title.trim());
+        } catch (err) {
+          // A refused create (privacy level, empty title) must not leave an orphan thread behind.
+          this.deps.chatStore.remove(thread.id);
+          throw err;
+        }
         this.broadcast({ type: "thread_created", threadId: thread.id });
         this.sendJson(res, 201, { thread: this.deps.chatStore.read(thread.id) });
         return;
@@ -866,6 +941,7 @@ export class BatchWebServer {
           const compactingJob = thread.compacting?.jobId ? this.safeReadJob(thread.compacting.jobId) : undefined;
           this.sendJson(res, 200, {
             thread,
+            effectiveLevel: this.deps.chat.effectiveLevel(threadId),
             entries,
             estimate,
             pendingJob,
@@ -904,10 +980,19 @@ export class BatchWebServer {
         }
 
         if (method === "POST" && action === "model") {
-          const body = await this.readJson<{ model: string }>(req);
-          await this.deps.chat.setModel(threadId, body.model ?? "");
+          const body = await this.readJson<{ model: string; route?: string }>(req);
+          await this.deps.chat.setModel(threadId, body.model ?? "", { route: parseRoute(body.route) });
           this.broadcast({ type: "thread_updated", threadId });
           this.sendJson(res, 200, { thread: this.deps.chatStore.read(threadId) });
+          return;
+        }
+
+        if (method === "POST" && action === "privacy") {
+          const body = await this.readJson<{ level?: string }>(req);
+          if (!isPrivacyLevel(body.level)) throw new Error("Unknown privacy level. Use standard, no-training or zdr.");
+          this.deps.chat.raisePrivacy(threadId, body.level);
+          this.broadcast({ type: "thread_updated", threadId });
+          this.sendJson(res, 200, { thread: this.deps.chatStore.read(threadId), level: this.deps.chat.effectiveLevel(threadId) });
           return;
         }
 
@@ -928,6 +1013,53 @@ export class BatchWebServer {
           this.sendJson(res, 200, { jobId });
           return;
         }
+      }
+
+      // ---------------- Privacy & Model Catalog ----------------
+      if (method === "GET" && pathname === "/api/privacy") {
+        this.sendJson(res, 200, this.privacyState());
+        return;
+      }
+
+      if (method === "POST" && pathname === "/api/privacy") {
+        const body = await this.readJson<{ level?: string }>(req);
+        if (!isPrivacyLevel(body.level)) throw new Error("Unknown privacy level. Use standard, no-training or zdr.");
+        const { update, showNotice } = levelUpdate(this.deps.getConfig().privacy, body.level);
+        this.savePrivacy(update);
+        this.broadcast({ type: "privacy" });
+        this.sendJson(res, 200, { ...this.privacyState(), ...(showNotice ? { notice: PRIVACY_NOTICE } : {}) });
+        return;
+      }
+
+      if (method === "POST" && pathname === "/api/privacy/attest") {
+        const body = await this.readJson<{ attested?: unknown }>(req);
+        if (typeof body.attested !== "boolean") throw new Error("attested must be true or false.");
+        this.savePrivacy(attestationUpdate(body.attested));
+        this.broadcast({ type: "privacy" });
+        this.sendJson(res, 200, this.privacyState());
+        return;
+      }
+
+      if (method === "POST" && pathname === "/api/models/refresh") {
+        if (!this.deps.catalog) throw new Error("No model catalog is available for this workspace.");
+        await this.deps.catalog.load();
+        this.broadcast({ type: "catalog" });
+        this.sendJson(res, 200, { catalog: this.catalogInfo() });
+        return;
+      }
+
+      if (method === "GET" && pathname === "/api/models") {
+        const config = this.deps.getConfig();
+        const threadParam = parsedUrl.searchParams.get("threadId");
+        const level: PrivacyLevel = threadParam ? this.deps.chat.effectiveLevel(this.deps.chatStore.resolve(threadParam)) : config.privacy.level;
+        const known = this.deps.getKnownModels?.() ?? [];
+        const batchModels = known.length > 0 ? known : [config.defaultModel, ...DEFAULT_FALLBACK_MODELS];
+        this.sendJson(res, 200, {
+          level,
+          entries: pickerEntries(this.deps.catalog?.snapshot(), batchModels, level, config.privacy.accountNoTraining),
+          catalog: this.catalogInfo(),
+        });
+        return;
       }
 
       // ---------------- Batch Job Endpoints ----------------

@@ -1,0 +1,234 @@
+import assert from "node:assert/strict";
+import { join } from "node:path";
+import test from "node:test";
+import { ArtifactService } from "../src/artifacts/service.js";
+import { ArtifactStore } from "../src/artifacts/store.js";
+import { ChatService } from "../src/chat/service.js";
+import { ThreadStore } from "../src/chat/store.js";
+import { loadConfig, type BatchConfig } from "../src/config.js";
+import { ModelCatalog } from "../src/models/catalog.js";
+import { OpenRouterBatchClient } from "../src/openrouter/client.js";
+import { BatchPoller } from "../src/poller.js";
+import { pickerEntries, PRIVACY_NOTICE } from "../src/privacy/commands.js";
+import type { ZdrEndpoint } from "../src/privacy/policy.js";
+import { JobRegistry } from "../src/registry.js";
+import { BatchService } from "../src/service.js";
+import { BatchWebServer } from "../src/web/server.js";
+import { FAKE_KEY, FakeOpenRouter, accepted, makeConfig } from "./fixtures/fake-openrouter.js";
+import { rm, tempWorkspace } from "./helpers.js";
+
+const ZDR: ZdrEndpoint[] = [{ model: "y/model", provider: "azure/eu" }];
+const MODELS = [
+  { id: "c/free-one:free", name: "Free One", free: true },
+  { id: "d/free-two:free", name: "Free Two", free: true },
+];
+
+interface Env {
+  root: string;
+  cfg: BatchConfig;
+  catalog: ModelCatalog;
+  store: ThreadStore;
+  chat: ChatService;
+  batch: BatchService;
+  get: (p: string, init?: RequestInit) => Promise<Response>;
+  post: (p: string, body?: unknown, extra?: Record<string, string>) => Promise<Response>;
+  anon: (p: string, method?: string) => Promise<Response>;
+  loads: () => number;
+}
+
+function withWeb(fn: (e: Env) => Promise<void>): () => Promise<void> {
+  return async () => {
+    const root = tempWorkspace();
+    let web: BatchWebServer | undefined;
+    try {
+      const fake = new FakeOpenRouter();
+      let n = 0;
+      fake.submitReplies = [async () => accepted(`batch_${++n}`)];
+      const cfg = makeConfig();
+      let loadCount = 0;
+      const catalog = new ModelCatalog({
+        fetch: async () => {
+          loadCount++;
+          return { models: MODELS, zdr: ZDR };
+        },
+        file: join(root, "catalog.json"),
+      });
+      await catalog.load();
+      loadCount = 0;
+      const batch = new BatchService({
+        registry: new JobRegistry(join(root, ".pi", "batches")),
+        workspaceRoot: root,
+        getConfig: () => cfg,
+        resolveApiKey: async () => FAKE_KEY,
+        createClient: (apiKey, timeoutMs) => new OpenRouterBatchClient({ apiKey, fetchImpl: fake.fetch, timeoutMs }),
+        gitIgnored: () => new Set(),
+        catalog,
+      });
+      const store = new ThreadStore(join(root, ".pi/batches/threads"));
+      const chat = new ChatService({ store, batch, workspaceRoot: root, getConfig: () => cfg });
+      const artifacts = new ArtifactService({ batch, workspaceRoot: root, getConfig: () => cfg, store: new ArtifactStore(join(root, ".pi/batches/artifacts")) });
+      const poller = new BatchPoller(() => batch, () => true);
+      web = new BatchWebServer({
+        workspaceRoot: root,
+        service: batch,
+        chat,
+        chatStore: store,
+        artifacts,
+        poller,
+        catalog,
+        getConfig: () => cfg,
+        getKnownModels: () => ["y/model", "x/other"],
+        reloadConfig: () => {
+          const fresh = loadConfig(root, join(root, "no-global.json")).config.privacy;
+          cfg.privacy = { ...fresh };
+        },
+      });
+      const base = await web.start(0, "127.0.0.1");
+      const launch = await globalThis.fetch(web.createLaunchUrl()!, { redirect: "manual" });
+      const cookie = (launch.headers.get("set-cookie") ?? "").split(";")[0]!;
+      const get = (p: string, init: RequestInit = {}) =>
+        globalThis.fetch(base + p, { ...init, headers: { ...(init.headers as Record<string, string> | undefined), Cookie: cookie } });
+      const post = (p: string, body: unknown = {}, extra: Record<string, string> = {}) =>
+        globalThis.fetch(base + p, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Batch-Token": web!.csrfToken, Cookie: cookie, ...extra },
+          body: JSON.stringify(body),
+        });
+      const anon = (p: string, method = "GET") => globalThis.fetch(base + p, { method, headers: { "X-Batch-Token": web!.csrfToken } });
+      await fn({ root, cfg, catalog, store, chat, batch, get, post, anon, loads: () => loadCount });
+    } finally {
+      await web?.stop();
+      rm(root);
+    }
+  };
+}
+
+test(
+  "new privacy endpoints need a session and refuse a foreign origin",
+  withWeb(async ({ chat, anon, post, get }) => {
+    const t = chat.newThread();
+    const routes: Array<[string, string]> = [
+      ["GET", "/api/privacy"],
+      ["POST", "/api/privacy"],
+      ["POST", "/api/privacy/attest"],
+      ["POST", "/api/models/refresh"],
+      ["GET", "/api/models"],
+      ["POST", `/api/threads/${t.id}/privacy`],
+    ];
+    for (const [method, path] of routes) {
+      assert.equal((await anon(path, method)).status, 401, `${method} ${path} without a session`);
+      const foreign = method === "GET" ? await get(path, { headers: { Origin: "http://evil.example" } }) : await post(path, {}, { Origin: "http://evil.example" });
+      assert.equal(foreign.status, 403, `${method} ${path} foreign origin`);
+    }
+  }),
+);
+
+test(
+  "GET/POST /api/privacy: level, notice once, attestation with time",
+  withWeb(async ({ get, post, cfg }) => {
+    const first = (await (await get("/api/privacy")).json()) as Record<string, any>;
+    assert.equal(first.level, "standard");
+    assert.equal(first.accountNoTraining, false);
+    assert.equal(first.deleteRemoteBatches, true);
+    assert.equal(first.noticeShown, false);
+    assert.equal(first.catalog.state, "fresh");
+
+    assert.equal((await post("/api/privacy", { level: "bogus" })).status, 400);
+
+    const raised = (await (await post("/api/privacy", { level: "zdr" })).json()) as Record<string, any>;
+    assert.equal(raised.level, "zdr");
+    assert.equal(raised.notice, PRIVACY_NOTICE);
+    assert.equal(cfg.privacy.level, "zdr");
+    const again = (await (await post("/api/privacy", { level: "no-training" })).json()) as Record<string, any>;
+    assert.equal(again.notice, undefined, "notice only once");
+
+    const attested = (await (await post("/api/privacy/attest", { attested: true })).json()) as Record<string, any>;
+    assert.equal(attested.accountNoTraining, true);
+    assert.match(attested.attestedAt, /^\d{4}-\d\d-\d\dT/);
+    assert.match(attested.attestNote, /cannot verify/);
+    const status = (await (await get("/api/privacy")).json()) as Record<string, any>;
+    assert.equal(status.attestedAt, attested.attestedAt);
+    assert.equal(status.source, "project");
+
+    const removed = (await (await post("/api/privacy/attest", { attested: false })).json()) as Record<string, any>;
+    assert.equal(removed.accountNoTraining, false);
+    assert.equal(removed.attestedAt, undefined);
+    assert.equal((await post("/api/privacy/attest", { attested: "yes" })).status, 400);
+  }),
+);
+
+test(
+  "POST /api/models/refresh reloads the catalog",
+  withWeb(async ({ post, loads }) => {
+    const r = await post("/api/models/refresh");
+    assert.equal(r.status, 200);
+    assert.equal(((await r.json()) as any).catalog.state, "fresh");
+    assert.equal(loads(), 1);
+  }),
+);
+
+test(
+  "POST /api/threads/:id/privacy raises, refuses lowering with the reason",
+  withWeb(async ({ chat, post, store }) => {
+    const t = chat.newThread();
+    const up = await post(`/api/threads/${t.id}/privacy`, { level: "no-training" });
+    assert.equal(up.status, 200);
+    assert.equal(store.read(t.id).privacyLevel, "no-training");
+    const down = await post(`/api/threads/${t.id}/privacy`, { level: "standard" });
+    assert.equal(down.status, 400);
+    assert.match(((await down.json()) as any).error, /can't lower a thread below the project level/);
+    assert.equal((await post(`/api/threads/${t.id}/privacy`, { level: "nope" })).status, 400);
+  }),
+);
+
+test(
+  "a blocked model posted by the page gets 400 and creates no job or thread",
+  withWeb(async ({ cfg, chat, post, store, batch }) => {
+    cfg.privacy.level = "zdr";
+    const t = chat.newThread();
+    const r = await post(`/api/threads/${t.id}/model`, { model: "x/other" });
+    assert.equal(r.status, 400);
+    assert.match(((await r.json()) as any).error, /^Privacy level zdr: /);
+    assert.notEqual(store.read(t.id).model, "x/other");
+
+    const before = store.list().length;
+    const created = await post("/api/threads", { model: "x/other" });
+    assert.equal(created.status, 400);
+    assert.match(((await created.json()) as any).error, /^Privacy level zdr: /);
+    assert.equal(store.list().length, before, "a refused create leaves no thread");
+    assert.equal(batch.registry.list().jobs.length, 0);
+
+    const ok = await post("/api/threads", { model: "y/model", title: "Allowed" });
+    assert.equal(ok.status, 201);
+  }),
+);
+
+test(
+  "GET /api/models matches pickerEntries for the project level and for a thread",
+  withWeb(async ({ cfg, chat, get, catalog }) => {
+    cfg.privacy.level = "zdr";
+    const proj = (await (await get("/api/models")).json()) as { entries: unknown[]; catalog: { state: string } };
+    assert.deepEqual(proj.entries, pickerEntries(catalog.snapshot(), ["y/model", "x/other"], "zdr", false));
+    assert.equal(proj.catalog.state, "fresh");
+
+    cfg.privacy.level = "standard";
+    const t = chat.newThread();
+    chat.raisePrivacy(t.id, "no-training");
+    const thread = (await (await get(`/api/models?threadId=${t.id}`)).json()) as { entries: unknown[]; level: string };
+    assert.equal(thread.level, "no-training");
+    assert.deepEqual(thread.entries, pickerEntries(catalog.snapshot(), ["y/model", "x/other"], "no-training", false));
+    assert.equal((await get("/api/models?threadId=nope")).status, 400);
+  }),
+);
+
+test(
+  "the page has no inline handlers and carries the privacy controls",
+  withWeb(async ({ get }) => {
+    const html = await (await get("/")).text();
+    assert.equal(/onclick\s*=/i.test(html), false);
+    assert.equal(/\son(click|change|input|submit|load|error)\s*=/i.test(html), false);
+    for (const needle of ["privacy-level", "refresh-models", "show-blocked", "attest-privacy", "openrouter.ai/settings/privacy"]) {
+      assert.ok(html.includes(needle), `page mentions ${needle}`);
+    }
+  }),
+);

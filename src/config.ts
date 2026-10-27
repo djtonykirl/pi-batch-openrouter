@@ -47,7 +47,7 @@ export interface BatchConfig {
   /** Batch chat: persistent named threads. */
   chat: { autoCompact: boolean; autoCompactTokens: number; keepRecentExchanges: number; retitleAtTurn: number; systemPrompt: string };
   /** Per-project privacy level and the account-level attestations behind it. */
-  privacy: { level: PrivacyLevel; accountNoTraining: boolean; deleteRemoteBatches: boolean; noticeShown: boolean };
+  privacy: { level: PrivacyLevel; accountNoTraining: boolean; deleteRemoteBatches: boolean; noticeShown: boolean; /** ISO time of the no-training attestation (set with accountNoTraining, removed on unattest). */ attestedAt?: string };
 }
 
 export const DEFAULT_CONFIG: BatchConfig = {
@@ -202,7 +202,7 @@ const SCHEMA: Record<string, Check | Record<string, Check>> = {
     retitleAtTurn: posInt(1000),
     systemPrompt: str,
   },
-  privacy: { level: isPrivacyLevel, accountNoTraining: bool, deleteRemoteBatches: bool, noticeShown: bool },
+  privacy: { level: isPrivacyLevel, accountNoTraining: bool, deleteRemoteBatches: bool, noticeShown: bool, attestedAt: (v) => typeof v === "string" && !Number.isNaN(Date.parse(v)) },
 };
 
 /** Validates field-by-field; invalid fields revert to defaults and are reported. Unknown keys are reported. */

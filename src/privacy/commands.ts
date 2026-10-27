@@ -54,10 +54,24 @@ export function catalogStateLine(snapshot: CatalogSnapshot | undefined): string 
   return snapshot.fresh ? `fresh at ${at}` : `from ${at}, refresh failed${snapshot.error ? ` (${snapshot.error})` : ""}`;
 }
 
-export function formatPrivacyStatus(input: { level: PrivacyLevel; source: string; accountNoTraining: boolean; snapshot: CatalogSnapshot | undefined }): string {
+/** Recorded with the attestation: the extension only stores what the user says. */
+export const ATTEST_NOTE = "The extension cannot verify this; check your OpenRouter account privacy settings.";
+
+/** The privacy config fields to write when the attestation changes (attestedAt is removed on unattest). */
+export function attestationUpdate(attested: boolean, now = new Date()): { accountNoTraining: boolean; attestedAt: string | undefined } {
+  return { accountNoTraining: attested, attestedAt: attested ? now.toISOString() : undefined };
+}
+
+/** The privacy config fields to write for a level change, and whether the one-time notice is due. */
+export function levelUpdate(current: { noticeShown: boolean }, level: PrivacyLevel): { update: { level: PrivacyLevel; noticeShown?: boolean }; showNotice: boolean } {
+  const showNotice = level !== "standard" && !current.noticeShown;
+  return { update: showNotice ? { level, noticeShown: true } : { level }, showNotice };
+}
+
+export function formatPrivacyStatus(input: { level: PrivacyLevel; source: string; accountNoTraining: boolean; attestedAt?: string; snapshot: CatalogSnapshot | undefined }): string {
   return [
     `Privacy level: ${input.level} (${input.source})`,
-    `No-training attestation: ${input.accountNoTraining ? "attested (you confirmed your OpenRouter account disables training)" : "not attested"}`,
+    `No-training attestation: ${input.accountNoTraining ? `attested${input.attestedAt ? ` ${formatIsoShort(input.attestedAt)}` : ""} (you confirmed your OpenRouter account disables training; the extension cannot verify this)` : "not attested"}`,
     `Model catalog: ${catalogStateLine(input.snapshot)}`,
     `Account privacy settings (not checked by this extension): ${PRIVACY_SETTINGS_URL}`,
     `Usage: /batch [--global] privacy ${PRIVACY_LEVELS.join("|")}|attest|unattest|refresh`,
@@ -92,7 +106,7 @@ export async function cmdPrivacy(rt: BatchRuntime, rest: string[], isGlobal: boo
   };
 
   if (!arg) {
-    rt.notify(formatPrivacyStatus({ level: config().level, source: levelSource(rt.cwd), accountNoTraining: config().accountNoTraining, snapshot: rt.catalog?.snapshot() }), "info");
+    rt.notify(formatPrivacyStatus({ level: config().level, source: levelSource(rt.cwd), accountNoTraining: config().accountNoTraining, attestedAt: config().attestedAt, snapshot: rt.catalog?.snapshot() }), "info");
     return;
   }
   if (arg === "refresh") {
@@ -102,7 +116,7 @@ export async function cmdPrivacy(rt: BatchRuntime, rest: string[], isGlobal: boo
     return;
   }
   if (arg === "attest") {
-    const where = save({ accountNoTraining: true });
+    const where = save(attestationUpdate(true));
     rt.notify(
       `Recorded: you attest your OpenRouter account disables training for the models you use (${where}). The extension cannot verify this; check ${PRIVACY_SETTINGS_URL}.`,
       "info",
@@ -110,13 +124,13 @@ export async function cmdPrivacy(rt: BatchRuntime, rest: string[], isGlobal: boo
     return;
   }
   if (arg === "unattest") {
-    rt.notify(`Attestation removed (${save({ accountNoTraining: false })}). Batch models are refused at no-training until you attest again.`, "info");
+    rt.notify(`Attestation removed (${save(attestationUpdate(false))}). Batch models are refused at no-training until you attest again.`, "info");
     return;
   }
   if (!isPrivacyLevel(arg)) throw new Error(USAGE);
 
-  const showNotice = arg !== "standard" && !config().noticeShown;
-  const where = save(showNotice ? { level: arg, noticeShown: true } : { level: arg });
+  const { update, showNotice } = levelUpdate(config(), arg);
+  const where = save(update);
   rt.notify(`Privacy level set to ${arg} (${where})`, "info");
   if (showNotice) rt.notify(PRIVACY_NOTICE, "info");
 }
