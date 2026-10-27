@@ -157,6 +157,7 @@ const block = (s: string | null) => (s === null ? "_none_" : s);
 const REPLACES_MARK = "_replaces a non-standard existing value_";
 const KEPT_PII_MARK = "_kept existing PII tag (model proposed none)_";
 const DROPPED_MARK = "_non-taxonomy tags dropped_";
+const WITHHELD_MARK = "_description withheld: its CLASSIFICATION line conflicts with the table's tags; rewrite it_";
 const tagsChangedMark = (existing: TagMap | undefined, approved: TagMap | undefined) => `_tags changed: ${fmtTags(existing)} → ${fmtTags(approved)}_`;
 
 /** Standards review: the table's tag change, and which existing tags fell outside the taxonomy. */
@@ -210,6 +211,8 @@ export function metadataReviewMarkdown(o: MetadataOutcome): string {
     }
     const d = t.proposal.table_description;
     out.push("**Proposed description:**", "", block(d.comment), "");
+    // The only way a proposal table's classification differs from the proposal's is the public-with-PII escalation.
+    if (row && row.approved_description === null && d.comment !== null && row.approved_tags?.classification !== t.proposal.classification) out.push(WITHHELD_MARK, "");
     const descIsStandard = (s: string) => descriptionIsStandard(s, t.proposal!.classification);
     const descReplaced = row !== undefined && replacesNonStandard(row.existing_description, row.approved_description, d.comment, descIsStandard);
     if (descReplaced) out.push(REPLACES_MARK, "");
@@ -311,10 +314,14 @@ function standardsDraftRow(o: MetadataOutcome, t: TableOutcome, standards: Metad
   const base = p ? (p.classification ?? "") : existingClass !== undefined && (CLASSIFICATIONS as readonly string[]).includes(existingClass) ? existingClass : "pii_scan_required";
   // A kept PII tag never sits under "public" (tableTagProblems rejects it).
   const classification = base === "public" && anyColumnPii ? "pii_scan_required" : base;
+  // The draft never fails its own check: a description whose CLASSIFICATION: line no longer
+  // matches the derived classification is withheld (null, R5) for the reviewer to rewrite.
+  const chosen = standardsDraftValue(ev.existing_description, p?.table_description.comment, (s) => descriptionIsStandard(s, p?.classification));
+  const description = p && chosen !== null && !descriptionIsStandard(chosen, classification) ? null : chosen;
   return {
     table: t.table,
     existing_description: ev.existing_description,
-    approved_description: standardsDraftValue(ev.existing_description, p?.table_description.comment, (s) => descriptionIsStandard(s, p?.classification)),
+    approved_description: description,
     existing_tags: existingTags,
     approved_tags: deriveTableTags(classification, standards, medallionLayer(t.table) ?? "", anyColumnPii),
     columns,

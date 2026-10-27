@@ -105,6 +105,7 @@ const LOCATION = "uc_dev_global_rnd_mdip_01.lighthouse_gold.PNPT_location_data";
 const AUDIT_ONLY = "c.lighthouse_silver.pnpt_audit_only"; // lowercase, as UC information_schema exports it
 const PLANT = "uc_dev.lighthouse_bronze.PNPT_plant";
 const CONTACT = "uc_dev.lighthouse_silver.PNPT_contact";
+const PUBLIC_T = "uc_dev.lighthouse_gold.PNPT_public_contact";
 const EMAIL_TAGS = { pii: "true", pii_type: "email", sensitivity: "high", requires_masking: "true" };
 const EMAIL_COMMENT = "Email address of the facility contact person.\nTYPE: Dimension.\nVALUES: Email address.\nSYNONYMS: contact_email.\nNULL MEANS: No contact recorded.";
 
@@ -142,6 +143,11 @@ const SP_TABLES: TableEvidence[] = [
     existing_tags: {},
     columns: [{ name: "contact_email", data_type: "STRING", nullable: true, existing_comment: null, existing_tags: EMAIL_TAGS }],
   },
+  {
+    table: PUBLIC_T,
+    existing_description: null,
+    columns: [{ name: "contact_email", data_type: "STRING", nullable: true, existing_comment: null, existing_tags: EMAIL_TAGS }],
+  },
 ];
 
 const spProposal = (table: string): Record<string, unknown> => {
@@ -160,6 +166,13 @@ const spProposal = (table: string): Record<string, unknown> => {
       table,
       classification: "internal",
       table_description: { comment: DESCRIPTION_33, confidence: "medium", reason: "Context." },
+      columns: [{ name: "contact_email", comment: EMAIL_COMMENT, confidence: "medium", reason: "Name.", pii_tags: null }],
+    };
+  if (table === PUBLIC_T)
+    return {
+      table,
+      classification: "public",
+      table_description: { comment: DESCRIPTION_33.replace("CLASSIFICATION: Internal.", "CLASSIFICATION: Public."), confidence: "medium", reason: "Context." },
       columns: [{ name: "contact_email", comment: EMAIL_COMMENT, confidence: "medium", reason: "Name.", pii_tags: null }],
     };
   if (table === AUDIT_ONLY) return { table, classification: "internal", table_description: { comment: DESCRIPTION_33, confidence: "medium", reason: "Context." }, columns: [] };
@@ -205,7 +218,7 @@ test("standards draft: a legacy comment takes the proposal; validate-approved pa
     const v = validateApprovedText(draft, service);
     assert.deepEqual(v.problems, []);
     assert.equal(v.counts.replacedNonStandard, 2);
-    assert.deepEqual(v.nullValues, [`${PLANT} column "plant_nm"`]);
+    assert.deepEqual(v.nullValues, [`${PLANT} column "plant_nm"`, `${PUBLIC_T} description`]);
   }, spFiles));
 
 test("standards validate: a reviewer reverting to the legacy comment gets a TYPE: problem", () =>
@@ -337,4 +350,23 @@ test("standards R4 for tags: a valid existing PII tag is kept when the model pro
     assert.equal(contact.approved_tags.pii, "true");
     assert.equal(contact.approved_tags.classification, "internal");
     assert.deepEqual(validateApprovedText(draft, service).problems, []);
+  }, spFiles));
+
+test("standards: a proposed public description that conflicts with a kept PII tag is withheld; the draft is still written", () =>
+  withWorkspace(async (root, service, fake) => {
+    const o = await standardsJob(service, fake);
+    const res = await writeApprovedDraft(service, artifactsFor(root, service), o.job.localId, { out: "metadata/pinpoint/approved.jsonl" });
+    assert.deepEqual(res.validation.problems, []);
+    const row = parseRows(fs.readFileSync(path.join(root, "metadata/pinpoint/approved.jsonl"), "utf8"))[4]!;
+    assert.equal(row.table, PUBLIC_T);
+    // Proposal said public; the kept email tag makes the table PII, so the taxonomy's holding value applies.
+    assert.equal(row.approved_tags.classification, "pii_scan_required");
+    assert.equal(row.approved_tags.pii, "true");
+    assert.equal(JSON.stringify(col(row, "contact_email").approved_tags), JSON.stringify(EMAIL_TAGS));
+    assert.equal(row.approved_description, null);
+    assert.ok(res.validation.nullValues!.includes(`${PUBLIC_T} description`));
+    const md = metadataReviewMarkdown(o);
+    assert.match(md, /CLASSIFICATION: Public\.\n\n_description withheld: its CLASSIFICATION line conflicts with the table's tags; rewrite it_/);
+    // Only that table is withheld.
+    assert.equal(md.split("_description withheld").length - 1, 1);
   }, spFiles));
