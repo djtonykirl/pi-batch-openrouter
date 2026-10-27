@@ -58,22 +58,18 @@ function chatJob(service: BatchService, opts: { title?: boolean; model?: string 
 const chatPosts = (fake: FakeOpenRouter) => fake.requests.filter((r) => r.method === "POST" && r.url.endsWith("/chat/completions"));
 const batchPosts = (fake: FakeOpenRouter) => fake.requests.filter((r) => r.url.includes("/batches"));
 
-/** A previewed immediate ask job moved to `submitted` by hand, as if Pi stopped right after the transition. */
-async function stoppedAfterSubmit(service: BatchService): Promise<JobManifest> {
-  const ws = service.workspaceRoot;
-  fs.mkdirSync(`${ws}/src`, { recursive: true });
-  fs.writeFileSync(`${ws}/src/a.ts`, "export const a = 1;\n");
-  const preview = await service.createJob(
-    await service.prepare({ objective: "Explain a", files: ["src/a.ts"], contexts: [], format: "markdown", includeInstructions: false, model: FREE }),
-    { previewOnly: true },
-  );
-  assert.equal(preview.route, "immediate");
-  return service.registry.update(preview.localId, (u) => {
-    u.transition("submitting");
-    u.transition("submitted");
-    u.manifest.nextPollAt = new Date(Date.now() - 1000).toISOString();
-    return u.manifest;
-  });
+/**
+ * An in-flight immediate chat job whose item 1 has no progress record yet (its first call got a
+ * per-minute 429). Tests then write the record a crash would leave. The fake's request log is cleared.
+ */
+async function stoppedAfterSubmit(service: BatchService, fake: FakeOpenRouter): Promise<JobManifest> {
+  fake.chatReplies = [{ status: 429, body: PER_MINUTE, headers: { "Retry-After": "1" } }];
+  const job = await chatJob(service);
+  assert.equal(job.route, "immediate");
+  assert.equal(job.localStatus, "polling");
+  assert.deepEqual(JSON.parse(fs.readFileSync(service.registry.artefact(job.localId, "immediateProgress"), "utf8")), {});
+  fake.requests.length = 0;
+  return job;
 }
 
 // ------------------------------------------------------------------ brief
@@ -253,7 +249,7 @@ test(
 test(
   "an item whose call started but never finished is never sent again",
   withService("standard", async ({ service, fake }) => {
-    const job = await stoppedAfterSubmit(service);
+    const job = await stoppedAfterSubmit(service, fake);
     // Pi stopped mid-call long ago: the provider may have answered (and counted) it.
     atomicWriteJson(service.registry.artefact(job.localId, "immediateProgress"), {
       [job.customIds[0]!]: { state: "started", at: new Date(Date.now() - 3_600_000).toISOString() },
@@ -269,7 +265,7 @@ test(
 test(
   "a call started recently by another process is left alone",
   withService("standard", async ({ service, fake }) => {
-    const job = await stoppedAfterSubmit(service);
+    const job = await stoppedAfterSubmit(service, fake);
     atomicWriteJson(service.registry.artefact(job.localId, "immediateProgress"), {
       [job.customIds[0]!]: { state: "started", at: new Date().toISOString() },
     });
@@ -277,7 +273,26 @@ test(
     const r = await service.reconcile(job.localId, { force: true });
     assert.equal(chatPosts(fake).length, 0);
     assert.equal(r.polled, false);
-    assert.equal(service.registry.read(job.localId).localStatus, "submitted");
+    assert.equal(service.registry.read(job.localId).localStatus, "polling");
+  }),
+);
+
+test(
+  "a chat thread's provider pin is neither sent nor recorded on the immediate route",
+  withService("standard", async ({ service, fake }) => {
+    fake.chatReplies = [{ status: 200, body: chatCompletion() }];
+    const job = await service.createChatJob({
+      threadId: "T-20261026-ABCD",
+      purpose: "turn",
+      throughSeq: 1,
+      model: FREE,
+      account: "default",
+      pin: { only: ["some-provider"], allow_fallbacks: false },
+      main: [{ role: "user", content: "hello there" }],
+    });
+    assert.equal(job.localStatus, "ready", job.error?.message);
+    assert.equal(job.providerPin, undefined);
+    assert.ok(!("provider" in fake.chatBodies()[0]!));
   }),
 );
 
@@ -296,7 +311,7 @@ test(
 test(
   "a settled response saved before a crash finishes from disk without calling again",
   withService("standard", async ({ service, fake }) => {
-    const job = await stoppedAfterSubmit(service);
+    const job = await stoppedAfterSubmit(service, fake);
     atomicWriteJson(service.registry.artefact(job.localId, "immediateProgress"), {
       [job.customIds[0]!]: { state: "completed", at: new Date().toISOString(), status: 200, bodyText: JSON.stringify(chatCompletion("Saved.")) },
     });

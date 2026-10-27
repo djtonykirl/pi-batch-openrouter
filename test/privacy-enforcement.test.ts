@@ -306,7 +306,15 @@ test(
     for (const c of cases) {
       // No attestation and an empty ZDR list: neither applies to the immediate route.
       await withEnv({ level: c.level, catalog: [] }, async ({ service, fake }) => {
-        const job = await service.createJob(await service.prepare({ ...ASK, model: "meta/llama-free:free" }), { previewOnly: true });
+        fake.chatReplies = [{ status: 200, body: chatCompletion() }];
+        const job = await service.createChatJob({
+          threadId: "T-20261026-ABCD",
+          purpose: "turn",
+          throughSeq: 1,
+          model: "meta/llama-free:free",
+          account: "default",
+          main: [{ role: "user", content: "hello" }],
+        });
         assert.deepEqual(job.privacy, { level: c.level, route: "immediate", enforcement: c.enforcement });
         assert.equal(job.route, "immediate");
         assert.equal(job.providerPin, undefined);
@@ -367,17 +375,58 @@ test(
 );
 
 test(
-  "an immediate-route job is sent through chat completions with its provider fields, never to /batches",
+  "an immediate-route chat job is sent through chat completions with its provider fields, never to /batches",
   withEnv({ level: "zdr", catalog: [] }, async ({ service, fake, jobsDir }) => {
     fake.submitReplies = [new Error("an immediate job must never reach /batches")];
     fake.chatReplies = [{ status: 200, body: chatCompletion() }];
-    const job = await service.createJob(await service.prepare({ ...ASK, model: "meta/llama-free:free" }), { previewOnly: false });
+    const job = await service.createChatJob({
+      threadId: "T-20261026-ABCD",
+      purpose: "turn",
+      throughSeq: 1,
+      model: "meta/llama-free:free",
+      account: "default",
+      main: [{ role: "user", content: "hello" }],
+    });
     assert.equal(job.localStatus, "ready", job.error?.message);
     assert.equal(postedBodies(fake).length, 0);
     const chat = fake.chatBodies();
     assert.equal(chat.length, 1);
     assert.deepEqual(chat[0]!.provider, { zdr: true });
     assert.deepEqual(jobDirs(jobsDir), [job.localId], "no orphan preview is left behind");
+  }),
+);
+
+const CHAT_ONLY = "Free models run only in batch chat (/batch chat); /batch ask and workflows need a batch model";
+
+test(
+  "/batch ask with a free model is refused before anything is persisted or sent",
+  async () => {
+    for (const previewOnly of [true, false]) {
+      await withEnv({ level: "standard" }, async ({ service, fake, jobsDir }) => {
+        await assert.rejects(service.createJob(await service.prepare({ ...ASK, model: "meta/llama-free:free" }), { previewOnly }), (err: unknown) => {
+          assert.ok(err instanceof SubmissionBlockedError);
+          assert.equal(err.message, CHAT_ONLY);
+          return true;
+        });
+        assert.deepEqual(jobDirs(jobsDir), []);
+        assert.equal(fake.requests.length, 0);
+      })();
+    }
+  },
+);
+
+test(
+  "a map-files workflow with a free model is refused before anything is persisted or sent",
+  withEnv({ level: "standard" }, async ({ service, fake, jobsDir }) => {
+    const plan = await service.planMapFiles({ objective: "Review this file for defects.", files: ["src/auth.ts"], contexts: [], format: "markdown", includeInstructions: true, model: "meta/llama-free:free" });
+    assert.deepEqual(plan.blockers, []);
+    await assert.rejects(service.createWorkflowJob(plan, { previewOnly: false }), (err: unknown) => {
+      assert.ok(err instanceof SubmissionBlockedError);
+      assert.equal(err.message, CHAT_ONLY);
+      return true;
+    });
+    assert.deepEqual(jobDirs(jobsDir), []);
+    assert.equal(fake.requests.length, 0);
   }),
 );
 

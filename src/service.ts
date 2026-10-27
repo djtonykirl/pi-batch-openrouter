@@ -194,6 +194,8 @@ export interface StoredMetadataPlan {
   createdAt: string;
 }
 
+export const IMMEDIATE_CHAT_ONLY = "Free models run only in batch chat (/batch chat); /batch ask and workflows need a batch model";
+
 export class SubmissionBlockedError extends Error {
   constructor(message: string) {
     super(message);
@@ -569,8 +571,11 @@ export class BatchService {
     const level = effectiveLevel(config.privacy.level, draft.privacyLevel);
     const route = routeForModel(draft.model, draft.route);
     if (route === "immediate") {
+      // Spec non-goal (v1): immediate requests outside batch chat need a rate-paced queue.
+      if (draft.kind !== "chat") throw new SubmissionBlockedError(IMMEDIATE_CHAT_ONLY);
       const enforcement = level === "zdr" ? "immediate: zdr=true" : level === "no-training" ? "immediate: data_collection=deny" : "none";
-      return { pin: draft.pin, route, privacy: { level, route, enforcement } };
+      // The immediate body carries only the privacy fields, so a pin is never recorded as if it were sent.
+      return { route, privacy: { level, route, enforcement } };
     }
     const catalog = level === "zdr" ? await this.deps.catalog?.whenLoaded(config.polling.requestTimeoutSeconds * 1000) : undefined;
     const decision = resolveBatchProvider({ level, model: draft.model, userPin: draft.pin, catalog, accountNoTraining: config.privacy.accountNoTraining });
