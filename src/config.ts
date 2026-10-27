@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { atomicWriteJson } from "./fsutil.js";
+import { isPrivacyLevel, type PrivacyLevel } from "./privacy/policy.js";
 
 /**
  * Application defaults — NOT claims about OpenRouter limits.
@@ -45,6 +46,8 @@ export interface BatchConfig {
   };
   /** Batch chat: persistent named threads. */
   chat: { autoCompact: boolean; autoCompactTokens: number; keepRecentExchanges: number; retitleAtTurn: number; systemPrompt: string };
+  /** Per-project privacy level and the account-level attestations behind it. */
+  privacy: { level: PrivacyLevel; accountNoTraining: boolean; deleteRemoteBatches: boolean; noticeShown: boolean };
 }
 
 export const DEFAULT_CONFIG: BatchConfig = {
@@ -84,6 +87,7 @@ export const DEFAULT_CONFIG: BatchConfig = {
     systemPrompt:
       "You are a helpful, knowledgeable assistant in an ongoing conversation. Answer clearly and directly. Use Markdown where it helps.",
   },
+  privacy: { level: "standard", accountNoTraining: false, deleteRemoteBatches: true, noticeShown: false },
 };
 
 export const GLOBAL_CONFIG_DIR = path.join(os.homedir(), ".pi", "agent", "pi-batch-openrouter");
@@ -198,6 +202,7 @@ const SCHEMA: Record<string, Check | Record<string, Check>> = {
     retitleAtTurn: posInt(1000),
     systemPrompt: str,
   },
+  privacy: { level: isPrivacyLevel, accountNoTraining: bool, deleteRemoteBatches: bool, noticeShown: bool },
 };
 
 /** Validates field-by-field; invalid fields revert to defaults and are reported. Unknown keys are reported. */
