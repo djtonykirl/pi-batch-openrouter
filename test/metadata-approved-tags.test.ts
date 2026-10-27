@@ -104,6 +104,9 @@ const PII_ADDRESS = { pii_type: "address", sensitivity: "medium", requires_maski
 const LOCATION = "uc_dev_global_rnd_mdip_01.lighthouse_gold.PNPT_location_data";
 const AUDIT_ONLY = "c.lighthouse_silver.pnpt_audit_only"; // lowercase, as UC information_schema exports it
 const PLANT = "uc_dev.lighthouse_bronze.PNPT_plant";
+const CONTACT = "uc_dev.lighthouse_silver.PNPT_contact";
+const EMAIL_TAGS = { pii: "true", pii_type: "email", sensitivity: "high", requires_masking: "true" };
+const EMAIL_COMMENT = "Email address of the facility contact person.\nTYPE: Dimension.\nVALUES: Email address.\nSYNONYMS: contact_email.\nNULL MEANS: No contact recorded.";
 
 const SP_TABLES: TableEvidence[] = [
   {
@@ -133,6 +136,12 @@ const SP_TABLES: TableEvidence[] = [
       { name: "plant_nm", data_type: "STRING", nullable: true, existing_comment: null, existing_tags: { note: "x" } },
     ],
   },
+  {
+    table: CONTACT,
+    existing_description: null,
+    existing_tags: {},
+    columns: [{ name: "contact_email", data_type: "STRING", nullable: true, existing_comment: null, existing_tags: EMAIL_TAGS }],
+  },
 ];
 
 const spProposal = (table: string): Record<string, unknown> => {
@@ -145,6 +154,13 @@ const spProposal = (table: string): Record<string, unknown> => {
         { name: "pk_loc_id", comment: COMMENT_33, confidence: "high", reason: "DDL.", pii_tags: null },
         { name: "Address1_ds", comment: ADDRESS_COMMENT, confidence: "medium", reason: "Name.", pii_tags: PII_ADDRESS },
       ],
+    };
+  if (table === CONTACT)
+    return {
+      table,
+      classification: "internal",
+      table_description: { comment: DESCRIPTION_33, confidence: "medium", reason: "Context." },
+      columns: [{ name: "contact_email", comment: EMAIL_COMMENT, confidence: "medium", reason: "Name.", pii_tags: null }],
     };
   if (table === AUDIT_ONLY) return { table, classification: "internal", table_description: { comment: DESCRIPTION_33, confidence: "medium", reason: "Context." }, columns: [] };
   return {
@@ -246,7 +262,7 @@ test("standards validate: hand-edited tags, public on a PII table, altered exist
     assert.deepEqual(tableTagProblems({ classification: "public", data_domain: "pinpoint", uc_prefix: "PNPT_", medallion_layer: "gold", pii: "false" }, { ...STANDARDS, layer: "gold" }, false), []);
   }, spFiles));
 
-test("standards audit columns: they keep their existing values and tags and are not checked; an all-audit table passes", () =>
+test("standards audit columns: locked to their existing values and tags (problems name the column, not the value); an all-audit table passes", () =>
   withWorkspace(async (_root, service, fake) => {
     const draft = toApprovedJsonl(approvedDraftRows(await standardsJob(service, fake)));
     const rows = parseRows(draft);
@@ -260,14 +276,23 @@ test("standards audit columns: they keep their existing values and tags and are 
     assert.equal(rows[1]!.approved_tags.pii, "false");
     assert.equal(rows[1]!.approved_tags.medallion_layer, "silver");
     assert.deepEqual(validateApprovedText(draft, service).problems, []);
-    // A reviewer value on an audit column is not standards-checked either.
-    audit.approved_comment = "short";
-    assert.deepEqual(validateApprovedText(joinRows(rows), service).problems, []);
+    // Audit columns are locked to their existing values; problems name the column, never the value.
+    const v = (m: (r: Row[]) => void) => {
+      const r = parseRows(draft);
+      m(r);
+      return validateApprovedText(joinRows(r), service).problems.join("\n");
+    };
+    assert.match(v((r) => (col(r[0]!, "fw_ingestdate").approved_comment = "short")), /line 1: column "fw_ingestdate" is a framework audit column: approved_comment must equal existing_comment/);
+    assert.match(v((r) => (col(r[0]!, "fw_ingestdate").approved_tags = { pii: "false" })), /line 1: column "fw_ingestdate" is a framework audit column: approved_tags must equal existing_tags/);
+    assert.match(v((r) => (col(r[1]!, "pipeline_timestamp").approved_tags = { pii: "false" })), /line 2: column "pipeline_timestamp" is a framework audit column: approved_tags must equal existing_tags/);
+    const piiText = v((r) => (col(r[1]!, "FW_INGESTDATE").approved_comment = "Loaded by jane@example.com, call 555-123-4567."));
+    assert.match(piiText, /line 2: column "FW_INGESTDATE" is a framework audit column: approved_comment must equal existing_comment/);
+    assert.doesNotMatch(piiText, /jane@example\.com|555-123-4567/);
     // Lowercase UC names are in the prefix (information_schema exports lowercase).
     assert.ok(hasUcPrefix(AUDIT_ONLY, "PNPT_"));
   }, spFiles));
 
-test("standards partial: --allow-partial keeps a table without a proposal at its existing values and tags", () =>
+test("standards partial: --allow-partial keeps existing text values of a table without a proposal; its tags are made taxonomy-valid", () =>
   withWorkspace(async (root, service, fake) => {
     const o = await standardsJob(service, fake, [2]);
     const art = artifactsFor(root, service);
@@ -277,8 +302,13 @@ test("standards partial: --allow-partial keeps a table without a proposal at its
     const rows = parseRows(fs.readFileSync(path.join(root, "metadata/pinpoint/approved.jsonl"), "utf8"));
     const plant = rows[2]!;
     assert.equal(plant.approved_description, "Plants.");
-    assert.deepEqual(plant.approved_tags, { owner: "legacy" });
-    assert.deepEqual((plant.columns as Row[]).map((c) => [c.approved_comment, c.approved_tags]), [[PLANT_COMMENT, {}], [null, { note: "x" }]]);
+    // Tags stay taxonomy-valid: derived facts, pii_scan_required for a non-taxonomy classification, invalid tags dropped.
+    assert.equal(JSON.stringify(plant.approved_tags), JSON.stringify({ classification: "pii_scan_required", data_domain: "pinpoint", uc_prefix: "PNPT_", medallion_layer: "bronze", pii: "false" }));
+    assert.deepEqual((plant.columns as Row[]).map((c) => [c.approved_comment, c.approved_tags]), [[PLANT_COMMENT, {}], [null, {}]]);
+    const md = metadataReviewMarkdown(o);
+    assert.match(md, /_non-taxonomy tags dropped_ \(table, column plant_nm\)/);
+    assert.match(md, /\*\*Tags:\*\* _tags changed: `owner=legacy` → `classification=pii_scan_required, /);
+    assert.match(md, /- plant_nm: _tags changed: `note=x` → none_/);
     // Changing a value of that table makes it subject to the standards again.
     plant.approved_description = "Plants of the bottling network.";
     assert.match(validateApprovedText(joinRows(rows), service).problems.join("\n"), /line 3: approved_description: .*GRAIN:/);
@@ -287,11 +317,24 @@ test("standards partial: --allow-partial keeps a table without a proposal at its
 test("standards review: tags line, PII column, audit rows and the non-standard replacement marker", () =>
   withWorkspace(async (_root, service, fake) => {
     const md = metadataReviewMarkdown(await standardsJob(service, fake));
-    assert.match(md, /\*\*Tags:\*\* none → `classification=internal, data_domain=pinpoint, uc_prefix=PNPT_, medallion_layer=gold, pii=true`/);
-    assert.match(md, /\*\*Tags:\*\* `owner=legacy` → `classification=confidential/);
+    assert.match(md, /\*\*Tags:\*\* _tags changed: none → `classification=internal, data_domain=pinpoint, uc_prefix=PNPT_, medallion_layer=gold, pii=true`_/);
+    assert.match(md, /\*\*Tags:\*\* _tags changed: `owner=legacy` → `classification=confidential/);
+    assert.match(md, /_non-taxonomy tags dropped_ \(table, column plant_nm\)/);
     assert.match(md, /\| Column \| Type \| Existing \| Proposed \| Confidence \| PII \|/);
     assert.match(md, /\| pk_loc_id \| STRING \| Location id \| Unique Core .* _replaces a non-standard existing value_ \| high \| — \|/);
-    assert.match(md, /\| Address1_ds \| STRING \| — \| First line .* \| medium \| address \(medium, masking true\) \|/);
+    assert.match(md, /\| Address1_ds \| STRING \| — \| First line .* \| medium \| address \(medium, masking true\) _tags changed: none → `pii=true, pii_type=address, sensitivity=medium, requires_masking=true`_ \|/);
+    assert.match(md, /\| contact_email \| STRING \| — \| Email address .* \| medium \| email \(high, masking true\) _kept existing PII tag \(model proposed none\)_ \|/);
     assert.match(md, /\| fw_ingestdate \| TIMESTAMP \| Ingest date \| — \| audit column \(not sent\) \| — \|/);
     assert.match(md, /CLASSIFICATION: Confidential\.\n\n_replaces a non-standard existing value_/);
+  }, spFiles));
+
+test("standards R4 for tags: a valid existing PII tag is kept when the model proposes none; the table pii follows it", () =>
+  withWorkspace(async (_root, service, fake) => {
+    const draft = toApprovedJsonl(approvedDraftRows(await standardsJob(service, fake)));
+    const contact = parseRows(draft)[3]!;
+    assert.equal(contact.table, CONTACT);
+    assert.equal(JSON.stringify(col(contact, "contact_email").approved_tags), JSON.stringify(EMAIL_TAGS));
+    assert.equal(contact.approved_tags.pii, "true");
+    assert.equal(contact.approved_tags.classification, "internal");
+    assert.deepEqual(validateApprovedText(draft, service).problems, []);
   }, spFiles));
