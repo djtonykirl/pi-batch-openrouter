@@ -9,9 +9,11 @@ import { customIdFor, customIdProblems } from "./ids.js";
 import { combinedCoverage, isUsable, itemText, jobItems, resolveItem, sourceLabel, type Coverage } from "./items.js";
 import { nullLogger, type Logger } from "./logger.js";
 import { normalizeBatchModelSlug } from "./models.js";
+import type { ModelCatalog } from "./models/catalog.js";
 import { OpenRouterBatchClient, OpenRouterError, type RawExchange } from "./openrouter/client.js";
 import { normaliseBatchResult, type NormalisedBatchResult } from "./openrouter/normalise-result.js";
 import { buildSubmitBody, messageText, submitBodyProblems, type BatchRequestItem, type ChatMessage, type ProviderPin, type SubmitBody } from "./openrouter/types.js";
+import { effectiveLevel, resolveBatchProvider, routeForModel, type PrivacyLevel, type Route } from "./privacy/policy.js";
 import { compileOutputSchema, type OutputValidator } from "./workflows/structured.js";
 import { findWorkflow, formatDiagnostics, type WorkflowDefinition, type WorkflowEntry } from "./workflows/definition.js";
 import { planDatasetRun, type DatasetPlan, type EffectiveLimits } from "./workflows/dataset-run.js";
@@ -226,6 +228,8 @@ export interface ServiceDeps {
   onSettled?: (job: JobManifest) => void;
   /** For packaging tests only. */
   gitIgnored?: PackageInput["gitIgnored"];
+  /** Session model catalog; required for `zdr` batch jobs (without it they are refused). */
+  catalog?: ModelCatalog;
 }
 
 export interface ReconcileOutcome {
@@ -242,7 +246,14 @@ interface JobDraft {
   objective: string;
   model: string;
   account: string;
+  /** The user's provider pin; replaced by the privacy decision before the body is built. */
   pin?: ProviderPin;
+  /** The thread's own level (chat); absent means the config's `privacy.level`. The stricter of the two applies. */
+  privacyLevel?: PrivacyLevel;
+  /** Explicit route; absent means derived from the model ID. */
+  route?: Route;
+  /** Re-check for an identical active job against the body as decided (the privacy pin can change it). */
+  checkDuplicate?: boolean;
   format: "markdown" | "json";
   items: Array<{
     source: ItemSource;
@@ -393,7 +404,7 @@ export class BatchService {
     const config = this.deps.getConfig();
     const { pkg } = prepared;
     const objective = prepared.options.objective.trim();
-    const job = this.persistJob({
+    const job = await this.persistJob({
       kind: "goal",
       objective,
       model: prepared.model,
@@ -411,6 +422,7 @@ export class BatchService {
       context: { fileCount: pkg.files.length, characters: pkg.characters, excludedCount: pkg.excluded.length },
       warnings: [...pkg.warnings],
       retryCount: 0,
+      checkDuplicate: !opts.previewOnly,
       writeArtefacts: (localId) => {
         atomicWriteFile(this.registry.artefact(localId, "objective"), objective + "\n");
         atomicWriteFile(this.registry.artefact(localId, "context"), pkg.contextText);
@@ -445,9 +457,17 @@ export class BatchService {
    * The single persistence path: allocates the local ID, derives provider-safe
    * custom_ids, validates the exact payload, writes the request artefacts
    * (whole-batch and per-item), then the manifest (draft -> previewed).
-   * Throws before anything is written if the payload is invalid.
+   * Throws before anything is written if the payload is invalid, or if the
+   * effective privacy level refuses the job (SubmissionBlockedError).
    */
-  private persistJob(draft: JobDraft): JobManifest {
+  private async persistJob(input: JobDraft): Promise<JobManifest> {
+    const { pin, route, privacy } = await this.decidePrivacy(input);
+    const draft: JobDraft = { ...input, pin };
+    if (draft.checkDuplicate) {
+      const masked = buildSubmitBody({ model: draft.model, provider: pin, requests: draft.items.map((it) => ({ custom_id: "{custom_id}", body: it.body })) });
+      const dup = this.findActiveDuplicate(contentHash(masked));
+      if (dup) throw new DuplicateActiveRequestError(dup.localId);
+    }
     const job = this.registry.create((localId) => {
       const customIds = draft.items.map((_, i) => customIdFor(localId, i));
       const body = buildSubmitBody({
@@ -495,6 +515,8 @@ export class BatchService {
         provider: "openrouter",
         account: draft.account,
         ...(draft.pin ? { providerPin: draft.pin } : {}),
+        ...(route !== "batch" ? { route } : {}),
+        privacy,
         endpoint: "/v1/chat/completions",
         format: draft.format,
         localStatus: "draft",
@@ -527,8 +549,31 @@ export class BatchService {
       u.transition("previewed", draft.previewDetails);
       return u.manifest;
     });
-    this.logger.log("info", "job_created", { localId: job.localId, kind: draft.kind, requests: job.requestCount, ...draft.previewDetails });
+    this.logger.log("info", "job_created", { localId: job.localId, kind: draft.kind, requests: job.requestCount, privacy: privacy.level, ...draft.previewDetails });
     return previewed;
+  }
+
+  /**
+   * Applies the effective privacy level (stricter of config and draft) before
+   * anything is written. Batch route: the policy's provider decision replaces
+   * the user's pin, or the job is refused. Immediate route: only recorded here
+   * (its provider fields are sent per request).
+   */
+  private async decidePrivacy(draft: JobDraft): Promise<{ pin?: ProviderPin; route: Route; privacy: NonNullable<JobManifest["privacy"]> }> {
+    const config = this.deps.getConfig();
+    const level = effectiveLevel(config.privacy.level, draft.privacyLevel);
+    const route = routeForModel(draft.model, draft.route);
+    if (route === "immediate") {
+      const enforcement = level === "zdr" ? "immediate: zdr=true" : level === "no-training" ? "immediate: data_collection=deny" : "none";
+      return { pin: draft.pin, route, privacy: { level, route, enforcement } };
+    }
+    const catalog = level === "zdr" ? await this.deps.catalog?.whenLoaded(config.polling.requestTimeoutSeconds * 1000) : undefined;
+    const decision = resolveBatchProvider({ level, model: draft.model, userPin: draft.pin, catalog, accountNoTraining: config.privacy.accountNoTraining });
+    if (!decision.ok) {
+      this.logger.log("warn", "privacy_refused", { kind: draft.kind, level, model: draft.model });
+      throw new SubmissionBlockedError(decision.reason);
+    }
+    return { pin: decision.provider, route, privacy: { level, route, enforcement: decision.enforcement } };
   }
 
   // ------------------------------------------------------------ map-files
@@ -609,7 +654,7 @@ export class BatchService {
     this.assertNoActiveDuplicate(plan.contentSha256, opts.previewOnly);
     const config = this.deps.getConfig();
     const objective = plan.options.objective.trim();
-    const job = this.persistJob({
+    const job = await this.persistJob({
       kind: "workflow",
       objective,
       model: plan.model,
@@ -620,6 +665,7 @@ export class BatchService {
       context: { fileCount: plan.pkg.files.length, characters: plan.totalCharacters, excludedCount: plan.pkg.excluded.length },
       warnings: [...plan.pkg.warnings],
       retryCount: 0,
+      checkDuplicate: !opts.previewOnly,
       workflow: plan.workflow,
       writeArtefacts: (localId, customIds, itemShas) => {
         atomicWriteFile(this.registry.artefact(localId, "objective"), objective + "\n");
@@ -753,7 +799,7 @@ export class BatchService {
       selection: plan.selection,
       planSha256: plan.planSha256,
     };
-    const job = this.persistJob({
+    const job = await this.persistJob({
       kind: "workflow",
       schemaVersion: DATASET_MANIFEST_SCHEMA_VERSION,
       objective: prepared.objective,
@@ -772,6 +818,7 @@ export class BatchService {
       context: { fileCount: 1, characters: plan.totalCharacters, excludedCount: 0 },
       warnings: [...prepared.warnings],
       retryCount: 0,
+      checkDuplicate: !opts.previewOnly,
       workflow: info,
       writeArtefacts: (localId, customIds, itemShas) => {
         atomicWriteFile(this.registry.artefact(localId, "objective"), prepared.objective + "\n");
@@ -892,7 +939,7 @@ export class BatchService {
       input: { path: input.relPath, sha256: plan.inputSha256, bytes: input.bytes, tables: plan.tables, tablesWithSamples: plan.tablesWithSamples },
       planSha256: plan.planSha256,
     };
-    const job = this.persistJob({
+    const job = await this.persistJob({
       kind: "workflow",
       schemaVersion: DATASET_MANIFEST_SCHEMA_VERSION,
       objective: prepared.objective,
@@ -904,6 +951,7 @@ export class BatchService {
       context: { fileCount: 2, characters: plan.totalCharacters, excludedCount: 0 },
       warnings: [...prepared.warnings],
       retryCount: 0,
+      checkDuplicate: !opts.previewOnly,
       workflow: info,
       writeArtefacts: (localId, customIds, itemShas) => {
         atomicWriteFile(this.registry.artefact(localId, "objective"), prepared.objective + "\n");
@@ -1553,7 +1601,7 @@ export class BatchService {
 
     const model = opts.model ? normalizeBatchModelSlug(opts.model) : srcBody.model;
     const promptOf = (body: BatchRequestItem["body"]) => body.messages.filter((m) => m.role === "user").map((m) => messageText(m)).join("\n\n");
-    const child = this.persistJob({
+    const child = await this.persistJob({
       kind: source.kind ?? "goal",
       objective: source.objective,
       model,
@@ -1726,7 +1774,7 @@ export class BatchService {
     this.assertNoActiveDuplicate(prepared.contentSha256, opts.previewOnly);
     const source = this.registry.read(prepared.sourceJobId);
     const objective = `Synthesis of ${prepared.sourceJobId}: ${source.objective}`;
-    const job = this.persistJob({
+    const job = await this.persistJob({
       kind: "synthesis",
       objective,
       model: prepared.model,
@@ -1744,6 +1792,7 @@ export class BatchService {
       context: { fileCount: 0, characters: prepared.characters, excludedCount: prepared.linkage.excluded.length },
       warnings: prepared.linkage.excluded.length ? [`partial synthesis: ${prepared.linkage.excluded.length} of ${prepared.linkage.expectedItems} source item(s) not included`] : [],
       retryCount: 0,
+      checkDuplicate: !opts.previewOnly,
       synthesis: prepared.linkage,
       writeArtefacts: (localId) => {
         atomicWriteFile(this.registry.artefact(localId, "objective"), objective + "\n");
@@ -1767,6 +1816,9 @@ export class BatchService {
     model: string;
     account: string;
     pin?: ProviderPin;
+    /** The thread's own privacy level; the stricter of it and the config level applies. */
+    privacyLevel?: PrivacyLevel;
+    route?: Route;
     main: ChatMessage[];
     title?: ChatMessage[];
   }): Promise<JobManifest> {
@@ -1780,13 +1832,15 @@ export class BatchService {
     if (input.title) items.push(mk(input.title, "chat-title"));
     const characters = items.reduce((n, it) => n + it.characters, 0);
     const chat: ChatLinkage = { threadId: input.threadId, purpose: input.purpose, throughSeq: input.throughSeq, titleItem: input.title !== undefined };
-    const job = this.persistJob({
+    const job = await this.persistJob({
       kind: "chat",
       schemaVersion: CHAT_MANIFEST_SCHEMA_VERSION,
       objective,
       model: input.model,
       account: input.account,
       pin: input.pin,
+      ...(input.privacyLevel ? { privacyLevel: input.privacyLevel } : {}),
+      ...(input.route ? { route: input.route } : {}),
       format: "markdown",
       items,
       context: { fileCount: 0, characters, excludedCount: 0 },

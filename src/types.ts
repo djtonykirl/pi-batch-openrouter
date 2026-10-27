@@ -1,5 +1,6 @@
 import type { NormalisedUsage } from "./openrouter/normalise-result.js";
 import type { ProviderPin } from "./openrouter/types.js";
+import type { PrivacyLevel, Route } from "./privacy/policy.js";
 import type { LocalStatus } from "./state.js";
 
 /**
@@ -211,6 +212,13 @@ export interface JobManifest {
   account: string;
   /** Optional upstream provider pin (`provider.only` in the OpenRouter request). */
   providerPin?: ProviderPin;
+  /** How the job's requests are sent. Absent means "batch" (every job made before the immediate route). */
+  route?: Route;
+  /**
+   * The privacy level enforced when this job was created, and how. Absent on
+   * jobs made before privacy levels existed (they were sent at `standard`).
+   */
+  privacy?: { level: PrivacyLevel; route: Route; enforcement: string };
   endpoint: "/v1/chat/completions";
   format: "markdown" | "json";
 
