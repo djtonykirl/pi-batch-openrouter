@@ -153,6 +153,7 @@ export function tableTagProblems(tags: TagMap, expected: { domain: string; ucPre
   if ("medallion_layer" in tags && expected.layer !== null && tags.medallion_layer !== expected.layer) problems.push(`${what} medallion_layer must be "${expected.layer}" (from the schema name)`);
   const pii = anyColumnPii ? "true" : "false";
   if ("pii" in tags && tags.pii !== pii) problems.push(`${what} pii must be "${pii}" (${anyColumnPii ? "a column is tagged PII" : "no column is tagged PII"})`);
+  if (tags.classification === "public" && (anyColumnPii || tags.pii === "true")) problems.push(`${what} classification "public" is not allowed on a table with PII; use a stricter classification`);
   return problems;
 }
 

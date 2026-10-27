@@ -30,7 +30,9 @@ export const METADATA_HELP = `/batch metadata — Databricks table descriptions 
                                      Markdown review: existing vs proposed values (an artifact)
   approved <job> --out <approved.jsonl> [--overwrite] [--allow-partial]
                                      draft handoff: existing values kept, empty ones take the proposal,
-                                     insufficient evidence stays null; edit it, then validate it
+                                     insufficient evidence stays null; edit it, then validate it.
+                                     Standards mode: rows carry tags, and an existing value that fails
+                                     the standards takes the proposal (marked in the review)
   validate-approved <approved.jsonl> [--job <id>]
                                      check a handoff against the job's evidence and report edits
 
@@ -98,15 +100,20 @@ export async function cmdMetadata(rt: BatchRuntime, rest: string[], ctx: Extensi
       if (!id || !parsed.values.out) throw new Error("Usage: /batch metadata approved <job> --out <approved.jsonl> [--overwrite] [--allow-partial]");
       const { manifest: m, validation, outcome } = await writeApprovedDraft(service, rt.requireArtifacts(), id, { out: parsed.values.out, overwrite: parsed.booleans.has("overwrite"), allowPartial: parsed.booleans.has("allow-partial") });
       const c = validation.counts;
+      const draftNote = outcome.standards
+        ? `   ${c.replacedNonStandard ?? 0} non-standard existing value(s) replaced by proposals\n` +
+          `   This is a DRAFT for review: standard existing values were kept; non-standard ones were replaced by proposals (marked in the review). Edit approved_* values and tags, then: /batch metadata validate-approved ${m.output!.path}\n`
+        : `   This is a DRAFT for review: existing comments were kept, not replaced. Edit approved_* values, then: /batch metadata validate-approved ${m.output!.path}\n`;
       rt.notify(
         `✅ Draft handoff written: ${m.output!.path} (artifact ${m.artifactId}, sha256 ${m.output!.sha256})\n` +
           `   ${outcome.tables.length} table(s); values: ${c.keptExisting} existing kept, ${c.fromProposal} from proposals, ${c.nullApproved} null (insufficient evidence or no proposal)\n` +
-          `   This is a DRAFT for review: existing comments were kept, not replaced. Edit approved_* values, then: /batch metadata validate-approved ${m.output!.path}\n` +
+          draftNote +
           `   Nothing has been applied to Databricks.`,
         validation.problems.length ? "warning" : "info",
       );
       return;
-    }    case "validate-approved": {
+    }
+    case "validate-approved": {
       const parsed = parseArgs(args, { values: ["job"] });
       if (parsed.errors.length) throw new Error(`/batch metadata validate-approved: ${parsed.errors.join("; ")}`);
       const file = parsed.positionals[0];
@@ -115,9 +122,12 @@ export async function cmdMetadata(rt: BatchRuntime, rest: string[], ctx: Extensi
       if (!r.ok) throw new ArtifactError(r.message);
       const v = validateApprovedText(fs.readFileSync(r.absPath, "utf8"), service, parsed.values.job);
       const c = v.counts;
-      const summary = `${r.relPath}: ${v.rows} table row(s)${v.jobId ? ` from job ${v.jobId}` : ""}; ${c.total} value(s): ${c.keptExisting} existing kept, ${c.fromProposal} as proposed, ${c.edited} edited by a reviewer, ${c.nullApproved} null`;
+      const summary =
+        `${r.relPath}: ${v.rows} table row(s)${v.jobId ? ` from job ${v.jobId}` : ""}; ${c.total} value(s): ${c.keptExisting} existing kept, ${c.fromProposal} as proposed, ${c.edited} edited by a reviewer, ${c.nullApproved} null` +
+        (c.replacedNonStandard !== undefined ? `; ${c.replacedNonStandard} non-standard existing value(s) replaced by proposals` : "");
       if (v.problems.length) throw new SubmissionBlockedError(`❌ ${summary}\n\nProblems:\n- ${v.problems.join("\n- ")}`);
-      rt.notify(`✅ ${summary}\n   Valid against the job's evidence. Hand it to the Databricks process for validation and application; Pi applies nothing.`, "info");
+      const nulls = v.nullValues?.length ? `\n   Null (skipped by the applier): ${v.nullValues.join(", ")}` : "";
+      rt.notify(`✅ ${summary}${nulls}\n   Valid against the job's evidence. Hand it to the Databricks process for validation and application; Pi applies nothing.`, "info");
       return;
     }
     case "help":

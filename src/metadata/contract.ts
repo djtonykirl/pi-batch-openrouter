@@ -57,11 +57,28 @@ export interface TableProposal {
   columns: ColumnProposal[];
 }
 
+export interface ApprovedColumn {
+  name: string;
+  existing_comment: string | null;
+  approved_comment: string | null;
+  /** Standards mode only (required there, rejected on a version 1 job). */
+  existing_tags?: TagMap;
+  approved_tags?: TagMap;
+}
+
+/**
+ * One table of approved.jsonl. Key order is part of the contract (TDD §3.3):
+ * table, existing_description, approved_description, [existing_tags, approved_tags,]
+ * columns[name, existing_comment, approved_comment, [existing_tags, approved_tags]], provenance.
+ * Version 1 rows carry no tag keys.
+ */
 export interface ApprovedRow {
   table: string;
   existing_description: string | null;
   approved_description: string | null;
-  columns: Array<{ name: string; existing_comment: string | null; approved_comment: string | null }>;
+  existing_tags?: TagMap;
+  approved_tags?: TagMap;
+  columns: ApprovedColumn[];
   provenance: {
     job_id: string;
     result_job_id: string | null;
@@ -170,45 +187,61 @@ export const PROPOSAL_SCHEMA_V2 = {
   },
 } as const;
 
-export const APPROVED_SCHEMA = {
+/**
+ * approved.jsonl row schema. `tags` decides the tag keys: "none" is the version 1
+ * contract (tag keys are unknown properties), "optional" is the published schema,
+ * and "required" is what a standards-mode (version 2) job's rows must satisfy.
+ */
+function approvedSchema(tags: "none" | "optional" | "required") {
+  const tagProps = tags === "none" ? {} : { existing_tags: tagMap, approved_tags: tagMap };
+  const tagKeys = tags === "required" ? ["existing_tags", "approved_tags"] : [];
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["table", "existing_description", "approved_description", ...tagKeys, "columns", "provenance"],
+    properties: {
+      table: { type: "string", pattern: TABLE_NAME_PATTERN },
+      existing_description: nullableText,
+      approved_description: nullableText,
+      ...tagProps,
+      columns: {
+        type: "array",
+        minItems: 1,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["name", "existing_comment", "approved_comment", ...tagKeys],
+          properties: { name: { type: "string", minLength: 1 }, existing_comment: nullableText, approved_comment: nullableText, ...tagProps },
+        },
+      },
+      provenance: APPROVED_PROVENANCE,
+    },
+  };
+}
+
+const APPROVED_PROVENANCE = {
   type: "object",
   additionalProperties: false,
-  required: ["table", "existing_description", "approved_description", "columns", "provenance"],
+  required: ["job_id", "result_job_id", "result_custom_id", "input_sha256", "context_sha256", "proposal_sha256"],
   properties: {
-    table: { type: "string", pattern: TABLE_NAME_PATTERN },
-    existing_description: nullableText,
-    approved_description: nullableText,
-    columns: {
-      type: "array",
-      minItems: 1,
-      items: {
-        type: "object",
-        additionalProperties: false,
-        required: ["name", "existing_comment", "approved_comment"],
-        properties: { name: { type: "string", minLength: 1 }, existing_comment: nullableText, approved_comment: nullableText },
-      },
-    },
-    provenance: {
-      type: "object",
-      additionalProperties: false,
-      required: ["job_id", "result_job_id", "result_custom_id", "input_sha256", "context_sha256", "proposal_sha256"],
-      properties: {
-        job_id: { type: "string", pattern: "^B-\\d{8}-[0-9A-Z]{4,8}$" },
-        result_job_id: { anyOf: [{ type: "string" }, { type: "null" }] },
-        result_custom_id: { anyOf: [{ type: "string" }, { type: "null" }] },
-        input_sha256: { type: "string", pattern: "^[0-9a-f]{64}$" },
-        context_sha256: { type: "string", pattern: "^[0-9a-f]{64}$" },
-        proposal_sha256: { anyOf: [{ type: "string", pattern: "^[0-9a-f]{64}$" }, { type: "null" }] },
-      },
-    },
+    job_id: { type: "string", pattern: "^B-\\d{8}-[0-9A-Z]{4,8}$" },
+    result_job_id: { anyOf: [{ type: "string" }, { type: "null" }] },
+    result_custom_id: { anyOf: [{ type: "string" }, { type: "null" }] },
+    input_sha256: { type: "string", pattern: "^[0-9a-f]{64}$" },
+    context_sha256: { type: "string", pattern: "^[0-9a-f]{64}$" },
+    proposal_sha256: { anyOf: [{ type: "string", pattern: "^[0-9a-f]{64}$" }, { type: "null" }] },
   },
 } as const;
+
+/** The published approved.jsonl schema: tag keys allowed; validateApprovedText requires or rejects them by job version. */
+export const APPROVED_SCHEMA = approvedSchema("optional");
 
 const ajv = new Ajv({ allErrors: true, strict: true, strictTypes: false, coerceTypes: false, useDefaults: false, removeAdditional: false, logger: false });
 const tableValidator = ajv.compile(TABLE_EVIDENCE_SCHEMA);
 const proposalValidator = ajv.compile(PROPOSAL_SCHEMA);
 const proposalValidatorV2 = ajv.compile(PROPOSAL_SCHEMA_V2);
-const approvedValidator = ajv.compile(APPROVED_SCHEMA);
+const approvedValidatorV1 = ajv.compile(approvedSchema("none"));
+const approvedValidatorV2 = ajv.compile(approvedSchema("required"));
 
 /** Databricks identifiers are case-insensitive: duplicates are compared case-insensitively. */
 export const identityKey = (s: string): string => s.toLowerCase();
@@ -281,6 +314,8 @@ export function proposalProblems(value: unknown, expected: TableEvidence, standa
   return problems;
 }
 
-export function approvedRowProblems(value: unknown): string[] {
-  return approvedValidator(value) ? [] : formatErrors(approvedValidator.errors ?? []);
+/** Schema problems of one approved row: version 1 rejects tag keys; standards mode requires them. */
+export function approvedRowProblems(value: unknown, standards?: MetadataStandards): string[] {
+  const validator = standards ? approvedValidatorV2 : approvedValidatorV1;
+  return validator(value) ? [] : formatErrors(validator.errors ?? []);
 }
