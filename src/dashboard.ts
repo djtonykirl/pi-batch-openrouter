@@ -177,7 +177,11 @@ export function describeJob(job: JobManifest, storageDir?: string): string[] {
   const multi = (job.items?.length ?? 0) > 1;
   const rows: Array<[string, string | number | undefined]> = [
     ["Job", job.localId],
-    ["Provider batch ID", job.providerBatchId],
+    ["Provider batch ID", job.providerBatchId ?? (job.route === "immediate" ? "none (immediate route)" : undefined)],
+    ["Route", job.route ?? job.privacy?.route],
+    ["Privacy", job.privacy?.level],
+    ["Enforcement", job.privacy?.enforcement],
+    ["Remote deletion", remoteDeletionCell(job)],
     ["Local status", job.localStatus],
     ["Provider status", job.providerStatus],
     ["Objective", job.objective.replace(/\s+/g, " ")],
@@ -220,6 +224,14 @@ export function describeJob(job: JobManifest, storageDir?: string): string[] {
   const lines = rows.filter(([, v]) => v !== undefined && v !== "").map(([k, v]) => `  ${k.padEnd(20)} ${v}`);
   for (const w of job.warnings) lines.push(`  ${"Warning".padEnd(20)} ${w}`);
   return lines;
+}
+
+function remoteDeletionCell(job: JobManifest): string | undefined {
+  const d = job.remoteDeletion;
+  if (!d) return undefined;
+  const at = d.at ? ` ${formatIsoShort(d.at)}` : "";
+  const err = d.lastError ? `, last error: ${d.lastError}` : "";
+  return `${d.state}${at} (${d.attempts} attempt${d.attempts === 1 ? "" : "s"}${err})`;
 }
 
 function workflowCell(job: JobManifest): string | undefined {

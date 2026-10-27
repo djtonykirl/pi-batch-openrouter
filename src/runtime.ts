@@ -7,6 +7,9 @@ import { BatchPoller } from "./poller.js";
 import { JobRegistry } from "./registry.js";
 import { ArtifactService } from "./artifacts/service.js";
 import { ArtifactStore } from "./artifacts/store.js";
+import { ModelCatalog, type CatalogModel } from "./models/catalog.js";
+import { OpenRouterBatchClient } from "./openrouter/client.js";
+import type { ZdrEndpoint } from "./privacy/policy.js";
 import { BatchService } from "./service.js";
 import { isChatJob, type JobManifest } from "./types.js";
 import { ChatService } from "./chat/service.js";
@@ -29,12 +32,15 @@ export class BatchRuntime {
   public service: BatchService | null = null;
   public artifacts: ArtifactService | null = null;
   public chat: ChatService | null = null;
+  /** Session model catalog (shared by the service, chat and web); null with no workspace. Kept across config reloads. */
+  public catalog: ModelCatalog | null = null;
   public chatSession: ChatSession | null = null;
   public webServer: BatchWebServer | null = null;
   private chatStore: ThreadStore | null = null;
   public readonly poller: BatchPoller;
   private logger: Logger | null = null;
   private apiKeyCache = new Map<string, string>();
+  private catalogFile: string | null = null;
 
   constructor(public readonly pi: ExtensionAPI) {
     this.poller = new BatchPoller(
@@ -74,13 +80,21 @@ export class BatchRuntime {
       this.artifacts = null;
       this.chat = null;
       this.chatStore = null;
+      this.catalog = null;
+      this.catalogFile = null;
       return;
     }
     const storage = path.resolve(this.cwd, this.loaded.config.storagePath);
     const registry = new JobRegistry(storage);
     this.logger = new FileLogger(path.join(storage, "extension.log"), () => [...this.apiKeyCache.values(), process.env.OPENROUTER_API_KEY ?? ""]);
+    const catalogFile = path.join(storage, "model-catalog.json");
+    if (!this.catalog || this.catalogFile !== catalogFile) {
+      this.catalogFile = catalogFile;
+      this.catalog = new ModelCatalog({ file: catalogFile, logger: this.logger, fetch: () => this.fetchCatalog() });
+    }
     this.service = new BatchService({
       registry,
+      catalog: this.catalog,
       workspaceRoot: this.cwd,
       getConfig: () => this.loaded.config,
       resolveApiKey: (account) => this.resolveApiKey(account),
@@ -104,6 +118,14 @@ export class BatchRuntime {
     if (this.loaded.errors.length > 0) {
       this.logger.log("warn", "config_errors", { errors: this.loaded.errors });
     }
+  }
+
+  /** Both endpoints are public; the key is only sent as the client requires one. Without a key the load fails and the catalog stays stale (fail-safe). */
+  private async fetchCatalog(): Promise<{ models: CatalogModel[]; zdr: ZdrEndpoint[] }> {
+    const apiKey = await this.resolveApiKey(this.loaded.config.defaultAccount);
+    const client = new OpenRouterBatchClient({ apiKey, timeoutMs: this.loaded.config.polling.requestTimeoutSeconds * 1000 });
+    const [models, zdr] = await Promise.all([client.listModels(), client.listZdrEndpoints()]);
+    return { models: models.models, zdr: zdr.endpoints };
   }
 
   public requireArtifacts(): ArtifactService {

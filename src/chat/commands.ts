@@ -4,8 +4,10 @@ import { parseArgs } from "../args.js";
 import { showText } from "../commands.js";
 import { isInside, writeFileAtomicExclusive } from "../fsutil.js";
 import { discoverBatchModels } from "../models.js";
-import { isPrivacyLevel, PRIVACY_LEVELS } from "../privacy/policy.js";
+import { pickerEntries } from "../privacy/commands.js";
+import { isPrivacyLevel, PRIVACY_LEVELS, type Route } from "../privacy/policy.js";
 import type { BatchRuntime } from "../runtime.js";
+import { formatIsoShort } from "../time.js";
 import type { JobManifest } from "../types.js";
 import { conversationOrder } from "./request.js";
 import type { ChatService } from "./service.js";
@@ -21,7 +23,8 @@ export const CHAT_HELP = `/batch chat — chat with a model at batch prices (rep
   chat resume [thread]      pick a thread (or give an ID suffix or exact title)
   chat clear                start a fresh thread (the old one stays resumable)
   chat rename <title>       rename the thread (locks the title); rename --auto unlocks auto-titling
-  chat model [slug]         change the model from the next message on (no slug: picker)
+  chat model [slug] [--refresh]
+                            change the model from the next message on (no slug: picker; --refresh reloads the model list first)
   chat privacy <level>      raise this thread to no-training or zdr (never below the project level)
   chat compact [focus]     summarise older messages now; optional focus instructions
   chat context              estimated size of the next request and distance to auto-compact
@@ -150,16 +153,36 @@ async function pickThread(rt: BatchRuntime, ctx: ExtensionCommandContext): Promi
   return choice === undefined ? undefined : labels.get(choice);
 }
 
-async function pickModel(rt: BatchRuntime, ctx: ExtensionCommandContext): Promise<string | undefined> {
+const REFRESH_MODELS = "Refresh models";
+
+/** Labelled model picker. Models the thread's level rules out are hidden. Returns the slug and the route the picker chose. */
+async function pickModel(rt: BatchRuntime, ctx: ExtensionCommandContext, threadId: string, refresh: boolean): Promise<{ slug: string; route?: Route } | undefined> {
+  const catalog = rt.catalog;
+  if (refresh && catalog) await catalog.load();
   const slugs = new Set<string>();
   for (const t of rt.requireChatStore().list()) slugs.add(t.model);
   slugs.add(rt.loaded.config.defaultModel);
   for (const m of discoverBatchModels(ctx)) slugs.add(m.modelId);
-  const choice = await ctx.ui.select("Chat model", [...slugs, TYPE_SLUG]);
-  if (choice === undefined) return undefined;
-  if (choice !== TYPE_SLUG) return choice;
-  const typed = (await ctx.ui.input("Model slug", "vendor/model"))?.trim();
-  return typed || undefined;
+  for (;;) {
+    const snapshot = catalog?.snapshot();
+    const level = rt.requireChat().effectiveLevel(threadId);
+    const entries = pickerEntries(snapshot, [...slugs], level, rt.loaded.config.privacy.accountNoTraining);
+    const shown = entries.filter((e) => !e.blocked);
+    const options = new Map<string, { slug: string; route: Route }>();
+    for (const e of shown) options.set(`${e.id} ${e.labels.map((l) => `[${l}]`).join(" ")}`, { slug: e.id, route: e.route });
+    const hidden = entries.length - shown.length;
+    const note = !snapshot ? " (loading models…)" : !snapshot.fresh ? ` (model list from ${formatIsoShort(snapshot.loadedAt)}, refresh failed)` : "";
+    const title = `Chat model · ${level}${note}${hidden > 0 ? ` · ${hidden} hidden by privacy level` : ""}`;
+    const choice = await ctx.ui.select(title, [...options.keys(), REFRESH_MODELS, TYPE_SLUG]);
+    if (choice === undefined) return undefined;
+    if (choice === REFRESH_MODELS) {
+      if (catalog) await catalog.load();
+      continue;
+    }
+    if (choice !== TYPE_SLUG) return options.get(choice);
+    const typed = (await ctx.ui.input("Model slug", "vendor/model"))?.trim();
+    return typed ? { slug: typed } : undefined;
+  }
 }
 
 export async function cmdChat(rt: BatchRuntime, rest: string[], ctx: ExtensionCommandContext): Promise<void> {
@@ -209,11 +232,14 @@ export async function cmdChat(rt: BatchRuntime, rest: string[], ctx: ExtensionCo
     }
     case "model": {
       const id = activeThread(rt);
-      const slug = args.join(" ").trim() || (await pickModel(rt, ctx));
-      if (!slug) return;
-      await rt.requireChat().setModel(id, slug);
+      const refresh = args.some((a) => a.toLowerCase() === "--refresh");
+      const typedSlug = args.filter((a) => a.toLowerCase() !== "--refresh").join(" ").trim();
+      if (typedSlug && refresh && rt.catalog) await rt.catalog.load();
+      const picked = typedSlug ? { slug: typedSlug } : await pickModel(rt, ctx, id, refresh);
+      if (!picked) return;
+      await rt.requireChat().setModel(id, picked.slug, picked.route ? { route: picked.route } : {});
       rt.requireChatSession().sync();
-      rt.notify(`Chat model set to ${slug} from the next message on.`, "info");
+      rt.notify(`Chat model set to ${picked.slug} from the next message on.`, "info");
       return;
     }
     case "privacy": {

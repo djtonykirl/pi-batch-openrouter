@@ -43,6 +43,7 @@ export default function (pi: ExtensionAPI): void {
     const webStopped = rt.stopWebServerForSessionChange();
     rt.bind(ctx);
     rt.startChatSession();
+    void rt.catalog?.load(); // non-blocking; failures are logged and leave the catalog stale
     rt.poller.start();
     rt.poller.updateBadge();
     void webStopped.then(

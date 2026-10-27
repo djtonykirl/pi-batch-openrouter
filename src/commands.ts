@@ -10,6 +10,7 @@ import { CHECK_LOCK_WAIT_MS, DuplicateActiveRequestError, SubmissionBlockedError
 import { cmdBatchArtifact } from "./artifact-commands.js";
 import { cmdMetadata } from "./metadata-commands.js";
 import { cmdChat } from "./chat/commands.js";
+import { cmdPrivacy } from "./privacy/commands.js";
 import { ArtifactError } from "./artifacts/service.js";
 import { formatLegacyInventory } from "./legacy.js";
 import { BUILTIN_WORKFLOWS, WorkflowNotFoundError, discoverWorkflows, findWorkflow, formatDiagnostics, validateWorkflowFile } from "./workflows/definition.js";
@@ -44,6 +45,7 @@ const SUBCOMMANDS: Record<string, { desc: string; nonTerminal: boolean }> = {
   web: { desc: "Start or stop local Web UI: web [--port n] [stop]", nonTerminal: false },
   model: { desc: "Select default batch model", nonTerminal: true },
   provider: { desc: "Select default OpenRouter account (Pi provider alias)", nonTerminal: true },
+  privacy: { desc: "Privacy level: privacy [standard|no-training|zdr|attest|unattest|refresh]", nonTerminal: true },
   help: { desc: "Show /batch usage", nonTerminal: false },
 };
 
@@ -110,6 +112,7 @@ const HELP = `/batch — deferred OpenRouter Batch goals
   web [--port <n>] [stop]            local Web UI studio (127.0.0.1)
   [--global] model [slug]            default batch model
   [--global] provider [alias]        default Pi account for the API key
+  [--global] privacy [level]         privacy level: standard | no-training | zdr; also attest, unattest, refresh
 
 IDs accept a unique suffix, e.g. "A7C2". Results are advisory and never applied to files automatically.`;
 
@@ -275,6 +278,8 @@ async function dispatch(rt: BatchRuntime, args: string, ctx: ExtensionCommandCon
       return cmdWeb(rt, rest);
     case "model":
       return cmdSetting(rt, "defaultModel", rest, isGlobal);
+    case "privacy":
+      return cmdPrivacy(rt, rest, isGlobal);
     case "provider":
     case "account":
       return cmdSetting(rt, "defaultAccount", rest, isGlobal);
@@ -434,6 +439,10 @@ async function cmdShow(rt: BatchRuntime, rest: string[], ctx: ExtensionCommandCo
     ),
   ];
   if (job.usage) lines.push("", `  Usage: ${formatUsage(job.usage)}`);
+  if ((job.route ?? "batch") === "batch" && !job.remoteDeletion) {
+    const strict = job.privacy?.level === "no-training" || job.privacy?.level === "zdr";
+    lines.push("", `  ${strict && rt.loaded.config.privacy.deleteRemoteBatches ? "Batch jobs are held at OpenRouter until finished; deleted after retrieval" : "Batch jobs are kept up to 30 days"}`);
+  }
   const items = jobItems(service.registry, job);
   if (items.length > 1 || job.workflow || job.kind === "synthesis") {
     const c = itemCounts(items.map((i) => i.status));

@@ -251,10 +251,10 @@ export function loadConfig(cwd?: string, globalFile = GLOBAL_CONFIG_FILE): Loade
 
 /**
  * Persist a partial update into one layer (global or project), preserving any
- * other keys already in that file. Only top-level scalar settings are written.
+ * other keys already in that file. Top-level scalar settings are written, and `privacy` fields are merged into the existing section.
  */
 export function saveConfigUpdate(
-  update: Partial<Pick<BatchConfig, "defaultModel" | "defaultAccount">>,
+  update: Partial<Pick<BatchConfig, "defaultModel" | "defaultAccount">> & { privacy?: Partial<BatchConfig["privacy"]> },
   target: { cwd?: string; global: boolean },
   globalFile = GLOBAL_CONFIG_FILE,
 ): string {
@@ -265,6 +265,7 @@ export function saveConfigUpdate(
     if (isObject(parsed)) existing = parsed;
   }
   const next: Json = { ...existing, ...update };
+  if (update.privacy) next.privacy = { ...(isObject(existing.privacy) ? existing.privacy : {}), ...update.privacy };
   if (update.defaultAccount !== undefined) delete next.defaultProvider; // legacy alias
   if (next.schemaVersion === undefined && !target.global) next.schemaVersion = 1;
   atomicWriteJson(file, next);
