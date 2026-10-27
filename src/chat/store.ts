@@ -77,12 +77,34 @@ export class ThreadStore {
     return parsed as ThreadState;
   }
 
-  /** Most recently updated first. Unreadable threads are skipped. */
-  /** Deletes a thread directory. Only for rolling back a thread that was just created and never used. */
-  public remove(id: string): void {
-    fs.rmSync(this.dir(id), { recursive: true, force: true });
+  /**
+   * Deletes a thread that was just created and never used (rollback of a refused create). Takes the thread lock and
+   * refuses unless the thread is untouched: no pending turn, not compacting, empty transcript.
+   */
+  public remove(id: string, waitMs = 3000): void {
+    const dir = this.dir(id);
+    if (!fs.existsSync(path.join(dir, FILES.state))) return;
+    let lock;
+    try {
+      lock = acquireLock(path.join(dir, FILES.lock), waitMs);
+    } catch (err) {
+      if (err instanceof LockTimeoutError) throw new ThreadBusyError(id);
+      throw err;
+    }
+    try {
+      const t = this.read(id);
+      if (t.pending || t.compacting || this.transcript(id).entries.length > 0) {
+        throw new Error(`Thread ${id} is in use and was not removed.`);
+      }
+      fs.rmSync(path.join(dir, FILES.state), { force: true });
+      fs.rmSync(path.join(dir, FILES.transcript), { force: true });
+    } finally {
+      lock.release();
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 
+  /** Most recently updated first. Unreadable threads are skipped. */
   public list(): ThreadState[] {
     if (!fs.existsSync(this.root)) return [];
     const out: ThreadState[] = [];

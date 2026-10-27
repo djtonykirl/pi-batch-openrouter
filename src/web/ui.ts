@@ -976,6 +976,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
       privacy: null,
       picker: { entries: [], catalog: null, key: "" },
       showBlocked: false,
+      pickedRoute: null,
     };
 
     function updateWorkspaceDisplay(rootPath) {
@@ -1750,7 +1751,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
       try {
         await api("/api/threads/" + encodeURIComponent(state.activeThreadId) + "/model", {
           method: "POST",
-          body: { model: slug },
+          body: { model: slug, route: pickedRouteFor(slug) },
         });
         document.getElementById("chatModelAlert").innerHTML = "";
         showToast("Thread model updated to " + slug);
@@ -2666,7 +2667,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         const rows = state.picker.entries.filter((e) => e.route === route && (state.showBlocked || !e.blocked));
         if (!rows.length) return;
         html += '<optgroup label="' + escapeHtml(title) + '">' +
-          rows.map((e) => '<option value="' + escapeHtml(e.id) + '"' + (e.blocked ? ' disabled title="' + escapeHtml(e.blocked) + '"' : "") + ">" +
+          rows.map((e) => '<option value="' + escapeHtml(e.id) + '" data-route="' + escapeHtml(e.route) + '"' + (e.blocked ? ' disabled title="' + escapeHtml(e.blocked) + '"' : "") + ">" +
             escapeHtml(pickerLabel(e) + (e.blocked ? "  (blocked)" : "")) + "</option>").join("") +
           "</optgroup>";
       });
@@ -2676,8 +2677,21 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
     }
 
     document.getElementById("chatModelPicker").addEventListener("change", (ev) => {
-      if (ev.target.value) document.getElementById("chatModelInput").value = ev.target.value;
+      const opt = ev.target.selectedOptions[0];
+      if (ev.target.value) {
+        document.getElementById("chatModelInput").value = ev.target.value;
+        state.pickedRoute = { model: ev.target.value, route: opt ? opt.getAttribute("data-route") : null };
+      }
     });
+    // Typing a different slug drops the picked route; the server then picks it from the model ID.
+    document.getElementById("chatModelInput").addEventListener("input", () => {
+      state.pickedRoute = null;
+    });
+    // The route the picker chose for this slug, if the box still holds it.
+    function pickedRouteFor(slug) {
+      const p = state.pickedRoute;
+      return p && p.model === slug && p.route ? p.route : undefined;
+    }
     document.getElementById("show-blocked-toggle").addEventListener("change", (ev) => {
       state.showBlocked = ev.target.checked;
       renderPicker();

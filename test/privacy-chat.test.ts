@@ -70,10 +70,10 @@ test(
     assert.equal(chat.effectiveLevel(t.id), "no-training");
     assert.equal(store.read(t.id).privacyLevel, "no-training");
     assert.ok(store.transcript(t.id).entries.some((e) => e.type === "status" && /no-training/.test(e.text)));
-    assert.throws(() => chat.raisePrivacy(t.id, "no-training"), /can't lower a thread below the project level/);
-    assert.throws(() => chat.raisePrivacy(t.id, "standard"), /can't lower a thread below the project level/);
+    assert.throws(() => chat.raisePrivacy(t.id, "no-training"), /can't lower a thread below its current level/);
+    assert.throws(() => chat.raisePrivacy(t.id, "standard"), /can't lower a thread below its current level/);
     cfg.privacy.level = "zdr";
-    assert.throws(() => chat.raisePrivacy(t.id, "no-training"), /can't lower a thread below the project level/);
+    assert.throws(() => chat.raisePrivacy(t.id, "no-training"), /can't lower a thread below its current level/);
     assert.equal(chat.effectiveLevel(t.id), "zdr");
   }),
 );

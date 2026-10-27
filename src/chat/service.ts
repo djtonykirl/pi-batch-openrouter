@@ -272,7 +272,7 @@ export class ChatService {
     this.store.update(threadId, (t, append) => {
       const current = effectiveLevelOf(project, t.privacyLevel);
       if (PRIVACY_LEVELS.indexOf(level) <= PRIVACY_LEVELS.indexOf(current)) {
-        throw new Error("Privacy level: can't lower a thread below the project level");
+        throw new Error(`Privacy level ${level}: can't lower a thread below its current level (${current})`);
       }
       t.privacyLevel = level;
       append({ type: "status", text: `Privacy level for this thread raised to ${level}.` });

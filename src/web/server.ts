@@ -919,7 +919,11 @@ export class BatchWebServer {
           if (body.title?.trim()) this.deps.chat.rename(thread.id, body.title.trim());
         } catch (err) {
           // A refused create (privacy level, empty title) must not leave an orphan thread behind.
-          this.deps.chatStore.remove(thread.id);
+          try {
+            this.deps.chatStore.remove(thread.id);
+          } catch {
+            // keep the original refusal as the error
+          }
           throw err;
         }
         this.broadcast({ type: "thread_created", threadId: thread.id });

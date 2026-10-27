@@ -176,7 +176,7 @@ test(
     assert.equal(store.read(t.id).privacyLevel, "no-training");
     const down = await post(`/api/threads/${t.id}/privacy`, { level: "standard" });
     assert.equal(down.status, 400);
-    assert.match(((await down.json()) as any).error, /can't lower a thread below the project level/);
+    assert.match(((await down.json()) as any).error, /can't lower a thread below its current level/);
     assert.equal((await post(`/api/threads/${t.id}/privacy`, { level: "nope" })).status, 400);
   }),
 );
@@ -232,3 +232,57 @@ test(
     }
   }),
 );
+
+test(
+  "the picker's chosen route is stored; the page sends it with Set",
+  withWeb(async ({ post, get, store, chat }) => {
+    const t = chat.newThread();
+    const r = await post(`/api/threads/${t.id}/model`, { model: "z/zero-priced", route: "immediate" });
+    assert.equal(r.status, 200);
+    assert.equal(store.read(t.id).route, "immediate");
+    assert.equal(store.read(t.id).model, "z/zero-priced");
+    assert.equal((await post(`/api/threads/${t.id}/model`, { model: "z/zero-priced", route: "bogus" })).status, 400);
+
+    const created = await post("/api/threads", { model: "z/other-free", route: "immediate" });
+    assert.equal(created.status, 201);
+    assert.equal(((await created.json()) as any).thread.route, "immediate");
+
+    const html = await (await get("/")).text();
+    assert.ok(html.includes('data-route="'), "picker options carry the route");
+    assert.ok(html.includes("route: pickedRouteFor(slug)"), "Set posts the picked route");
+    assert.ok(html.includes("state.pickedRoute = null"), "editing the box clears the route");
+  }),
+);
+
+test(
+  "send at zdr for a batch model with no ZDR provider: no job, refusal recorded",
+  withWeb(async ({ cfg, chat, post, batch, store }) => {
+    const t = chat.newThread();
+    await chat.setModel(t.id, "x/other");
+    cfg.privacy.level = "zdr";
+    const r = await post(`/api/threads/${t.id}/send`, { text: "hello" });
+    // Chat keeps the user's message and records the refusal on the thread (it is not an HTTP error), so nothing is lost.
+    assert.equal(r.status, 200);
+    assert.equal(((await r.json()) as any).jobId, undefined);
+    const failure = store.read(t.id).lastFailure;
+    assert.match(failure?.message ?? "", /Privacy level zdr: no ZDR provider/);
+    assert.equal(store.read(t.id).pending, undefined);
+    assert.equal(batch.registry.list().jobs.length, 0);
+  }),
+);
+
+test("ThreadStore.remove only removes an untouched thread", async () => {
+  const root = tempWorkspace();
+  try {
+    const store = new ThreadStore(join(root, "threads"));
+    const fresh = store.create({ model: "a/b", account: "default" });
+    store.remove(fresh.id);
+    assert.equal(store.list().length, 0);
+    const used = store.create({ model: "a/b", account: "default" });
+    store.update(used.id, (_t, append) => append({ type: "status", text: "hi" }));
+    assert.throws(() => store.remove(used.id), /in use/);
+    assert.equal(store.list().length, 1);
+  } finally {
+    rm(root);
+  }
+});
