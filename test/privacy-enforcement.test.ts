@@ -315,3 +315,85 @@ test(
     }
   },
 );
+
+// ------------------------------------------------------------ fix round 1
+
+test(
+  "a preview made at a lower level is refused at submit after the level is raised, and stays previewed",
+  withEnv({ level: "standard" }, async ({ service, fake, cfg }) => {
+    const preview = await service.createJob(await service.prepare(ASK), { previewOnly: true });
+    assert.equal(preview.privacy?.level, "standard");
+    cfg.privacy.level = "zdr";
+    fake.submitReplies = [accepted()];
+    await assert.rejects(service.submit(preview.localId), (err: unknown) => {
+      assert.ok(err instanceof SubmissionBlockedError);
+      assert.equal(err.message, `Privacy level zdr: ${preview.localId} was prepared at standard; cancel it and create it again`);
+      return true;
+    });
+    assert.equal(postedBodies(fake).length, 0);
+    assert.equal(service.registry.read(preview.localId).localStatus, "previewed");
+  }),
+);
+
+test(
+  "a preview from before privacy levels (no privacy field) counts as standard at submit",
+  withEnv({ level: "standard" }, async ({ service, fake, cfg }) => {
+    const preview = await service.createJob(await service.prepare(ASK), { previewOnly: true });
+    service.registry.update(preview.localId, (u) => {
+      delete u.manifest.privacy;
+    });
+    cfg.privacy.level = "no-training";
+    cfg.privacy.accountNoTraining = true;
+    await assert.rejects(service.submit(preview.localId), /^SubmissionBlockedError: Privacy level no-training: .* was prepared at standard/);
+    assert.equal(postedBodies(fake).length, 0);
+    assert.equal(service.registry.read(preview.localId).localStatus, "previewed");
+  }),
+);
+
+test(
+  "a preview recorded at zdr submits normally with the config at zdr or standard",
+  async () => {
+    for (const later of ["zdr", "standard"] as const) {
+      await withEnv({ level: "zdr" }, async ({ service, fake, cfg }) => {
+        const preview = await service.createJob(await service.prepare(ASK), { previewOnly: true });
+        cfg.privacy.level = later;
+        fake.submitReplies = [accepted()];
+        const job = await service.submit(preview.localId);
+        assert.equal(job.localStatus, "submitted");
+        assert.deepEqual(JSON.parse(postedBodies(fake)[0]!).provider, { only: ["anthropic", "azure/eu"], allow_fallbacks: false });
+      })();
+    }
+  },
+);
+
+test(
+  "an immediate-route job is refused at submit until the immediate path exists",
+  withEnv({ level: "zdr", catalog: [] }, async ({ service, fake, jobsDir }) => {
+    fake.submitReplies = [accepted()];
+    await assert.rejects(service.createJob(await service.prepare({ ...ASK, model: "meta/llama-free:free" }), { previewOnly: false }), (err: unknown) => {
+      assert.ok(err instanceof SubmissionBlockedError);
+      assert.match(err.message, /immediate route, which isn't available yet/);
+      return true;
+    });
+    assert.equal(postedBodies(fake).length, 0);
+    const [id] = jobDirs(jobsDir);
+    assert.equal(service.registry.read(id!).localStatus, "previewed");
+  }),
+);
+
+test(
+  "a retry keeps its source's stricter level when the project level is lower",
+  withEnv({ level: "zdr" }, async ({ service, fake, cfg }) => {
+    fake.submitReplies = [accepted("batch_src")];
+    const src = await service.createJob(await service.prepare(ASK), { previewOnly: false });
+    assert.equal(src.privacy?.level, "zdr");
+    fake.getReplies = [{ status: 200, body: completed([successItem(src.customIds[0]!, "ok")], { id: "batch_src" }) }];
+    await service.reconcile(src.localId, { force: true });
+    cfg.privacy.level = "standard";
+    fake.submitReplies = [accepted("batch_retry")];
+    const retried = await service.retry(src.localId);
+    assert.equal(retried.localStatus, "submitted");
+    assert.equal(retried.privacy?.level, "zdr");
+    assert.deepEqual(JSON.parse(postedBodies(fake).at(-1)!).provider, { only: ["anthropic", "azure/eu"], allow_fallbacks: false });
+  }),
+);

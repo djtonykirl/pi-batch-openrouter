@@ -13,7 +13,7 @@ import type { ModelCatalog } from "./models/catalog.js";
 import { OpenRouterBatchClient, OpenRouterError, type RawExchange } from "./openrouter/client.js";
 import { normaliseBatchResult, type NormalisedBatchResult } from "./openrouter/normalise-result.js";
 import { buildSubmitBody, messageText, submitBodyProblems, type BatchRequestItem, type ChatMessage, type ProviderPin, type SubmitBody } from "./openrouter/types.js";
-import { effectiveLevel, resolveBatchProvider, routeForModel, type PrivacyLevel, type Route } from "./privacy/policy.js";
+import { effectiveLevel, resolveBatchProvider, routeForModel, stricter, type PrivacyLevel, type Route } from "./privacy/policy.js";
 import { compileOutputSchema, type OutputValidator } from "./workflows/structured.js";
 import { findWorkflow, formatDiagnostics, type WorkflowDefinition, type WorkflowEntry } from "./workflows/definition.js";
 import { planDatasetRun, type DatasetPlan, type EffectiveLimits } from "./workflows/dataset-run.js";
@@ -1015,6 +1015,16 @@ export class BatchService {
       if (job.localStatus !== "previewed") {
         throw new Error(`Job ${localId} is ${job.localStatus}; only previewed jobs can be submitted.`);
       }
+      // A preview made at a lower level (or before privacy levels) was never pinned for the current one.
+      const current = this.deps.getConfig().privacy.level;
+      const recorded = job.privacy?.level ?? "standard";
+      if (current !== recorded && stricter(current, recorded) === current) {
+        throw new SubmissionBlockedError(`Privacy level ${current}: ${localId} was prepared at ${recorded}; cancel it and create it again`);
+      }
+      // Until the immediate path exists, an immediate job must never fall through to /batches without its provider fields.
+      if (job.route === "immediate") {
+        throw new SubmissionBlockedError(`Privacy level ${recorded}: ${localId} uses the immediate route, which isn't available yet; it stays previewed`);
+      }
       if (!opts.skipDuplicateCheck && job.contentSha256) {
         const dup = this.findActiveDuplicate(job.contentSha256, localId);
         if (dup) throw new DuplicateActiveRequestError(dup.localId);
@@ -1607,6 +1617,8 @@ export class BatchService {
       model,
       account: source.account,
       pin: srcBody.provider,
+      // A retry never drops below the level its source was sent at (e.g. a zdr thread under a standard project).
+      ...(source.privacy ? { privacyLevel: source.privacy.level } : {}),
       format: source.format,
       items: bodies.map(({ item, body }) => ({
         source: item.source,
