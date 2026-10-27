@@ -19,7 +19,12 @@ import { resolveWorkspaceInput } from "./workspace-paths.js";
 export const METADATA_HELP = `/batch metadata — Databricks table descriptions and column comments (proposals only)
 
   plan --context <context.md> --input <tables.jsonl> [--preview] [--model <slug>] [--account] [--provider]
-                                     one request per table; --preview saves the plan without sending
+       [--domain <slug> --uc-prefix <PREFIX>]
+                                     one request per table; --preview saves the plan without sending.
+                                     --domain with --uc-prefix (both or neither) turns on UC standards mode:
+                                     Fulcrum description/comment formats, classification and column PII
+                                     tags; tables must start with the prefix and sit in a bronze, silver
+                                     or gold schema; framework audit columns are not sent
   summary <job>                      coverage, statuses and confidence totals
   review <job> [--out <file.md>] [--overwrite]
                                      Markdown review: existing vs proposed values (an artifact)
@@ -46,10 +51,18 @@ export async function cmdMetadata(rt: BatchRuntime, rest: string[], ctx: Extensi
   const service = rt.requireService();
   switch (sub) {
     case "plan": {
-      const parsed = parseArgs(args, { values: ["context", "input", "model", "account", "provider"], booleans: ["preview"] });
+      const parsed = parseArgs(args, { values: ["context", "input", "model", "account", "provider", "domain", "uc-prefix"], booleans: ["preview"] });
       if (parsed.errors.length) throw new Error(`/batch metadata plan: ${parsed.errors.join("; ")}`);
-      if (!parsed.values.context || !parsed.values.input) throw new Error("Usage: /batch metadata plan --context <context.md> --input <tables.jsonl> [--preview]");
-      const prepared = await service.planMetadata({ context: parsed.values.context, input: parsed.values.input, model: parsed.values.model, account: parsed.values.account, providerPin: parsed.values.provider });
+      if (!parsed.values.context || !parsed.values.input) throw new Error("Usage: /batch metadata plan --context <context.md> --input <tables.jsonl> [--domain <slug> --uc-prefix <PREFIX>] [--preview]");
+      const prepared = await service.planMetadata({
+        context: parsed.values.context,
+        input: parsed.values.input,
+        model: parsed.values.model,
+        account: parsed.values.account,
+        providerPin: parsed.values.provider,
+        domain: parsed.values.domain,
+        ucPrefix: parsed.values["uc-prefix"],
+      });
       const previewOnly = parsed.booleans.has("preview");
       const preview = formatMetadataPreview(prepared, previewOnly);
       if (prepared.blockers.length > 0) throw new SubmissionBlockedError(`${preview}\n\nPLAN BLOCKED — nothing was saved or sent:\n\n${prepared.blockers.join("\n\n")}`);
@@ -121,8 +134,10 @@ export function formatMetadataPreview(p: PreparedMetadataRun, previewOnly: boole
   lines.push(`Workflow:          databricks-metadata (built-in): table descriptions and column comments only`);
   if (p.context) lines.push(`Context:           ${p.context.relPath}  (sha256 ${plan?.contextSha256 ?? "-"})`);
   if (p.input) lines.push(`Input:             ${p.input.relPath}  (sha256 ${plan?.inputSha256 ?? "-"})`);
+  lines.push(`Standards:         ${plan?.standards ? `${plan.standards.domain} / ${plan.standards.ucPrefix}` : "off"}`);
   if (plan) {
     lines.push(
+      `Audit columns:     ${plan.auditColumns} not sent${plan.standards ? "" : " (standards off: every column is sent)"}`,
       `Tables:            ${plan.tables}${plan.blankLines ? `  (${plan.blankLines} blank line(s) ignored)` : ""}`,
       `Requests:          ${plan.items.length}  (one per table, one batch)`,
       `Tables w/ samples: ${plan.tablesWithSamples}  (sample values are sent as given; they are not shown here)`,

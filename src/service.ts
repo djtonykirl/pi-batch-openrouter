@@ -20,8 +20,9 @@ import { findWorkflow, formatDiagnostics, type WorkflowDefinition, type Workflow
 import { planDatasetRun, type DatasetPlan, type EffectiveLimits } from "./workflows/dataset-run.js";
 import { resolveWorkspaceInput, resolveWorkspaceOutput } from "./workspace-paths.js";
 import { decodeDatasetBytes } from "./datasets/dataset.js";
-import { proposalProblems, type TableEvidence } from "./metadata/contract.js";
-import { METADATA_WORKFLOW, planMetadataRun, type MetadataPlan } from "./metadata/plan.js";
+import { promptEvidence, proposalProblems, type TableEvidence } from "./metadata/contract.js";
+import { metadataWorkflow, planMetadataRun, type MetadataPlan, type MetadataWorkflowId } from "./metadata/plan.js";
+import { standardsFromOptions, type MetadataStandards } from "./metadata/standards.js";
 import { buildExportRows, toCsv, toJsonl, writeExport } from "./export.js";
 import { inventoryLegacyJobs, type LegacyInventory } from "./legacy.js";
 import { ARTEFACTS, JobRegistry, JobUpdate } from "./registry.js";
@@ -168,6 +169,9 @@ export interface MetadataRunOptions {
   model?: string;
   account?: string;
   providerPin?: string;
+  /** Opt-in UC standards mode: both or neither (domain slug and table prefix such as PNPT_). */
+  domain?: string;
+  ucPrefix?: string;
 }
 
 export interface PreparedMetadataRun {
@@ -186,7 +190,9 @@ export interface PreparedMetadataRun {
 }
 
 export interface StoredMetadataPlan {
-  workflow: typeof METADATA_WORKFLOW;
+  workflow: MetadataWorkflowId;
+  /** Present only for a standards-mode (version 2) job. */
+  standards?: MetadataStandards;
   context: MetadataWorkflowInfo["context"];
   input: MetadataWorkflowInfo["input"];
   planSha256: string;
@@ -910,10 +916,20 @@ export class BatchService {
     const model = normalizeBatchModelSlug(options.model ?? config.defaultModel);
     const pin: ProviderPin | undefined = options.providerPin ? { only: [options.providerPin], allow_fallbacks: false } : undefined;
     const base: PreparedMetadataRun = { options, model, account, pin, maxTokens: config.request.maxTokens, objective: "", contentSha256: "", blockers, warnings: [] };
+    const mode = standardsFromOptions(options.domain, options.ucPrefix);
+    if (mode.error) {
+      blockers.push(mode.error);
+      return base;
+    }
     const read = (raw: string, what: string, maxBytes: number) => {
       const r = resolveWorkspaceInput(this.deps.workspaceRoot, raw, config, { what, maxBytes });
       if (!r.ok) {
         blockers.push(r.message);
+        return undefined;
+      }
+      // A raw notebook would send its cell outputs: Pass 2 takes the reviewed context, never a notebook.
+      if (/\.ipynb$/i.test(r.relPath)) {
+        blockers.push(`${r.relPath} is a notebook; use the reviewed <Domain>_context.md (Pass 1 output), not a notebook`);
         return undefined;
       }
       const bytes = fs.readFileSync(r.absPath);
@@ -935,19 +951,25 @@ export class BatchService {
       maxTokens: config.request.maxTokens,
       limits: { maxRequests: config.workflows.maxRequestsPerBatch, maxRows: config.workflows.maxRowsPerRun, maxCharactersPerItem: config.workflows.maxCharactersPerItem, maxTotalCharacters: config.workflows.maxTotalCharacters },
       security: { scanSecrets: config.security.scanSecrets, blockOnSecret: config.security.blockOnSecret, knownSecrets: await this.knownSecrets(account) },
+      ...(mode.standards ? { standards: mode.standards } : {}),
     });
     blockers.push(...plan.blockers);
     const contentSha256 = contentHash(buildSubmitBody({ model, provider: pin, requests: plan.items.map((it) => ({ custom_id: "{custom_id}", body: it.body })) }));
-    return { ...base, plan, context: { relPath: context.relPath, bytes: context.bytes.length, text: context.text }, input: { relPath: input.relPath, bytes: input.bytes.length }, objective: `Databricks metadata proposals for ${plan.tables} table(s) from ${input.relPath}`, contentSha256, warnings: plan.warnings };
+    // R7: metadata jobs have no thread, so the project level is the effective level. A warning, not a blocker.
+    const warnings = [...plan.warnings];
+    if (plan.tablesWithSamples > 0 && effectiveLevel(config.privacy.level) === "standard") warnings.push("sample values will be sent at privacy level standard; consider /batch privacy zdr");
+    return { ...base, plan, context: { relPath: context.relPath, bytes: context.bytes.length, text: context.text }, input: { relPath: input.relPath, bytes: input.bytes.length }, objective: `Databricks metadata proposals for ${plan.tables} table(s) from ${input.relPath}`, contentSha256, warnings };
   }
 
   public async createMetadataJob(prepared: PreparedMetadataRun, opts: { previewOnly: boolean }): Promise<JobManifest> {
     const { plan, context, input } = prepared;
     if (prepared.blockers.length > 0 || !plan || !context || !input) throw new SubmissionBlockedError(prepared.blockers.join("\n\n") || "the metadata plan is incomplete");
     this.assertNoActiveDuplicate(prepared.contentSha256, opts.previewOnly);
+    const workflow = metadataWorkflow(plan.standards);
     const info: MetadataWorkflowInfo = {
-      name: METADATA_WORKFLOW.name,
-      version: METADATA_WORKFLOW.version,
+      name: workflow.name,
+      version: workflow.version,
+      ...(plan.standards ? { standards: plan.standards } : {}),
       origin: "builtin",
       context: { path: context.relPath, sha256: plan.contextSha256, bytes: context.bytes },
       input: { path: input.relPath, sha256: plan.inputSha256, bytes: input.bytes, tables: plan.tables, tablesWithSamples: plan.tablesWithSamples },
@@ -972,7 +994,8 @@ export class BatchService {
         // Exact copy of the shared context sent with every request.
         atomicWriteFile(this.registry.artefact(localId, "context"), context.text);
         atomicWriteJson(this.registry.artefact(localId, "metadataPlan"), {
-          workflow: METADATA_WORKFLOW,
+          workflow,
+          ...(plan.standards ? { standards: plan.standards } : {}),
           context: info.context,
           input: info.input,
           planSha256: plan.planSha256,
@@ -980,7 +1003,7 @@ export class BatchService {
           createdAt: nowIso(),
         });
       },
-      previewDetails: { workflow: METADATA_WORKFLOW.name, requests: plan.items.length, characters: plan.totalCharacters, planSha256: plan.planSha256 },
+      previewDetails: { workflow: workflow.name, requests: plan.items.length, characters: plan.totalCharacters, planSha256: plan.planSha256 },
     });
     if (opts.previewOnly) return job;
     return this.submit(job.localId, { skipDuplicateCheck: true });
@@ -996,12 +1019,15 @@ export class BatchService {
     if (isMetadataWorkflow(job.workflow)) {
       // Each item is checked against the evidence of ITS table (by the item's source, never the model's claim).
       try {
-        const byTable = new Map(this.metadataEvidence(job.localId).tables.map((t) => [t.table, t.evidence]));
+        const stored = this.metadataEvidence(job.localId);
+        // The standards stored with the job (copied to retries), never the current options.
+        const standards = stored.standards;
+        const byTable = new Map(stored.tables.map((t) => [t.table, t.evidence]));
         const items = job.items ?? [];
         return (value, customId) => {
           const it = items.find((i) => i.customId === customId);
           const ev = it?.source.sourceId !== undefined ? byTable.get(it.source.sourceId) : undefined;
-          return ev ? proposalProblems(value, ev) : ["no stored evidence for this item; its output cannot be validated"];
+          return ev ? proposalProblems(value, promptEvidence(ev, standards), standards) : ["no stored evidence for this item; its output cannot be validated"];
         };
       } catch {
         return () => ["the job's stored metadata evidence (request/metadata.json) is missing or unusable; output cannot be validated"];

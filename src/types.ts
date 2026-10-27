@@ -98,7 +98,9 @@ export type WorkflowInfo = MapFilesWorkflowInfo | DatasetWorkflowInfo | Metadata
  */
 export interface MetadataWorkflowInfo {
   name: "databricks-metadata";
-  version: 1;
+  /** 1: generic; 2: opt-in UC standards mode (then `standards` is set). */
+  version: 1 | 2;
+  standards?: { domain: string; ucPrefix: string };
   origin: "builtin";
   context: { path: string; sha256: string; bytes: number };
   input: { path: string; sha256: string; bytes: number; tables: number; tablesWithSamples: number };
