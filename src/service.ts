@@ -286,6 +286,8 @@ const RECONCILE_STATUSES: ReadonlySet<LocalStatus> = new Set<LocalStatus>([...PO
 const INTERRUPTED_AFTER_MS = 30_000;
 /** Poll interval while an explicit user check waits for another check's lock. */
 const LOCK_RETRY_MS = 250;
+/** Remote batch deletion is abandoned (state "failed") after this many attempts. */
+const MAX_DELETION_ATTEMPTS = 10;
 /** How long `/batch check <id>` waits for an in-flight check before reporting "busy". */
 export const CHECK_LOCK_WAIT_MS = 10_000;
 
@@ -1394,10 +1396,60 @@ export class BatchService {
         delete m.error;
       }
       u.transition(next, { finalResponse: path.basename(finalPath), ...counts, issues: normalised.issues.length ? normalised.issues : undefined, ...details });
+      // The raw final response is on disk. Whether to delete depends only on this job's OWN recorded level.
+      const ownLevel = m.privacy?.level;
+      if (
+        (ownLevel === "no-training" || ownLevel === "zdr") &&
+        this.deps.getConfig().privacy.deleteRemoteBatches &&
+        m.route !== "immediate" &&
+        m.providerBatchId &&
+        !m.remoteDeletion
+      ) {
+        m.remoteDeletion = { state: "pending", attempts: 0 };
+        u.note("remote_deletion_pending", { level: ownLevel });
+      }
       return m;
     });
     this.logger.log(next === "ready" ? "info" : "warn", "retrieved", { localId, providerBatchId: job.providerBatchId, outcome: next, ...counts });
     return updated;
+  }
+
+  /**
+   * Deletes finished batches at OpenRouter for jobs marked pending (strict levels only).
+   * Never changes localStatus; each attempt is an event. Gives up as `failed` after 10 attempts.
+   */
+  public async runRemoteDeletions(): Promise<void> {
+    const pending = this.registry.list().jobs.filter((j) => j.remoteDeletion?.state === "pending" && j.route !== "immediate" && j.providerBatchId);
+    for (const job of pending) {
+      const localId = job.localId;
+      let deleted = false;
+      let error: string | undefined;
+      try {
+        const apiKey = await this.deps.resolveApiKey(job.account);
+        if (!apiKey) throw new Error(`no API key available for account "${job.account}"`);
+        const res = await this.client(apiKey).deleteBatch(job.providerBatchId!);
+        deleted = res.deleted;
+        if (!deleted) error = res.detail ? `not finished yet: ${res.detail}` : "not finished yet (HTTP 409)";
+      } catch (err) {
+        error = (err as Error).message;
+      }
+      this.registry.update(localId, (u) => {
+        const prev = u.manifest.remoteDeletion;
+        if (prev?.state !== "pending") return u.manifest;
+        const attempts = prev.attempts + 1;
+        const at = nowIso();
+        if (deleted) {
+          u.manifest.remoteDeletion = { state: "done", attempts, at };
+          u.note("remote_deletion_done", { attempts });
+        } else {
+          const failed = attempts >= MAX_DELETION_ATTEMPTS;
+          u.manifest.remoteDeletion = { state: failed ? "failed" : "pending", attempts, lastError: error ?? "unknown error", at };
+          u.note(failed ? "remote_deletion_failed" : "remote_deletion_retry", { attempts, error });
+        }
+        return u.manifest;
+      });
+      this.logger.log(deleted ? "info" : "warn", deleted ? "remote_deleted" : "remote_delete_failed", { localId, providerBatchId: job.providerBatchId, ...(error ? { error } : {}) });
+    }
   }
 
   private writeResultArtefacts(job: JobManifest, n: NormalisedBatchResult, finalPath: string): void {

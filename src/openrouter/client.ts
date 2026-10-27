@@ -128,6 +128,24 @@ export class OpenRouterBatchClient {
     }
   }
 
+  /**
+   * DELETE /batches/{id}. 404/410 mean it is already gone (`deleted: true`);
+   * 409 means the batch is not finished yet (`deleted: false`, retry later).
+   * Anything else throws.
+   */
+  public async deleteBatch(batchId: string): Promise<{ deleted: boolean; raw?: RawExchange; detail?: string }> {
+    try {
+      const raw = await this.request("DELETE", `/batches/${encodeURIComponent(batchId)}`, "delete");
+      return { deleted: true, raw };
+    } catch (err) {
+      if (err instanceof OpenRouterError) {
+        if (err.httpStatus === 404 || err.httpStatus === 410) return { deleted: true, detail: err.detail };
+        if (err.httpStatus === 409) return { deleted: false, detail: err.detail };
+      }
+      throw err;
+    }
+  }
+
   /** GET /models (public catalog). */
   public async listModels(): Promise<{ raw: RawExchange; models: CatalogModel[] }> {
     const raw = await this.request("GET", "/models", "models");

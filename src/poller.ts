@@ -90,6 +90,11 @@ export class BatchPoller {
       }
     }
     try {
+      await service.runRemoteDeletions();
+    } catch {
+      // Deletion is best-effort and retried on the next pass; it never affects polling.
+    }
+    try {
       await this.onTick?.();
     } catch {
       // The tick owner logs its own failures; polling must carry on.

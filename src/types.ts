@@ -219,6 +219,8 @@ export interface JobManifest {
    * jobs made before privacy levels existed (they were sent at `standard`).
    */
   privacy?: { level: PrivacyLevel; route: Route; enforcement: string };
+  /** Deletion of the finished batch at OpenRouter (strict levels only). Absent when not applicable. */
+  remoteDeletion?: { state: "pending" | "done" | "failed"; attempts: number; lastError?: string; at?: string };
   endpoint: "/v1/chat/completions";
   format: "markdown" | "json";
 

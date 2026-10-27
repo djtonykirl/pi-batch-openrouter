@@ -25,6 +25,7 @@ export class FakeOpenRouter {
   public submitReplies: Reply[] = [];
   public getReplies: Reply[] = [];
   public cancelReplies: Reply[] = [];
+  public deleteReplies: Reply[] = [];
   public offline = false;
   /** Bodies of submissions that passed validation, in order. */
   public readonly accepted: Array<{ model: string; requests: Array<{ custom_id: string; body: unknown }> }> = [];
@@ -38,7 +39,7 @@ export class FakeOpenRouter {
       if (rejection) return { status: rejection.status, text: async () => JSON.stringify({ error: { code: rejection.status, message: rejection.message } }) };
       this.accepted.push(JSON.parse(init.body!));
     }
-    const queue = isSubmit ? this.submitReplies : url.endsWith("/cancel") ? this.cancelReplies : this.getReplies;
+    const queue = isSubmit ? this.submitReplies : init.method === "DELETE" ? this.deleteReplies : url.endsWith("/cancel") ? this.cancelReplies : this.getReplies;
     const reply = queue.length > 1 ? queue.shift()! : queue[0];
     if (!reply) throw new Error(`no scripted reply for ${init.method} ${url}`);
     if (reply instanceof Error) throw reply;
