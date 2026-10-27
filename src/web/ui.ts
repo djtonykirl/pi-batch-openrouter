@@ -808,6 +808,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
           <button class="btn btn-sm btn-primary job-kind-btn" data-kind="ask">Ask / Goal (Files + Uploads)</button>
           <button class="btn btn-sm job-kind-btn" data-kind="map-files">Map-Files Workflow (1 req / file)</button>
           <button class="btn btn-sm job-kind-btn" data-kind="dataset">Dataset Workflow (CSV / JSONL)</button>
+          <button class="btn btn-sm job-kind-btn" data-kind="metadata">UC Metadata</button>
         </div>
 
         <div id="jobFormAsk" class="job-form-section">
@@ -826,6 +827,28 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
               <input type="text" id="datasetInputPath" placeholder="data/items.csv" style="width:100%; font-family:var(--mono);">
             </div>
           </div>
+        </div>
+
+        <div id="jobFormMetadata" class="job-form-section" style="display:none;">
+          <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+            <div>
+              <label style="font-size:12px; color:var(--text-muted);">Context file (reviewed &lt;Domain&gt;_context.md)</label>
+              <input type="text" id="metadataContextInput" placeholder="metadata/pinpoint/context.md" style="width:100%; font-family:var(--mono);">
+            </div>
+            <div>
+              <label style="font-size:12px; color:var(--text-muted);">Tables file (tables.jsonl)</label>
+              <input type="text" id="metadataTablesInput" placeholder="metadata/pinpoint/tables.jsonl" style="width:100%; font-family:var(--mono);">
+            </div>
+            <div>
+              <label style="font-size:12px; color:var(--text-muted);">Domain (optional, lowercase slug)</label>
+              <input type="text" id="metadataDomainInput" placeholder="pinpoint" style="width:100%; font-family:var(--mono);">
+            </div>
+            <div>
+              <label style="font-size:12px; color:var(--text-muted);">UC prefix (optional, e.g. PNPT_)</label>
+              <input type="text" id="metadataPrefixInput" placeholder="PNPT_" style="width:100%; font-family:var(--mono);">
+            </div>
+          </div>
+          <div style="font-size:12px; color:var(--text-muted); margin-top:6px;">Give both domain and UC prefix to enforce the UC description, comment and tag standards; leave both empty for plain proposals. Proposals only: nothing is applied to Databricks.</div>
         </div>
 
         <div id="jobFormFilesSection" style="display:flex; flex-direction:column; gap:8px;">
@@ -1007,6 +1030,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
       "retryActiveChatTurn", "pollSingleJob", "removeAttachment", "toggleWorkspaceSelection", "previewWorkspaceFile",
       "quickAttachToChat", "inspectJobItem", "generateJobArtifact", "exportDatasetJob", "previewArtifactFrame",
       "submitPreviewedJob", "cancelBatchJob", "retryBatchJob", "synthesizeBatchJob", "setJobSubTab",
+      "writeMetadataReview", "writeMetadataApproved", "validateMetadataApproved",
     ]);
     function act(name, ...args) {
       return 'data-action="' + escapeHtml(name) + '" data-args="' + escapeHtml(JSON.stringify(args)) + '"';
@@ -2246,9 +2270,97 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         (!isChat ? '<button class="btn btn-sm ' + (state.jobSubTab === "artifacts" ? "btn-primary" : "") + '" ' + act("setJobSubTab", "artifacts") + '>🖨️ Artifacts & Exports</button>' : "") +
         '<button class="btn btn-sm ' + (state.jobSubTab === "events" ? "btn-primary" : "") + '" ' + act("setJobSubTab", "events") + '>🕒 Lifecycle Events</button>' +
         "</div>" +
+        metadataActionsCard(j) +
         subContent +
         "</div>";
     }
+
+    function metadataActionsCard(j) {
+      if (!j.workflow || j.workflow.name !== "databricks-metadata") return "";
+      if (!["ready", "partial", "failed", "cancelled", "expired", "corrupt"].includes(j.localStatus)) return "";
+      const inPath = (j.workflow.input && j.workflow.input.path) || "metadata/tables.jsonl";
+      const dir = inPath.includes("/") ? inPath.slice(0, inPath.lastIndexOf("/") + 1) : "";
+      const field = (id, label, value) =>
+        '<div><label style="font-size:12px; color:var(--text-muted);">' + label + '</label><input type="text" id="' + id + '" value="' + escapeHtml(value) + '" style="width:100%; font-family:var(--mono);"></div>';
+      return (
+        '<div class="msg-card" style="max-width:none; display:flex; flex-direction:column; gap:10px;">' +
+        "<strong>UC Metadata handoff</strong>" +
+        '<div style="font-size:12px; color:var(--text-muted);">Writes files into the workspace through the artifact system. Proposals only: nothing is applied to Databricks.</div>' +
+        '<div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">' +
+        field("metadataReviewOut", "Review file (.md)", dir + "review.md") +
+        field("metadataApprovedOut", "Approved file (.jsonl)", dir + "approved.jsonl") +
+        "</div>" +
+        '<div style="display:flex; gap:14px; flex-wrap:wrap; font-size:12px;">' +
+        '<label><input type="checkbox" id="metadataOverwrite"> Overwrite existing file</label>' +
+        '<label><input type="checkbox" id="metadataAllowPartial"> Allow partial (tables without a proposal keep their existing values)</label>' +
+        "</div>" +
+        '<div style="display:flex; gap:8px; flex-wrap:wrap;">' +
+        '<button class="btn btn-sm btn-primary" ' + act("writeMetadataReview", j.localId) + ">Write review.md</button>" +
+        '<button class="btn btn-sm btn-primary" ' + act("writeMetadataApproved", j.localId) + ">Write approved.jsonl</button>" +
+        '<button class="btn btn-sm" ' + act("validateMetadataApproved", j.localId) + ">Validate approved file</button>" +
+        "</div>" +
+        '<div id="metadataActionOutput"></div>' +
+        "</div>"
+      );
+    }
+
+    function metadataOutput(html) {
+      const box = document.getElementById("metadataActionOutput");
+      if (box) box.innerHTML = html;
+    }
+    function metadataCounts(c) {
+      return c ? c.total + " value(s): " + c.keptExisting + " existing kept, " + c.fromProposal + " from proposals, " + c.nullApproved + " null" : "";
+    }
+    function metadataProblems(problems) {
+      return problems && problems.length ? '<div class="alert-box alert-danger">Problems:\\n- ' + escapeHtml(problems.join("\\n- ")) + "</div>" : "";
+    }
+
+    window.writeMetadataReview = async (jobId) => {
+      try {
+        const res = await api("/api/jobs/" + encodeURIComponent(jobId) + "/metadata/review", {
+          method: "POST",
+          body: { out: document.getElementById("metadataReviewOut").value.trim() || undefined, overwrite: document.getElementById("metadataOverwrite").checked },
+        });
+        metadataOutput('<div class="alert-box alert-success">Review written: ' + escapeHtml(res.path) + " (artifact " + escapeHtml(res.artifactId) + ")" + (res.gaps ? "\\n" + res.gaps + " table(s) without a usable proposal are listed in it" : "") + "</div>");
+        showToast("Wrote " + res.path);
+      } catch (err) {
+        metadataOutput('<div class="alert-box alert-danger">' + escapeHtml(err.message) + "</div>");
+      }
+    };
+
+    window.writeMetadataApproved = async (jobId) => {
+      try {
+        const res = await api("/api/jobs/" + encodeURIComponent(jobId) + "/metadata/approved", {
+          method: "POST",
+          body: {
+            out: document.getElementById("metadataApprovedOut").value.trim(),
+            overwrite: document.getElementById("metadataOverwrite").checked,
+            allowPartial: document.getElementById("metadataAllowPartial").checked,
+          },
+        });
+        metadataOutput(
+          '<div class="alert-box alert-success">Draft handoff written: ' + escapeHtml(res.path) + "\\nsha256 " + escapeHtml(res.sha256) + "\\n" + escapeHtml(metadataCounts(res.counts)) +
+            "\\nThis is a draft for review; edit approved_* values, then validate it.</div>" + metadataProblems(res.problems),
+        );
+        showToast("Wrote " + res.path);
+      } catch (err) {
+        metadataOutput('<div class="alert-box alert-danger">' + escapeHtml(err.message) + "</div>");
+      }
+    };
+
+    window.validateMetadataApproved = async (jobId) => {
+      try {
+        const res = await api("/api/metadata/validate-approved", {
+          method: "POST",
+          body: { file: document.getElementById("metadataApprovedOut").value.trim(), job: jobId },
+        });
+        metadataOutput(
+          '<div class="alert-box ' + (res.problems.length ? "alert-danger" : "alert-success") + '">' + escapeHtml(res.path) + ": " + res.rows + " table row(s)" + (res.jobId ? " from job " + escapeHtml(res.jobId) : "") + "; " + escapeHtml(metadataCounts(res.counts)) + "</div>" + metadataProblems(res.problems),
+        );
+      } catch (err) {
+        metadataOutput('<div class="alert-box alert-danger">' + escapeHtml(err.message) + "</div>");
+      }
+    };
 
     window.setJobSubTab = (tab) => {
       state.jobSubTab = tab;
@@ -2371,9 +2483,11 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
       btn.addEventListener("click", () => {
         state.jobStudioKind = btn.dataset.kind;
         document.querySelectorAll(".job-kind-btn").forEach((b) => b.classList.toggle("btn-primary", b.dataset.kind === state.jobStudioKind));
-        document.getElementById("jobFormAsk").style.display = state.jobStudioKind === "dataset" ? "none" : "block";
-        document.getElementById("jobFormDataset").style.display = state.jobStudioKind === "dataset" ? "block" : "none";
-        document.getElementById("jobFormFilesSection").style.display = state.jobStudioKind === "dataset" ? "none" : "flex";
+        const kind = state.jobStudioKind;
+        document.getElementById("jobFormAsk").style.display = kind === "dataset" || kind === "metadata" ? "none" : "block";
+        document.getElementById("jobFormDataset").style.display = kind === "dataset" ? "block" : "none";
+        document.getElementById("jobFormMetadata").style.display = kind === "metadata" ? "block" : "none";
+        document.getElementById("jobFormFilesSection").style.display = kind === "dataset" || kind === "metadata" ? "none" : "flex";
         document.getElementById("mapFilesGroupWrap").style.display = state.jobStudioKind === "map-files" ? "block" : "none";
         document.getElementById("jobUploadLabel").style.display = state.jobStudioKind === "ask" ? "inline-flex" : "none";
       });
@@ -2413,6 +2527,17 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
             providerPin,
             mode,
           };
+        } else if (state.jobStudioKind === "metadata") {
+          endpoint = "/api/jobs/metadata";
+          payload = {
+            context: document.getElementById("metadataContextInput").value.trim(),
+            input: document.getElementById("metadataTablesInput").value.trim(),
+            domain: document.getElementById("metadataDomainInput").value.trim() || undefined,
+            ucPrefix: document.getElementById("metadataPrefixInput").value.trim() || undefined,
+            model,
+            providerPin,
+            mode,
+          };
         } else {
           endpoint = "/api/jobs/dataset";
           payload = {
@@ -2428,6 +2553,12 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         if (mode === "dryrun") {
           if (res.blockers && res.blockers.length > 0) {
             outBox.innerHTML = '<div class="alert-box alert-danger"><strong>Blocked:</strong>\\n' + escapeHtml(res.blockers.join("\\n")) + "</div>";
+          } else if (state.jobStudioKind === "metadata") {
+            outBox.innerHTML =
+              '<pre style="max-height:320px; overflow:auto; white-space:pre-wrap; background:#0b0d13; padding:10px; border-radius:6px; border:1px solid var(--border); font-size:11px;">' +
+              escapeHtml(res.preview) +
+              "</pre>" +
+              (res.warnings?.length ? '<div class="alert-box alert-danger">Warnings: ' + escapeHtml(res.warnings.join("; ")) + "</div>" : "");
           } else {
             outBox.innerHTML =
               '<div class="alert-box alert-success">✅ Dry-Run Validated:\\n' +

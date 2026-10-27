@@ -16,6 +16,9 @@ import { buildContextPackage, gitCheckIgnore, toPosix } from "../context/package
 import { formatSecretFindings, scanForSecrets } from "../context/secrets.js";
 import { atomicWriteFile, isInside, sha256Hex, writeFileAtomicExclusive } from "../fsutil.js";
 import { jobItems, sourceLabel } from "../items.js";
+import { formatMetadataPreview } from "../metadata-commands.js";
+import { writeApprovedDraft, writeMetadataReview } from "../metadata/outputs.js";
+import { validateApprovedText } from "../metadata/report.js";
 import { FileLogger } from "../logger.js";
 import { ModelCatalog, type CatalogModel } from "../models/catalog.js";
 import { OpenRouterBatchClient } from "../openrouter/client.js";
@@ -26,6 +29,7 @@ import { JobRegistry } from "../registry.js";
 import { BatchService } from "../service.js";
 import { isChatJob, type JobManifest } from "../types.js";
 import { discoverWorkflows } from "../workflows/definition.js";
+import { resolveWorkspaceInput } from "../workspace-paths.js";
 import { renderWebUiHtml } from "./ui.js";
 
 export interface WebServerDeps {
@@ -1189,6 +1193,73 @@ export class BatchWebServer {
         this.deps.poller.updateBadge();
         this.broadcast({ type: "job_created", localId: job.localId });
         this.sendJson(res, 201, { job });
+        return;
+      }
+
+      if (method === "POST" && pathname === "/api/jobs/metadata") {
+        const body = await this.readJson<{
+          context: string;
+          input: string;
+          domain?: string;
+          ucPrefix?: string;
+          model?: string;
+          account?: string;
+          providerPin?: string;
+          mode?: "dryrun" | "preview" | "submit";
+        }>(req);
+        const prepared = await this.deps.service.planMetadata({
+          context: body.context ?? "",
+          input: body.input ?? "",
+          model: body.model || undefined,
+          account: body.account || undefined,
+          providerPin: body.providerPin || undefined,
+          domain: body.domain || undefined,
+          ucPrefix: body.ucPrefix || undefined,
+        });
+        const previewOnly = body.mode !== "submit";
+        const preview = formatMetadataPreview(prepared, previewOnly);
+        if (prepared.blockers.length > 0) {
+          const blocked = prepared.blockers.join("\n\n");
+          this.sendJson(res, 400, { error: `${preview}\n\nPLAN BLOCKED: nothing was saved or sent:\n\n${blocked}`, blockers: prepared.blockers, warnings: prepared.warnings, preview });
+          return;
+        }
+        if (body.mode === "dryrun") {
+          this.sendJson(res, 200, { blockers: prepared.blockers, warnings: prepared.warnings, preview });
+          return;
+        }
+        const job = await this.deps.service.createMetadataJob(prepared, { previewOnly });
+        this.deps.poller.updateBadge();
+        this.broadcast({ type: "job_created", localId: job.localId });
+        this.sendJson(res, 201, { job });
+        return;
+      }
+
+      if (method === "POST" && pathname === "/api/metadata/validate-approved") {
+        const body = await this.readJson<{ file?: string; job?: string }>(req);
+        if (!body.file?.trim()) throw new Error("file is required");
+        const config = this.deps.getConfig();
+        const r = resolveWorkspaceInput(this.deps.workspaceRoot, body.file, config, { what: "approved file", maxBytes: config.workflows.maxDatasetBytes });
+        if (!r.ok) throw new Error(r.message);
+        const v = validateApprovedText(fs.readFileSync(r.absPath, "utf8"), this.deps.service, body.job || undefined);
+        this.sendJson(res, 200, { path: r.relPath, rows: v.rows, jobId: v.jobId, counts: v.counts, problems: v.problems });
+        return;
+      }
+
+      const metadataOutMatch = /^\/api\/jobs\/([^/]+)\/metadata\/(review|approved)$/.exec(pathname);
+      if (method === "POST" && metadataOutMatch) {
+        const jobRef = decodeURIComponent(metadataOutMatch[1]!);
+        if (metadataOutMatch[2] === "review") {
+          const body = await this.readJson<{ out?: string; overwrite?: boolean }>(req);
+          const { manifest, gaps } = await writeMetadataReview(this.deps.service, this.deps.artifacts, jobRef, { out: body.out || undefined, overwrite: body.overwrite === true });
+          this.broadcast({ type: "artifact_created", artifactId: manifest.artifactId });
+          this.sendJson(res, 200, { path: manifest.output!.path, artifactId: manifest.artifactId, gaps });
+          return;
+        }
+        const body = await this.readJson<{ out?: string; overwrite?: boolean; allowPartial?: boolean }>(req);
+        if (!body.out?.trim()) throw new Error("out is required: the approved handoff is written to an explicit .jsonl path");
+        const { manifest, validation } = await writeApprovedDraft(this.deps.service, this.deps.artifacts, jobRef, { out: body.out, overwrite: body.overwrite === true, allowPartial: body.allowPartial === true });
+        this.broadcast({ type: "artifact_created", artifactId: manifest.artifactId });
+        this.sendJson(res, 200, { path: manifest.output!.path, artifactId: manifest.artifactId, sha256: manifest.output!.sha256, counts: validation.counts, problems: validation.problems });
         return;
       }
 
