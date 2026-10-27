@@ -393,7 +393,23 @@ export class ChatService {
     }
     const link = this.linkClaim(threadId, "turn", claim, jobId!);
     if (!link.linked) return { error: this.linkFailedMessage(threadId, jobId!, link.reason) };
+    this.applyIfSettled(jobId!);
     return { jobId };
+  }
+
+  /**
+   * A job can settle before its claim is linked (an immediate-route reply settles inside submit, so its
+   * `onSettled` found no linked claim). Applies it now instead of on the next tick. `settle` re-checks the
+   * linked job under the thread lock and clears the claim, so a later tick or `onSettled` is a no-op.
+   */
+  private applyIfSettled(jobId: string): void {
+    try {
+      const job = this.deps.batch.registry.read(jobId);
+      if (TERMINAL_STATUSES.has(job.localStatus)) this.applySettled(job);
+    } catch (err) {
+      // The next tick applies it.
+      this.logger.log("warn", "chat_settle_failed", { localId: jobId, error: errorMessage(err) });
+    }
   }
 
   /**
@@ -673,6 +689,7 @@ export class ChatService {
     }
     const link = this.linkClaim(threadId, "compact", claim, jobId!);
     if (!link.linked) return { error: this.linkFailedMessage(threadId, jobId!, link.reason) };
+    this.applyIfSettled(jobId!);
     return { jobId };
   }
 

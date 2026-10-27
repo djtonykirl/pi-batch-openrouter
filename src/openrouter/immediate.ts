@@ -15,6 +15,10 @@ import type { BatchRequestItem } from "./types.js";
  * the provider may have answered it, so it is never sent again. It becomes
  * `submission_unknown` once the call can no longer be in flight (`inFlightMs`); until
  * then it is left alone, in case another process is still waiting on it.
+ *
+ * Saving item N's outcome and marking item N+1 `started` are two separate writes. Between
+ * them, item N+1 has no record, and only the caller's job lock stops another process from
+ * sending it. That gap is exposed only if the lock goes stale (held > 120 s) in that instant.
  */
 
 export type ImmediateFailureCode = "rate_limited_daily" | "provider_error" | "submission_unknown";

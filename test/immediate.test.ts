@@ -323,6 +323,28 @@ test(
 );
 
 test(
+  "a crash in retrieving before the final response was saved rebuilds it from progress without calling",
+  withService("standard", async ({ service, fake }) => {
+    const job = await stoppedAfterSubmit(service, fake);
+    atomicWriteJson(service.registry.artefact(job.localId, "immediateProgress"), {
+      [job.customIds[0]!]: { state: "completed", at: new Date().toISOString(), status: 200, bodyText: JSON.stringify(chatCompletion("Rebuilt.")) },
+    });
+    service.registry.update(job.localId, (u) => {
+      u.transition("provider_completed");
+      u.transition("retrieving");
+    });
+    assert.equal(service.registry.read(job.localId).finalResponseFile, undefined);
+    fake.chatReplies = [new Error("must not be called")];
+    const r = await service.reconcile(job.localId);
+    assert.equal(r.status, "ready");
+    assert.equal(chatPosts(fake).length, 0);
+    const done = service.registry.read(job.localId);
+    assert.ok(done.finalResponseFile);
+    assert.equal(itemText(service.registry, done, jobItems(service.registry, done)[0]!)?.trimEnd(), "Rebuilt.");
+  }),
+);
+
+test(
   "cancelling a waiting immediate job never calls the batch cancel endpoint",
   withService("standard", async ({ service, fake }) => {
     fake.chatReplies = [{ status: 429, body: PER_MINUTE, headers: { "Retry-After": "20" } }];

@@ -7,10 +7,12 @@ import type { TranscriptEntry } from "../src/chat/types.js";
 import type { BatchConfig } from "../src/config.js";
 import { acquireLock } from "../src/fsutil.js";
 import type { ChatMessage } from "../src/openrouter/types.js";
-import type { BatchService } from "../src/service.js";
+import { BatchService } from "../src/service.js";
+import { JobRegistry } from "../src/registry.js";
+import { OpenRouterBatchClient } from "../src/openrouter/client.js";
 import type { JobManifest } from "../src/types.js";
-import { FakeOpenRouter, accepted, makeConfig, makeService } from "./fixtures/fake-openrouter.js";
-import { batchObject, completed, failedItem, successItem } from "./fixtures/openrouter.js";
+import { FAKE_KEY, FakeOpenRouter, accepted, makeConfig, makeService } from "./fixtures/fake-openrouter.js";
+import { batchObject, chatCompletion, completed, failedItem, successItem } from "./fixtures/openrouter.js";
 import { rm, tempWorkspace, writeFiles } from "./helpers.js";
 
 interface Setup {
@@ -399,3 +401,48 @@ test(
     assert.equal(est.tokens, Math.ceil((s.cfg.chat.systemPrompt.length + 800) / 4));
   }),
 );
+
+test("a free-model reply that settles inside submit is in the transcript when send returns, once", async () => {
+  const root = tempWorkspace();
+  try {
+    const fake = new FakeOpenRouter();
+    fake.chatReplies = [{ status: 200, body: chatCompletion("Free hello!") }];
+    const cfg = makeConfig();
+    let chat: ChatService | undefined;
+    let settledCalls = 0;
+    // Wired as the runtime does: onSettled fires inside submit, before ChatService has linked the claim.
+    const batch = new BatchService({
+      registry: new JobRegistry(join(root, ".pi", "batches")),
+      workspaceRoot: root,
+      getConfig: () => cfg,
+      resolveApiKey: async () => FAKE_KEY,
+      createClient: (apiKey, timeoutMs) => new OpenRouterBatchClient({ apiKey, fetchImpl: fake.fetch, timeoutMs }),
+      gitIgnored: () => new Set(),
+      onSettled: (job) => {
+        settledCalls++;
+        chat?.applySettled(job);
+      },
+    });
+    const store = new ThreadStore(join(root, ".pi/batches/threads"));
+    chat = new ChatService({ store, batch, workspaceRoot: root, getConfig: () => cfg });
+    const t = chat.newThread();
+    chat.setModel(t.id, "meta/llama-free:free");
+
+    const r = await chat.send(t.id, "hello");
+    assert.equal(r.queued, false);
+    assert.equal(batch.registry.read(r.jobId!).localStatus, "ready");
+    assert.equal(settledCalls, 1);
+    const assistant = () => store.transcript(t.id).entries.filter((e) => e.type === "assistant");
+    assert.equal(assistant().length, 1, "applied without waiting for a tick");
+    assert.equal(assistant()[0]!.type === "assistant" && assistant()[0]!.text, "Free hello!");
+    assert.equal(store.read(t.id).pending, undefined);
+
+    // Neither a later tick nor a repeated onSettled appends it again.
+    await chat.tick();
+    chat.applySettled(batch.registry.read(r.jobId!));
+    assert.equal(assistant().length, 1);
+    assert.equal(fake.requests.filter((x) => x.url.endsWith("/chat/completions")).length, 1);
+  } finally {
+    rm(root);
+  }
+});
