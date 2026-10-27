@@ -34,8 +34,14 @@ test("parseZdrEndpoints normalises model slugs", () => {
   const eps = parseZdrEndpoints(JSON.stringify(ZDR_RESPONSE));
   assert.equal(eps.length, ZDR_RESPONSE.data.length);
   assert.deepEqual(eps.find((e) => e.provider === "baseten"), { model: "baseten/mammoth-1", provider: "baseten" });
-  assert.deepEqual(eps[0], { model: "cloudflare/clef-flash", provider: "makora" }, "tag quantization suffix is dropped");
+  assert.deepEqual(eps[0], { model: "cloudflare/clef-flash", provider: "makora/bf16" }, "full tag is kept");
   assert.deepEqual(eps.find((e) => e.provider === "amazon-bedrock"), { model: "amazon/titan-embed-image-v1", provider: "amazon-bedrock" });
+});
+
+test("parseZdrEndpoints keeps full tags and drops duplicate pairs", () => {
+  const e = (model_id: string, tag: string) => ({ model_id, tag });
+  const eps = parseZdrEndpoints(JSON.stringify({ data: [e("x/y", "azure/eu"), e("x/y:free", "azure/eu"), e("x/y", "azure"), e("x/y", "azure/eu")] }));
+  assert.deepEqual(eps, [{ model: "x/y", provider: "azure/eu" }, { model: "x/y", provider: "azure" }]);
 });
 
 test("parsers reject non-JSON and wrong shapes", () => {

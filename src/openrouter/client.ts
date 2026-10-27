@@ -233,15 +233,21 @@ export function parseModels(text: string): CatalogModel[] {
 
 /**
  * Parses GET /endpoints/zdr. Each entry has `model_id` and an endpoint `tag` such as
- * `azure/eu` or `makora/bf16`; the provider slug is the part before the first `/`.
+ * `azure/eu`, `makora/bf16` or `amazon-bedrock`. The full tag is kept as `provider`: it is
+ * the `provider[/variant][/region][/tier]` slug that `provider.only` accepts, whereas the base
+ * slug would match every endpoint of that provider, including non-ZDR ones
+ * (https://openrouter.ai/docs/guides/routing/provider-selection). Duplicate pairs are dropped.
  */
 export function parseZdrEndpoints(text: string): ZdrEndpoint[] {
   const out: ZdrEndpoint[] = [];
+  const seen = new Set<string>();
   for (const e of parseDataArray(text, "zdr")) {
-    if (typeof e.model_id !== "string" || typeof e.tag !== "string") continue;
-    const provider = e.tag.split("/")[0];
-    if (!e.model_id || !provider) continue;
-    out.push({ model: normaliseModelSlug(e.model_id), provider });
+    if (typeof e.model_id !== "string" || typeof e.tag !== "string" || !e.model_id || !e.tag) continue;
+    const model = normaliseModelSlug(e.model_id);
+    const key = model + " " + e.tag;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ model, provider: e.tag });
   }
   return out;
 }
