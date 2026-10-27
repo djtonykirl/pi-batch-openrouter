@@ -3,7 +3,8 @@ import * as path from "node:path";
 import { Worker } from "node:worker_threads";
 import * as zlib from "node:zlib";
 import type { BatchConfig } from "./config.js";
-import { buildContextPackage, heading, isProbablyBinary } from "./context/package.js";
+import { MAX_NOTEBOOK_RAW_BYTES, cleanNotebook, isNotebookPath } from "./context/notebook.js";
+import { buildContextPackage,heading, isProbablyBinary } from "./context/package.js";
 import { formatSecretFindings, scanForSecrets, type SecretFinding } from "./context/secrets.js";
 import { sha256Hex } from "./fsutil.js";
 import type { ChatContentPart } from "./openrouter/types.js";
@@ -544,8 +545,10 @@ export async function prepareAttachments(opts: {
     }
 
     // 2c. Text / Code / CSV / JSON / Markdown upload
-    if (buf.length > config.context.maxFileBytes) {
-      blockers.push(`File "${name}" is ${buf.length} bytes (limit ${config.context.maxFileBytes})`);
+    const notebook = isNotebookPath(name);
+    const rawLimit = notebook ? MAX_NOTEBOOK_RAW_BYTES : config.context.maxFileBytes;
+    if (buf.length > rawLimit) {
+      blockers.push(`File "${name}" is ${buf.length} bytes (limit ${rawLimit})`);
       continue;
     }
     if (isProbablyBinary(buf)) {
@@ -555,6 +558,21 @@ export async function prepareAttachments(opts: {
     let text = buf.toString("utf8");
     if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
     text = text.replace(/\r\n/g, "\n");
+    if (notebook) {
+      // Outputs and metadata are dropped before the secret scan and before anything is sent; maxFileBytes applies to the cleaned text.
+      const cleaned = cleanNotebook(text);
+      if (!cleaned.ok) {
+        blockers.push(`Notebook "${name}" is not a readable notebook (${cleaned.reason}); it was not sent`);
+        continue;
+      }
+      const cleanedBytes = Buffer.byteLength(cleaned.text, "utf8");
+      if (cleanedBytes > config.context.maxFileBytes) {
+        blockers.push(`Notebook "${name}" is ${cleanedBytes} bytes after cleaning (limit ${config.context.maxFileBytes})`);
+        continue;
+      }
+      text = cleaned.text;
+      warnings.push(`${name}: notebook outputs stripped`);
+    }
     if (config.security.scanSecrets) {
       secretFindings.push(...scanForSecrets(text, name, knownSecrets));
     }
