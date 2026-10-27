@@ -1,4 +1,6 @@
 import type { BatchSnapshot, SubmitBody } from "./types.js";
+import type { CatalogModel } from "../models/catalog.js";
+import { normaliseModelSlug, type ZdrEndpoint } from "../privacy/policy.js";
 
 export interface HttpResponseLike {
   status: number;
@@ -126,6 +128,18 @@ export class OpenRouterBatchClient {
     }
   }
 
+  /** GET /models (public catalog). */
+  public async listModels(): Promise<{ raw: RawExchange; models: CatalogModel[] }> {
+    const raw = await this.request("GET", "/models", "models");
+    return { raw, models: parseModels(raw.bodyText) };
+  }
+
+  /** GET /endpoints/zdr: every endpoint OpenRouter lists as zero-data-retention. */
+  public async listZdrEndpoints(): Promise<{ raw: RawExchange; endpoints: ZdrEndpoint[] }> {
+    const raw = await this.request("GET", "/endpoints/zdr", "zdr");
+    return { raw, endpoints: parseZdrEndpoints(raw.bodyText) };
+  }
+
   private async request(method: string, pathName: string, operation: string, body?: string): Promise<RawExchange> {
     const headers: Record<string, string> = {
       Authorization: `Bearer ${this.opts.apiKey}`,
@@ -186,6 +200,50 @@ function extractErrorMessage(text: string): string {
     // non-JSON body
   }
   return text.slice(0, 300) || "(empty body)";
+}
+
+function parseDataArray(text: string, operation: string): Record<string, unknown>[] {
+  let json: unknown;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new OpenRouterError("protocol", undefined, "response is not valid JSON", operation);
+  }
+  const data = json && typeof json === "object" ? (json as Record<string, unknown>).data : undefined;
+  if (!Array.isArray(data)) throw new OpenRouterError("protocol", undefined, "response has no data array", operation);
+  return data.filter((e): e is Record<string, unknown> => !!e && typeof e === "object");
+}
+
+/** Parses GET /models. A model is free when its ID ends in `:free` or both prices are exactly "0". */
+export function parseModels(text: string): CatalogModel[] {
+  const out: CatalogModel[] = [];
+  for (const e of parseDataArray(text, "models")) {
+    if (typeof e.id !== "string" || !e.id) continue;
+    const pricing = (e.pricing ?? {}) as Record<string, unknown>;
+    const model: CatalogModel = {
+      id: e.id,
+      name: typeof e.name === "string" ? e.name : e.id,
+      free: e.id.endsWith(":free") || (pricing.prompt === "0" && pricing.completion === "0"),
+    };
+    if (typeof e.context_length === "number") model.contextLength = e.context_length;
+    out.push(model);
+  }
+  return out;
+}
+
+/**
+ * Parses GET /endpoints/zdr. Each entry has `model_id` and an endpoint `tag` such as
+ * `azure/eu` or `makora/bf16`; the provider slug is the part before the first `/`.
+ */
+export function parseZdrEndpoints(text: string): ZdrEndpoint[] {
+  const out: ZdrEndpoint[] = [];
+  for (const e of parseDataArray(text, "zdr")) {
+    if (typeof e.model_id !== "string" || typeof e.tag !== "string") continue;
+    const provider = e.tag.split("/")[0];
+    if (!e.model_id || !provider) continue;
+    out.push({ model: normaliseModelSlug(e.model_id), provider });
+  }
+  return out;
 }
 
 /** Minimal structural validation of a batch object. Unknown fields are tolerated (and preserved in raw). */
