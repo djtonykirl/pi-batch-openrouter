@@ -5,6 +5,8 @@ import { normaliseModelSlug, type ZdrEndpoint } from "../privacy/policy.js";
 export interface HttpResponseLike {
   status: number;
   text(): Promise<string>;
+  /** Response headers (fetch's `Headers`); only `Retry-After` is read. */
+  headers?: { get(name: string): string | null };
 }
 
 export type FetchLike = (
@@ -38,6 +40,8 @@ export class OpenRouterError extends Error {
     public readonly operation: string,
     /** Provider response body (for evidence files only; never put into log messages). */
     public readonly rawBody?: string,
+    /** The response's `Retry-After` header, verbatim, when it had one. */
+    public readonly retryAfter?: string,
   ) {
     super(`OpenRouter ${operation} ${category}${httpStatus ? ` (HTTP ${httpStatus})` : ""}: ${detail}`);
     this.name = "OpenRouterError";
@@ -146,6 +150,14 @@ export class OpenRouterBatchClient {
     }
   }
 
+  /**
+   * POST /chat/completions (the immediate route; no streaming). `bodyText` is sent
+   * byte-for-byte. Non-2xx throws OpenRouterError with `rawBody` (and `retryAfter`).
+   */
+  public async chatCompletion(bodyText: string): Promise<RawExchange> {
+    return this.request("POST", "/chat/completions", "chat", bodyText);
+  }
+
   /** GET /models (public catalog). */
   public async listModels(): Promise<{ raw: RawExchange; models: CatalogModel[] }> {
     const raw = await this.request("GET", "/models", "models");
@@ -189,12 +201,19 @@ export class OpenRouterBatchClient {
     }
 
     if (res.status < 200 || res.status >= 300) {
+      let retryAfter: string | undefined;
+      try {
+        retryAfter = res.headers?.get("retry-after") ?? undefined;
+      } catch {
+        // an unreadable headers object: no Retry-After
+      }
       throw new OpenRouterError(
         categoriseHttpStatus(res.status),
         res.status,
         this.redact(extractErrorMessage(text)),
         operation,
         this.redact(text),
+        retryAfter,
       );
     }
     return { status: res.status, bodyText: text };

@@ -11,7 +11,7 @@ import { JobRegistry } from "../src/registry.js";
 import { BatchService, DuplicateActiveRequestError, SubmissionBlockedError, type AskOptions } from "../src/service.js";
 import { CLASSIFY_YAML, TICKETS_CSV } from "./fixtures/datasets.js";
 import { FAKE_KEY, FakeOpenRouter, accepted, makeConfig } from "./fixtures/fake-openrouter.js";
-import { completed, successItem } from "./fixtures/openrouter.js";
+import { chatCompletion, completed, successItem } from "./fixtures/openrouter.js";
 import { rm, tempWorkspace, writeFiles } from "./helpers.js";
 
 const ASK: AskOptions = { objective: "Review the authentication design", files: ["src/auth.ts"], contexts: [], format: "markdown", includeInstructions: true };
@@ -367,17 +367,17 @@ test(
 );
 
 test(
-  "an immediate-route job is refused at submit until the immediate path exists",
+  "an immediate-route job is sent through chat completions with its provider fields, never to /batches",
   withEnv({ level: "zdr", catalog: [] }, async ({ service, fake, jobsDir }) => {
-    fake.submitReplies = [accepted()];
-    await assert.rejects(service.createJob(await service.prepare({ ...ASK, model: "meta/llama-free:free" }), { previewOnly: false }), (err: unknown) => {
-      assert.ok(err instanceof SubmissionBlockedError);
-      assert.match(err.message, /immediate route, which isn't available yet/);
-      return true;
-    });
+    fake.submitReplies = [new Error("an immediate job must never reach /batches")];
+    fake.chatReplies = [{ status: 200, body: chatCompletion() }];
+    const job = await service.createJob(await service.prepare({ ...ASK, model: "meta/llama-free:free" }), { previewOnly: false });
+    assert.equal(job.localStatus, "ready", job.error?.message);
     assert.equal(postedBodies(fake).length, 0);
-    const [id] = jobDirs(jobsDir);
-    assert.equal(service.registry.read(id!).localStatus, "previewed");
+    const chat = fake.chatBodies();
+    assert.equal(chat.length, 1);
+    assert.deepEqual(chat[0]!.provider, { zdr: true });
+    assert.deepEqual(jobDirs(jobsDir), [job.localId], "no orphan preview is left behind");
   }),
 );
 

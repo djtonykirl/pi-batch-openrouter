@@ -75,3 +75,16 @@ export function completed(results: unknown[], overrides: Record<string, unknown>
     ...overrides,
   });
 }
+
+/** A non-streaming POST /chat/completions response (the immediate route). */
+export function chatCompletion(content: unknown = "Free reply.", usage: Record<string, unknown> = { prompt_tokens: 12, completion_tokens: 8, total_tokens: 20, cost: 0 }): Record<string, unknown> {
+  return {
+    id: "gen-1792074400-free",
+    object: "chat.completion",
+    created: FINALIZED_AT_S,
+    model: "meta/llama-free:free",
+    provider: "Example",
+    choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
+    usage,
+  };
+}

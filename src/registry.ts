@@ -46,6 +46,8 @@ export const ARTEFACTS = {
   submissionResponse: "provider/submission-response.json",
   latestStatus: "provider/latest-status.json",
   finalResponse: "provider/final-response.json",
+  /** Immediate route: per-item call state (started / completed / failed), rewritten atomically before and after each call. */
+  immediateProgress: "provider/immediate-progress.json",
   cancelResponse: "provider/cancel-response.json",
   resultMd: "result/result.md",
   resultJson: "result/result.json",

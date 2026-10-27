@@ -17,7 +17,10 @@ export const FAKE_KEY = "sk-or-v1-" + "fa4e".repeat(16);
  */
 export const PROVIDER_CUSTOM_ID = /^[A-Za-z0-9_-]{1,64}$/;
 
-export type Reply = { status: number; body: unknown } | Error | (() => Promise<{ status: number; body: unknown }>);
+export type Reply =
+  | { status: number; body: unknown; headers?: Record<string, string> }
+  | Error
+  | (() => Promise<{ status: number; body: unknown; headers?: Record<string, string> }>);
 
 /** Scripted OpenRouter: queues of replies per route; records every request; validates submissions. */
 export class FakeOpenRouter {
@@ -26,6 +29,8 @@ export class FakeOpenRouter {
   public getReplies: Reply[] = [];
   public cancelReplies: Reply[] = [];
   public deleteReplies: Reply[] = [];
+  /** Replies to POST /chat/completions (the immediate route). */
+  public chatReplies: Reply[] = [];
   public offline = false;
   /** Bodies of submissions that passed validation, in order. */
   public readonly accepted: Array<{ model: string; requests: Array<{ custom_id: string; body: unknown }> }> = [];
@@ -39,13 +44,32 @@ export class FakeOpenRouter {
       if (rejection) return { status: rejection.status, text: async () => JSON.stringify({ error: { code: rejection.status, message: rejection.message } }) };
       this.accepted.push(JSON.parse(init.body!));
     }
-    const queue = isSubmit ? this.submitReplies : init.method === "DELETE" ? this.deleteReplies : url.endsWith("/cancel") ? this.cancelReplies : this.getReplies;
+    const isChat = init.method === "POST" && url.endsWith("/chat/completions");
+    const queue = isSubmit
+      ? this.submitReplies
+      : isChat
+        ? this.chatReplies
+        : init.method === "DELETE"
+          ? this.deleteReplies
+          : url.endsWith("/cancel")
+            ? this.cancelReplies
+            : this.getReplies;
     const reply = queue.length > 1 ? queue.shift()! : queue[0];
     if (!reply) throw new Error(`no scripted reply for ${init.method} ${url}`);
     if (reply instanceof Error) throw reply;
     const r = typeof reply === "function" ? await reply() : reply;
-    return { status: r.status, text: async () => (typeof r.body === "string" ? r.body : JSON.stringify(r.body)) };
+    const headers = Object.fromEntries(Object.entries(r.headers ?? {}).map(([k, v]) => [k.toLowerCase(), v]));
+    return {
+      status: r.status,
+      headers: { get: (name: string) => headers[name.toLowerCase()] ?? null },
+      text: async () => (typeof r.body === "string" ? r.body : JSON.stringify(r.body)),
+    };
   };
+
+  /** Parsed bodies POSTed to /chat/completions, in order. */
+  public chatBodies(): Array<Record<string, unknown>> {
+    return this.requests.filter((r) => r.method === "POST" && r.url.endsWith("/chat/completions")).map((r) => JSON.parse(r.body!));
+  }
 
   /** custom_ids of the most recently accepted submission, in submission order. */
   public lastCustomIds(): string[] {

@@ -11,6 +11,7 @@ import { nullLogger, type Logger } from "./logger.js";
 import { normalizeBatchModelSlug } from "./models.js";
 import type { ModelCatalog } from "./models/catalog.js";
 import { OpenRouterBatchClient, OpenRouterError, type RawExchange } from "./openrouter/client.js";
+import { immediateResultId, runImmediateJob, type ImmediateItemState, type ImmediateProgress } from "./openrouter/immediate.js";
 import { normaliseBatchResult, type NormalisedBatchResult } from "./openrouter/normalise-result.js";
 import { buildSubmitBody, messageText, submitBodyProblems, type BatchRequestItem, type ChatMessage, type ProviderPin, type SubmitBody } from "./openrouter/types.js";
 import { effectiveLevel, resolveBatchProvider, routeForModel, stricter, type PrivacyLevel, type Route } from "./privacy/policy.js";
@@ -288,6 +289,8 @@ const INTERRUPTED_AFTER_MS = 30_000;
 const LOCK_RETRY_MS = 250;
 /** Remote batch deletion is abandoned (state "failed") after this many attempts. */
 const MAX_DELETION_ATTEMPTS = 10;
+/** Added to the request timeout: how long an immediate call recorded as started may still be in flight elsewhere. */
+const IMMEDIATE_IN_FLIGHT_MARGIN_MS = 30_000;
 /** How long `/batch check <id>` waits for an in-flight check before reporting "busy". */
 export const CHECK_LOCK_WAIT_MS = 10_000;
 
@@ -1023,19 +1026,11 @@ export class BatchService {
       if (current !== recorded && stricter(current, recorded) === current) {
         throw new SubmissionBlockedError(`Privacy level ${current}: ${localId} was prepared at ${recorded}; cancel it and create it again`);
       }
-      // Until the immediate path exists, an immediate job must never fall through to /batches without its provider fields.
-      if (job.route === "immediate") {
-        throw new SubmissionBlockedError(`Privacy level ${recorded}: ${localId} uses the immediate route, which isn't available yet; it stays previewed`);
-      }
       if (!opts.skipDuplicateCheck && job.contentSha256) {
         const dup = this.findActiveDuplicate(job.contentSha256, localId);
         if (dup) throw new DuplicateActiveRequestError(dup.localId);
       }
-      const bodyText = fs.readFileSync(this.registry.artefact(localId, "submittedRequest"), "utf8");
-      if (sha256Hex(bodyText) !== job.requestSha256) {
-        throw new Error(`Job ${localId}: submitted-request.json no longer matches request.sha256; refusing to submit.`);
-      }
-      const body = JSON.parse(bodyText) as SubmitBody;
+      const { bodyText, body } = this.storedRequest(job);
       // Re-validated at submit time too: previews made by earlier versions may predate a rule.
       const problems = [...customIdProblems(body.requests.map((r) => r.custom_id)), ...submitBodyProblems(body)];
       if (problems.length > 0) {
@@ -1048,13 +1043,28 @@ export class BatchService {
         throw new Error(`Missing API key for account "${job.account}". Configure it in Pi (auth.json) or set OPENROUTER_API_KEY. Job ${localId} stays previewed.`);
       }
       const drift = this.workflowDrift(localId);
+      const immediate = job.route === "immediate";
       this.registry.update(localId, (u) => {
         if (drift) {
           u.note("workflow_changed_since_preview", { definitionFile: isDatasetWorkflow(job.workflow) ? job.workflow.definitionFile : undefined });
           if (!u.manifest.warnings.includes(drift)) u.manifest.warnings.push(drift);
         }
         u.transition("submitting");
+        if (immediate) {
+          // Nothing is sent yet: the per-item progress record (written before each call) is what
+          // makes the calls crash safe, so the job goes straight to in flight in this same write.
+          const m = u.manifest;
+          m.submittedAt = nowIso();
+          for (const it of m.items ?? []) if (it.status === "planned") it.status = "submitted";
+          m.nextPollAt = nowIso();
+          u.transition("submitted", { route: "immediate" });
+        }
       });
+      if (immediate) {
+        this.logger.log("info", "submit_immediate", { localId, model: job.model, requests: body.requests.length, privacy: job.privacy?.level });
+        await this.immediateStep(job.localId, body);
+        return this.registry.read(localId);
+      }
       this.logger.log("info", "submit_start", { localId, model: job.model, requests: body.requests.length });
 
       try {
@@ -1192,6 +1202,14 @@ export class BatchService {
         return u.manifest;
       });
     }
+    if (job.route === "immediate") {
+      if (!POLLABLE_STATUSES.has(job.localStatus)) return { localId, status: job.localStatus, polled: false, skipped: "not_pollable" };
+      // provider_completed (a recovered retrieval) rebuilds from saved progress without calling, so it is always due.
+      if (!opts.force && job.localStatus !== "provider_completed" && job.nextPollAt && isoToEpochMs(job.nextPollAt) > Date.now()) {
+        return { localId, status: job.localStatus, polled: false, skipped: "not_due" };
+      }
+      return this.immediateStep(localId, this.storedRequest(job).body);
+    }
     if (!POLLABLE_STATUSES.has(job.localStatus) || !job.providerBatchId) {
       return { localId, status: job.localStatus, polled: false, skipped: "not_pollable" };
     }
@@ -1302,10 +1320,102 @@ export class BatchService {
     return { localId: job.localId, status: updated.localStatus, polled: true, error: e.message };
   }
 
+  /** The exact stored request body; refuses one that no longer matches its recorded hash. */
+  private storedRequest(job: JobManifest): { bodyText: string; body: SubmitBody } {
+    const bodyText = fs.readFileSync(this.registry.artefact(job.localId, "submittedRequest"), "utf8");
+    if (sha256Hex(bodyText) !== job.requestSha256) {
+      throw new Error(`Job ${job.localId}: submitted-request.json no longer matches request.sha256; refusing to submit.`);
+    }
+    return { bodyText, body: JSON.parse(bodyText) as SubmitBody };
+  }
+
+  /** The immediate route's per-item call state, rewritten atomically (provider/immediate-progress.json). */
+  private immediateProgress(localId: string): ImmediateProgress {
+    const file = this.registry.artefact(localId, "immediateProgress");
+    return {
+      // An unreadable record throws: nothing is sent when what was sent is unknown.
+      read: () => (fs.existsSync(file) ? (JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, ImmediateItemState>) : {}),
+      write: (state) => atomicWriteJson(file, state),
+    };
+  }
+
+  /**
+   * One immediate-route step (caller holds the job lock): sends the items that have no
+   * outcome yet through POST /chat/completions, then settles through the normal retrieval
+   * path, reschedules after a per-minute 429, or fails the job when the reply item failed.
+   */
+  private async immediateStep(localId: string, body: SubmitBody): Promise<ReconcileOutcome> {
+    let job = this.registry.read(localId);
+    const config = this.deps.getConfig();
+    let apiKey: string;
+    try {
+      apiKey = await this.deps.resolveApiKey(job.account);
+      if (!apiKey) throw new OpenRouterError("auth", undefined, `no API key available for account "${job.account}"`, "chat");
+    } catch (err) {
+      return this.recordPollError(job, err);
+    }
+    const level = job.privacy?.level ?? "standard";
+    const outcome = await runImmediateJob(job, body.requests, this.client(apiKey), level, undefined, {
+      progress: this.immediateProgress(localId),
+      inFlightMs: config.polling.requestTimeoutSeconds * 1000 + IMMEDIATE_IN_FLIGHT_MARGIN_MS,
+    });
+
+    if (outcome.kind === "in_flight") {
+      this.logger.log("info", "immediate_in_flight", { localId, item: outcome.ordinal, until: outcome.until });
+      return { localId, status: job.localStatus, polled: false, skipped: "locked" };
+    }
+    if (outcome.kind === "retry") {
+      job = this.registry.update(localId, (u) => {
+        const m = u.manifest;
+        m.consecutivePollFailures += 1;
+        m.pollAttempts += 1;
+        m.lastPollAt = nowIso();
+        m.nextPollAt = outcome.notBefore;
+        delete m.lastPollError; // OpenRouter answered: a rate limit is not a poll error
+        if (m.localStatus === "submitted") u.transition("polling", { route: "immediate" });
+        u.note("immediate_rate_limited", { reason: outcome.reason, notBefore: outcome.notBefore, consecutive: m.consecutivePollFailures });
+        return m;
+      });
+      this.logger.log("warn", "immediate_rate_limited", { localId, notBefore: outcome.notBefore, consecutive: job.consecutivePollFailures });
+      return { localId, status: job.localStatus, polled: true };
+    }
+    if (outcome.kind === "failed") {
+      job = this.registry.update(localId, (u) => {
+        const m = u.manifest;
+        m.lastPollAt = nowIso();
+        m.error = { code: outcome.code, message: outcome.message };
+        const first = m.items?.[0];
+        if (first) {
+          first.status = "failed";
+          first.error = { code: outcome.code, message: outcome.message };
+        }
+        u.transition("failed", { code: outcome.code, route: "immediate" });
+        return m;
+      });
+      this.logger.log("error", "immediate_failed", { localId, code: outcome.code });
+      this.deps.onSettled?.(job);
+      return { localId, status: job.localStatus, polled: true, error: outcome.message };
+    }
+    this.registry.update(localId, (u) => {
+      const m = u.manifest;
+      m.lastPollAt = nowIso();
+      m.consecutivePollFailures = 0;
+      delete m.lastPollError;
+      m.providerStatus = "completed";
+      if (m.localStatus === "submitted") u.transition("polling", { route: "immediate" });
+      if (m.localStatus !== "provider_completed") u.transition("provider_completed", { route: "immediate" });
+      u.transition("retrieving");
+    });
+    job = this.saveFinalAndFinish(localId, outcome.finalResponseText, { route: "immediate" });
+    if (TERMINAL_STATUSES.has(job.localStatus)) this.deps.onSettled?.(job);
+    return { localId, status: job.localStatus, polled: true };
+  }
+
   private normalise(job: JobManifest, rawText: string): NormalisedBatchResult {
     return normaliseBatchResult(rawText, {
       localJobId: job.localId,
-      providerBatchId: job.providerBatchId!,
+      // Immediate jobs never have a provider batch: their final response carries a synthetic ID.
+      providerBatchId: job.route === "immediate" ? immediateResultId(job.localId) : job.providerBatchId!,
       expectedCustomIds: job.customIds,
       // Release 1 jobs never validated JSON output; keep their semantics.
       format: job.schemaVersion >= 2 ? job.format : "markdown",
@@ -1339,15 +1449,20 @@ export class BatchService {
       });
     }
 
+    return this.saveFinalAndFinish(localId, raw.bodyText, {});
+  }
+
+  /** In `retrieving`: saves the raw final response (write-once), records where it is, then settles from it. */
+  private saveFinalAndFinish(localId: string, rawText: string, details: Record<string, unknown>): JobManifest {
     // 1. Raw evidence first (write-once), and record where it is before interpreting it.
-    const finalPath = writeOnce(this.registry.artefact(localId, "finalResponse"), raw.bodyText);
+    const finalPath = writeOnce(this.registry.artefact(localId, "finalResponse"), rawText);
     const rel = path.relative(this.registry.jobDir(localId), finalPath).split(path.sep).join("/");
     this.registry.update(localId, (u) => {
       u.manifest.finalResponseFile = rel;
-      u.note("final_response_saved", { file: rel, bytes: Buffer.byteLength(raw.bodyText) });
+      u.note("final_response_saved", { file: rel, bytes: Buffer.byteLength(rawText) });
     });
     // 2..10. Interpret, write item artefacts and summary, settle the outcome.
-    return this.finishRetrieval(localId, raw.bodyText, finalPath, {});
+    return this.finishRetrieval(localId, rawText, finalPath, details);
   }
 
   /** Normalises a saved final response and settles the job. Idempotent: safe to re-run after a crash. */
@@ -1549,6 +1664,24 @@ export class BatchService {
     }
     if (job.localStatus !== "submitted" && job.localStatus !== "polling" && job.localStatus !== "cancel_requested") {
       return { job, message: `${localId} is ${job.localStatus}; it cannot be cancelled now.` };
+    }
+    if (job.route === "immediate") {
+      // No provider batch to cancel. Under the lock no call is in progress, so stopping here sends nothing more.
+      job = this.withLock(localId, () =>
+        this.registry.update(localId, (u) => {
+          const m = u.manifest;
+          if (m.localStatus !== "submitted" && m.localStatus !== "polling" && m.localStatus !== "cancel_requested") return m;
+          if (m.localStatus !== "cancel_requested") {
+            m.cancelRequestedAt = nowIso();
+            u.transition("cancel_requested");
+          }
+          u.transition("cancelled", { route: "immediate" });
+          return m;
+        }),
+      );
+      if (job.localStatus !== "cancelled") return { job, message: `${localId} is ${job.localStatus}; it cannot be cancelled now.` };
+      this.deps.onSettled?.(job);
+      return { job, message: `${localId} was cancelled; no further requests will be sent for it.` };
     }
 
     if (job.localStatus !== "cancel_requested") {
