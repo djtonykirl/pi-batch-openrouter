@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { canonicalJson, sha256Hex } from "../src/fsutil.js";
 import { PROPOSAL_SCHEMA_V2, promptEvidence, proposalProblems, type TableEvidence } from "../src/metadata/contract.js";
-import { renderMetadataPrompt } from "../src/metadata/plan.js";
+import { portableSchema, renderMetadataPrompt } from "../src/metadata/plan.js";
 import {
   columnCommentProblems,
   columnTagProblems,
@@ -339,7 +339,7 @@ test("standards-mode request bodies carry the proposal schema as response_format
     const p = await planPinpoint(service);
     assert.deepEqual(p.blockers, []);
     for (const it of p.plan!.items) {
-      assert.deepEqual(it.body.response_format, { type: "json_schema", json_schema: { name: "uc_metadata_proposal", strict: true, schema: PROPOSAL_SCHEMA_V2 } });
+      assert.deepEqual(it.body.response_format, { type: "json_schema", json_schema: { name: "uc_metadata_proposal", strict: true, schema: portableSchema(PROPOSAL_SCHEMA_V2) } });
     }
   }, files(evidence()));
   const off = makeConfig((c) => {
@@ -354,4 +354,29 @@ test("standards-mode request bodies carry the proposal schema as response_format
     const p = await service.planMetadata({ context: "metadata/beverage/context.md", input: "metadata/beverage/tables.jsonl" });
     for (const it of p.plan!.items) assert.equal("response_format" in it.body, false);
   });
+});
+
+test("the response_format schema is portable: no length keywords, every enum typed; local validation keeps the full schema", () => {
+  const portable = portableSchema(PROPOSAL_SCHEMA_V2);
+  const text = JSON.stringify(portable);
+  for (const k of ["minLength", "maxLength", "minItems", "maxItems"]) assert.equal(text.includes(`"${k}"`), false, k);
+  const enums: Array<Record<string, unknown>> = [];
+  const walk = (v: unknown): void => {
+    if (Array.isArray(v)) return v.forEach(walk);
+    if (!v || typeof v !== "object") return;
+    const o = v as Record<string, unknown>;
+    if (Array.isArray(o.enum)) enums.push(o);
+    Object.values(o).forEach(walk);
+  };
+  walk(portable);
+  assert.ok(enums.length >= 5);
+  for (const e of enums) assert.equal(e.type, "string", JSON.stringify(e));
+  // Same structure otherwise (required fields, additionalProperties), and the original is untouched.
+  assert.deepEqual((portable as { required: string[] }).required, [...PROPOSAL_SCHEMA_V2.required]);
+  assert.match(JSON.stringify(PROPOSAL_SCHEMA_V2), /"minLength":1/);
+  // Local validation still enforces the lengths the portable copy leaves out.
+  const p = proposal();
+  p.columns[0]!.reason = "";
+  assert.ok(proposalProblems(p, promptEvidence(evidence(), STANDARDS), STANDARDS).length > 0, "an empty reason is still rejected locally");
+  assert.deepEqual(proposalProblems(proposal(), promptEvidence(evidence(), STANDARDS), STANDARDS), []);
 });

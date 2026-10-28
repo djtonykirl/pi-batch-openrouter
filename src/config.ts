@@ -68,6 +68,12 @@ export interface BatchConfig {
   };
 }
 
+/**
+ * Default for workflows.metadataStructuredOutput. One constant so it is easy to flip off if a real standards batch shows
+ * a provider rejecting response_format.
+ */
+export const METADATA_STRUCTURED_OUTPUT_DEFAULT = true;
+
 export const DEFAULT_CONFIG: BatchConfig = {
   schemaVersion: 1,
   defaultModel: "anthropic/claude-opus-5.5",
@@ -96,7 +102,7 @@ export const DEFAULT_CONFIG: BatchConfig = {
     maxSynthesisCharacters: 1_000_000,
     maxRowsPerRun: 1_000,
     maxDatasetBytes: 20_000_000,
-    metadataStructuredOutput: true,
+    metadataStructuredOutput: METADATA_STRUCTURED_OUTPUT_DEFAULT,
   },
   chat: {
     autoCompact: true,

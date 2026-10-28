@@ -1259,7 +1259,9 @@ payload limit and no maximum request count. Setting `excludePatterns` replaces t
 `maxRowsPerRun` caps the selected rows (each row is one request) and `maxDatasetBytes` the dataset file size.
 `metadataStructuredOutput` (UC metadata standards mode only) sends the proposal schema with each request as a strict
 structured output (`response_format`), which asks the provider to constrain the reply to that schema; set it to `false` for a model
-whose batch endpoints reject `response_format`. Version 1 metadata requests never carry it.
+whose batch endpoints reject `response_format`. Version 1 metadata requests never carry it. The schema sent is a portable
+copy (no length limits, an explicit type on every enum); every reply is still validated locally against the full
+schema. The setting affects new plans only: a retry reuses the stored request bodies.
 A workflow's own `limits` can only lower these. The `routing` section is described in
 [Provider routing and account privacy](#provider-routing-and-account-privacy); with its defaults nothing changes.
 

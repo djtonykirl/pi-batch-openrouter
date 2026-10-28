@@ -203,9 +203,32 @@ export function renderMetadataPrompt(context: string, evidence: TableEvidence, s
   ].join("\n");
 }
 
+const LENGTH_KEYWORDS = new Set(["minLength", "maxLength", "minItems", "maxItems"]);
+
+/**
+ * A copy of a JSON Schema that strict structured-output modes accept across providers: the length keywords
+ * (minLength/maxLength/minItems/maxItems) are dropped, and every `enum` gets an explicit `type` from its values. The
+ * full schema (PROPOSAL_SCHEMA_V2, with the lengths) is still enforced locally by the Ajv validator on every reply.
+ */
+export function portableSchema(schema: unknown): unknown {
+  if (Array.isArray(schema)) return schema.map(portableSchema);
+  if (!schema || typeof schema !== "object") return schema;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(schema as Record<string, unknown>)) {
+    if (LENGTH_KEYWORDS.has(k)) continue;
+    // `enum` and `properties` values are data (or a name map), not schemas: copy enum values as they are.
+    out[k] = k === "enum" ? v : k === "properties" ? Object.fromEntries(Object.entries(v as Record<string, unknown>).map(([p, s]) => [p, portableSchema(s)])) : portableSchema(v);
+  }
+  if (Array.isArray(out.enum) && out.type === undefined) {
+    const types = [...new Set(out.enum.map((x) => (x === null ? "null" : typeof x === "number" ? (Number.isInteger(x) ? "integer" : "number") : typeof x)))];
+    out.type = types.length === 1 ? types[0] : types;
+  }
+  return out;
+}
+
 /** The standards-mode proposal schema as an OpenAI-style structured output (`response_format`), which the Batch API forwards. */
-export function proposalResponseFormat(): { type: "json_schema"; json_schema: { name: string; strict: true; schema: typeof PROPOSAL_SCHEMA_V2 } } {
-  return { type: "json_schema", json_schema: { name: "uc_metadata_proposal", strict: true, schema: PROPOSAL_SCHEMA_V2 } };
+export function proposalResponseFormat(): { type: "json_schema"; json_schema: { name: string; strict: true; schema: unknown } } {
+  return { type: "json_schema", json_schema: { name: "uc_metadata_proposal", strict: true, schema: portableSchema(PROPOSAL_SCHEMA_V2) } };
 }
 
 export function metadataMessages(prompt: string): ChatMessage[] {
