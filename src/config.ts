@@ -43,6 +43,11 @@ export interface BatchConfig {
     maxRowsPerRun: number;
     /** Dataset workflows: largest dataset file read. */
     maxDatasetBytes: number;
+    /**
+     * UC metadata standards mode: send the proposal schema as a structured output (response_format, strict). Every
+     * :batch model in the catalog reported structured_outputs support on 2026-10-28; set false for a model that rejects it.
+     */
+    metadataStructuredOutput: boolean;
   };
   /** Batch chat: persistent named threads. */
   chat: { autoCompact: boolean; autoCompactTokens: number; keepRecentExchanges: number; retitleAtTurn: number; systemPrompt: string };
@@ -91,6 +96,7 @@ export const DEFAULT_CONFIG: BatchConfig = {
     maxSynthesisCharacters: 1_000_000,
     maxRowsPerRun: 1_000,
     maxDatasetBytes: 20_000_000,
+    metadataStructuredOutput: true,
   },
   chat: {
     autoCompact: true,
@@ -208,6 +214,7 @@ const SCHEMA: Record<string, Check | Record<string, Check>> = {
     maxSynthesisCharacters: posInt(),
     maxRowsPerRun: posInt(100_000),
     maxDatasetBytes: posInt(),
+    metadataStructuredOutput: bool,
   },
   chat: {
     autoCompact: bool,

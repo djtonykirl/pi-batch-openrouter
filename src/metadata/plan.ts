@@ -53,6 +53,7 @@ export const METADATA_STANDARDS_INSTRUCTIONS = [
   "Every description and comment is at least 30 characters long.",
   `Set "classification" to one of ${CLASSIFICATIONS.join(", ")}; use pii_scan_required when the evidence does not make the classification clear. The CLASSIFICATION: line states the same value. Never use public when any column has pii_tags.`,
   'Set "pii_tags" only for a column that holds personal data (pii_type, sensitivity and requires_masking); otherwise null.',
+  '"pii_tags" belongs only on each entry of "columns"; never put it in "table_description". "classification" is a top-level field of the response object, next to "table", not inside "table_description".',
   "Never copy sample values that look personal (names, email addresses, phone numbers, identification numbers, addresses) into any description or comment.",
   "Do not propose data_domain, uc_prefix, medallion_layer or a table-level pii tag: they are derived outside this request.",
 ];
@@ -79,6 +80,8 @@ export interface MetadataPlanInput {
   security: { scanSecrets: boolean; blockOnSecret: boolean; knownSecrets: readonly string[] };
   /** Opt-in UC standards mode (both domain and ucPrefix); absent = workflow version 1, unchanged. */
   standards?: MetadataStandards;
+  /** Standards mode only: send PROPOSAL_SCHEMA_V2 as response_format (workflows.metadataStructuredOutput). */
+  structuredOutput?: boolean;
 }
 
 export interface MetadataPlanItem {
@@ -187,12 +190,22 @@ export function renderMetadataPrompt(context: string, evidence: TableEvidence, s
     "",
     `- Respond with exactly one JSON object conforming to the JSON Schema below, with "table" set to ${JSON.stringify(evidence.table)}.`,
     "- A comment is a string, or null when confidence is \"insufficient\" (and only then).",
-    ...(standards ? ['- "classification" is required; every column carries "pii_tags" (an object for a column holding personal data, otherwise null).'] : []),
+    ...(standards
+      ? [
+          '- "classification" is required; every column carries "pii_tags" (an object for a column holding personal data, otherwise null).',
+          '- "classification" is a top-level field. "pii_tags" belongs only on each entry of "columns"; never put it in "table_description", which has exactly "comment", "confidence" and "reason".',
+        ]
+      : []),
     "- Do not add any text before or after the JSON object, and do not wrap it in a code fence.",
     "",
     JSON.stringify(standards ? PROPOSAL_SCHEMA_V2 : PROPOSAL_SCHEMA, null, 2),
     "",
   ].join("\n");
+}
+
+/** The standards-mode proposal schema as an OpenAI-style structured output (`response_format`), which the Batch API forwards. */
+export function proposalResponseFormat(): { type: "json_schema"; json_schema: { name: string; strict: true; schema: typeof PROPOSAL_SCHEMA_V2 } } {
+  return { type: "json_schema", json_schema: { name: "uc_metadata_proposal", strict: true, schema: PROPOSAL_SCHEMA_V2 } };
 }
 
 export function metadataMessages(prompt: string): ChatMessage[] {
@@ -242,7 +255,8 @@ export function planMetadataRun(input: MetadataPlanInput): MetadataPlan {
       auditColumns += evidence.columns.length - sent.columns.length;
       const prompt = renderMetadataPrompt(input.context.text, evidence, standards);
       const messages = metadataMessages(prompt);
-      const body: BatchRequestItem["body"] = { messages, max_tokens: input.maxTokens };
+      // Standards mode only: the proposal schema as a structured output (v1 bodies, and their hashes, are unchanged).
+      const body: BatchRequestItem["body"] = { messages, max_tokens: input.maxTokens, ...(standards && input.structuredOutput ? { response_format: proposalResponseFormat() } : {}) };
       items.push({
         ordinal: items.length + 1,
         evidence,

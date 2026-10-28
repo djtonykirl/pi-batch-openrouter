@@ -1243,7 +1243,7 @@ Invalid values fall back to the default and are reported. Legacy keys (`defaultP
   "security": { "scanSecrets": true, "blockOnSecret": true, "allowOutsideWorkspace": false },
   "injection": { "maxCharacters": 30000, "includeObjective": true, "includeArtefactPaths": true },
   "submission": { "showPreview": true, "requireConfirmation": false },
-  "workflows": { "maxRequestsPerBatch": 100, "maxCharactersPerItem": 500000, "maxTotalCharacters": 5000000, "maxSynthesisCharacters": 1000000, "maxRowsPerRun": 1000, "maxDatasetBytes": 20000000 },
+  "workflows": { "maxRequestsPerBatch": 100, "maxCharactersPerItem": 500000, "maxTotalCharacters": 5000000, "maxSynthesisCharacters": 1000000, "maxRowsPerRun": 1000, "maxDatasetBytes": 20000000, "metadataStructuredOutput": true },
   "privacy": { "level": "standard", "accountNoTraining": false, "deleteRemoteBatches": true, "noticeShown": false },
   "routing": { "allowedProviders": [], "allowFallbacks": true, "requireZdr": false, "accountZdrEnforced": false, "requireNoDataCollection": false, "accountDataCollectionDenied": false }
 }
@@ -1253,6 +1253,9 @@ These are application defaults (local policy), not OpenRouter limits. OpenRouter
 payload limit and no maximum request count. Setting `excludePatterns` replaces the whole list. The
 `workflows` section is optional; Release 1 configuration files keep working unchanged. For dataset workflows,
 `maxRowsPerRun` caps the selected rows (each row is one request) and `maxDatasetBytes` the dataset file size.
+`metadataStructuredOutput` (UC metadata standards mode only) sends the proposal schema with each request as a strict
+structured output (`response_format`), which asks the provider to constrain the reply to that schema; set it to `false` for a model
+whose batch endpoints reject `response_format`. Version 1 metadata requests never carry it.
 A workflow's own `limits` can only lower these. The `routing` section is described in
 [Provider routing and account privacy](#provider-routing-and-account-privacy); with its defaults nothing changes.
 

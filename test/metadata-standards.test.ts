@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { canonicalJson, sha256Hex } from "../src/fsutil.js";
-import { promptEvidence, proposalProblems, type TableEvidence } from "../src/metadata/contract.js";
+import { PROPOSAL_SCHEMA_V2, promptEvidence, proposalProblems, type TableEvidence } from "../src/metadata/contract.js";
 import { renderMetadataPrompt } from "../src/metadata/plan.js";
 import {
   columnCommentProblems,
@@ -322,3 +322,36 @@ test("lifecycle: a standards job records v2 + standards; PII under a public clas
     await service.reconcile(retry.localId, { force: true });
     assert.equal(service.registry.read(retry.localId).items![0]!.status, "completed");
   }, files(evidence())));
+
+// ------------------------------------------------------------------ prompt placement rule and structured output
+
+test("standards prompt says where pii_tags and classification go; v1 prompt does not", () => {
+  const std = renderMetadataPrompt("ctx", evidence(), STANDARDS);
+  assert.match(std, /"pii_tags" belongs only on each entry of "columns"; never put it in "table_description"/);
+  assert.match(std, /"classification" is a top-level field/);
+  const v1 = renderMetadataPrompt("ctx", evidence());
+  assert.doesNotMatch(v1, /pii_tags/);
+  assert.doesNotMatch(v1, /classification/);
+});
+
+test("standards-mode request bodies carry the proposal schema as response_format; the flag turns it off", async () => {
+  await withWorkspace(async (_root, service) => {
+    const p = await planPinpoint(service);
+    assert.deepEqual(p.blockers, []);
+    for (const it of p.plan!.items) {
+      assert.deepEqual(it.body.response_format, { type: "json_schema", json_schema: { name: "uc_metadata_proposal", strict: true, schema: PROPOSAL_SCHEMA_V2 } });
+    }
+  }, files(evidence()));
+  const off = makeConfig((c) => {
+    c.workflows.metadataStructuredOutput = false;
+  });
+  await withWorkspace(async (_root, service) => {
+    const p = await planPinpoint(service);
+    for (const it of p.plan!.items) assert.equal("response_format" in it.body, false);
+  }, files(evidence()), off);
+  // v1 never carries it (the byte-identical baseline above covers its hashes).
+  await withWorkspace(async (_root, service) => {
+    const p = await service.planMetadata({ context: "metadata/beverage/context.md", input: "metadata/beverage/tables.jsonl" });
+    for (const it of p.plan!.items) assert.equal("response_format" in it.body, false);
+  });
+});

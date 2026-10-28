@@ -1068,7 +1068,7 @@ export class BatchService {
       maxTokens: config.request.maxTokens,
       limits: { maxRequests: config.workflows.maxRequestsPerBatch, maxRows: config.workflows.maxRowsPerRun, maxCharactersPerItem: config.workflows.maxCharactersPerItem, maxTotalCharacters: config.workflows.maxTotalCharacters },
       security: { scanSecrets: config.security.scanSecrets, blockOnSecret: config.security.blockOnSecret, knownSecrets: await this.knownSecrets(account) },
-      ...(mode.standards ? { standards: mode.standards } : {}),
+      ...(mode.standards ? { standards: mode.standards, structuredOutput: config.workflows.metadataStructuredOutput } : {}),
     });
     blockers.push(...plan.blockers);
     const contentSha256 = contentHash(buildSubmitBody({ model, provider: pin, requests: plan.items.map((it) => ({ custom_id: "{custom_id}", body: it.body })) }));
