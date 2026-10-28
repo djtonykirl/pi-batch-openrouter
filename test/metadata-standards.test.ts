@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { DEFAULT_CONFIG } from "../src/config.js";
 import { canonicalJson, sha256Hex } from "../src/fsutil.js";
 import { PROPOSAL_SCHEMA_V2, promptEvidence, proposalProblems, type TableEvidence } from "../src/metadata/contract.js";
 import { portableSchema, renderMetadataPrompt } from "../src/metadata/plan.js";
@@ -334,21 +335,22 @@ test("standards prompt says where pii_tags and classification go; v1 prompt does
   assert.doesNotMatch(v1, /classification/);
 });
 
-test("standards-mode request bodies carry the proposal schema as response_format; the flag turns it off", async () => {
+test("standards-mode request bodies carry the proposal schema as response_format only when opted in (default off)", async () => {
+  assert.equal(DEFAULT_CONFIG.workflows.metadataStructuredOutput, false, "off by default: a provider rejected the strict schema live");
+  const on = makeConfig((c) => {
+    c.workflows.metadataStructuredOutput = true;
+  });
   await withWorkspace(async (_root, service) => {
     const p = await planPinpoint(service);
     assert.deepEqual(p.blockers, []);
     for (const it of p.plan!.items) {
       assert.deepEqual(it.body.response_format, { type: "json_schema", json_schema: { name: "uc_metadata_proposal", strict: true, schema: portableSchema(PROPOSAL_SCHEMA_V2) } });
     }
-  }, files(evidence()));
-  const off = makeConfig((c) => {
-    c.workflows.metadataStructuredOutput = false;
-  });
+  }, files(evidence()), on);
   await withWorkspace(async (_root, service) => {
     const p = await planPinpoint(service);
     for (const it of p.plan!.items) assert.equal("response_format" in it.body, false);
-  }, files(evidence()), off);
+  }, files(evidence()));
   // v1 never carries it (the byte-identical baseline above covers its hashes).
   await withWorkspace(async (_root, service) => {
     const p = await service.planMetadata({ context: "metadata/beverage/context.md", input: "metadata/beverage/tables.jsonl" });

@@ -135,13 +135,16 @@ test(
     fake.chatReplies = [{ status: 429, body: PER_MINUTE, headers: { "Retry-After": "20" } }];
     const before = Date.now();
     const job = await chatJob(service);
+    const after = Date.now();
     const m = service.registry.read(job.localId);
     assert.ok(m.localStatus === "submitted" || m.localStatus === "polling", m.localStatus);
     assert.equal(m.error, undefined);
     assert.equal(m.lastPollError, undefined);
     assert.equal(m.items![0]!.status, "submitted");
-    const delay = Date.parse(m.nextPollAt!) - before;
-    assert.ok(delay >= 19_000 && delay <= 22_000, `nextPollAt is ${delay} ms ahead`);
+    // Retry-After: 20 is applied when the 429 arrives, somewhere between `before` and `after` (which can be seconds
+    // apart under a loaded test run), so bound it by both rather than by a fixed window from `before`.
+    const next = Date.parse(m.nextPollAt!);
+    assert.ok(next >= before + 19_000 && next <= after + 21_000, `nextPollAt is ${next - before} ms after the start (${after - before} ms elapsed)`);
 
     // Not due yet: the poller leaves it alone.
     const early = await service.reconcile(job.localId);

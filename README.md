@@ -1247,7 +1247,7 @@ Invalid values fall back to the default and are reported. Legacy keys (`defaultP
   "security": { "scanSecrets": true, "blockOnSecret": true, "allowOutsideWorkspace": false },
   "injection": { "maxCharacters": 30000, "includeObjective": true, "includeArtefactPaths": true },
   "submission": { "showPreview": true, "requireConfirmation": false },
-  "workflows": { "maxRequestsPerBatch": 100, "maxCharactersPerItem": 500000, "maxTotalCharacters": 5000000, "maxSynthesisCharacters": 1000000, "maxRowsPerRun": 1000, "maxDatasetBytes": 20000000, "metadataStructuredOutput": true },
+  "workflows": { "maxRequestsPerBatch": 100, "maxCharactersPerItem": 500000, "maxTotalCharacters": 5000000, "maxSynthesisCharacters": 1000000, "maxRowsPerRun": 1000, "maxDatasetBytes": 20000000, "metadataStructuredOutput": false },
   "privacy": { "level": "standard", "accountNoTraining": false, "deleteRemoteBatches": true, "noticeShown": false },
   "routing": { "allowedProviders": [], "allowFallbacks": true, "requireZdr": false, "accountZdrEnforced": false, "requireNoDataCollection": false, "accountDataCollectionDenied": false }
 }
@@ -1257,9 +1257,12 @@ These are application defaults (local policy), not OpenRouter limits. OpenRouter
 payload limit and no maximum request count. Setting `excludePatterns` replaces the whole list. The
 `workflows` section is optional; Release 1 configuration files keep working unchanged. For dataset workflows,
 `maxRowsPerRun` caps the selected rows (each row is one request) and `maxDatasetBytes` the dataset file size.
-`metadataStructuredOutput` (UC metadata standards mode only) sends the proposal schema with each request as a strict
-structured output (`response_format`), which asks the provider to constrain the reply to that schema; set it to `false` for a model
-whose batch endpoints reject `response_format`. Version 1 metadata requests never carry it. The schema sent is a portable
+`metadataStructuredOutput` (UC metadata standards mode only, **off by default**) sends the proposal schema with each
+request as a strict structured output (`response_format`), which asks the provider to constrain the reply to that schema.
+Strict schemas depend on each provider's translation: on 2026-10-28 `google/gemini-3.8-flash` rejected the (valid)
+schema with "pii_tags.anyOf.0.additionalProperties must be a boolean or an object", and such a rejection fails every
+item of the batch. Turn it on only for a model whose batch endpoints are known to accept it; without it the prompt
+states the same structure. Version 1 metadata requests never carry it. The schema sent is a portable
 copy (no length limits, an explicit type on every enum); every reply is still validated locally against the full
 schema. The setting affects new plans only: a retry reuses the stored request bodies.
 A workflow's own `limits` can only lower these. The `routing` section is described in

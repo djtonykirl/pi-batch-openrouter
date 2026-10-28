@@ -69,10 +69,13 @@ export interface BatchConfig {
 }
 
 /**
- * Default for workflows.metadataStructuredOutput. One constant so it is easy to flip off if a real standards batch shows
- * a provider rejecting response_format.
+ * Default for workflows.metadataStructuredOutput: off. A live standards batch on google/gemini-3.8-flash (2026-10-28) was
+ * rejected with "Invalid response_json_schema: schema at properties.columns.items.properties.pii_tags.anyOf.0.
+ * additionalProperties must be a boolean or an object" although the schema sent was valid JSON Schema: strict structured
+ * output depends on each provider's schema translation, and a rejection fails every item. Opt in per project once a
+ * model's batch endpoints are known to accept it.
  */
-export const METADATA_STRUCTURED_OUTPUT_DEFAULT = true;
+export const METADATA_STRUCTURED_OUTPUT_DEFAULT = false;
 
 export const DEFAULT_CONFIG: BatchConfig = {
   schemaVersion: 1,
