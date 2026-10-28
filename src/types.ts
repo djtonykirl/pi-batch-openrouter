@@ -232,6 +232,8 @@ export interface JobManifest {
     firstAttemptAt?: string;
     /** Earliest time of the next attempt (exponential backoff). */
     nextAttemptAt?: string;
+    /** No API key was available at the last pass: nothing was attempted, and the user has to supply one. */
+    waitingForKey?: true;
   };
   endpoint: "/v1/chat/completions";
   format: "markdown" | "json";

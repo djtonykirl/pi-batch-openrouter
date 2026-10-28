@@ -1650,9 +1650,11 @@ export class BatchService {
       }
       if (!apiKey) {
         const lastError = `no API key available for account "${job.account}"${keyError ? ` (${keyError})` : ""}; not counted as an attempt`;
+        // Recorded (and logged) once per change, not on every pass: the job waits until a key is available.
+        if (job.remoteDeletion?.waitingForKey && job.remoteDeletion.lastError === lastError) continue;
         this.registry.update(localId, (u) => {
           const prev = u.manifest.remoteDeletion;
-          if (prev?.state === "pending" && prev.lastError !== lastError) u.manifest.remoteDeletion = { ...prev, lastError };
+          if (prev?.state === "pending") u.manifest.remoteDeletion = { ...prev, lastError, waitingForKey: true };
           return u.manifest;
         });
         this.logger.log("warn", "remote_delete_no_key", { localId, account: job.account });

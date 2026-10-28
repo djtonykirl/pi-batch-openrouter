@@ -234,7 +234,8 @@ function remoteDeletionCell(job: JobManifest): string | undefined {
   const err = d.lastError ? `, last error: ${d.lastError}` : "";
   const next = d.state === "pending" && d.nextAttemptAt ? `, next attempt ${formatIsoShort(d.nextAttemptAt)}` : "";
   const cell = `${d.state}${at} (${d.attempts} attempt${d.attempts === 1 ? "" : "s"}${next}${err})`;
-  return d.state === "failed" ? `${cell}; NEEDS ATTENTION: the batch is still at OpenRouter (kept up to 30 days); delete it there` : cell;
+  if (d.state === "failed") return `${cell}; NEEDS ATTENTION: the batch is still at OpenRouter (kept up to 30 days); delete it there`;
+  return d.state === "pending" && d.waitingForKey ? `${cell}; waiting for an API key for account "${job.account}" before it can be deleted` : cell;
 }
 
 /**

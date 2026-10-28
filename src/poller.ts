@@ -123,11 +123,13 @@ export function badgeText(jobs: readonly JobManifest[]): string | undefined {
   const attention = jobs.filter((j) => (j.localStatus === "corrupt" || (ACTIVE_STATUSES.has(j.localStatus) && j.lastPollError)) && !j.injectedAt).length;
   // A batch that could not be deleted at OpenRouter stays there (up to 30 days): the user has to act.
   const deletionFailed = jobs.filter((j) => j.remoteDeletion?.state === "failed").length;
+  const deletionNoKey = jobs.filter((j) => j.remoteDeletion?.state === "pending" && j.remoteDeletion.waitingForKey).length;
   const parts: string[] = [];
   if (active) parts.push(`${active} active`);
   if (partial) parts.push(`${partial} partial`);
   if (ready) parts.push(`${ready} ready`);
   if (attention) parts.push(`${attention} attention`);
   if (deletionFailed) parts.push(`${deletionFailed} remote deletion failed`);
+  if (deletionNoKey) parts.push(`${deletionNoKey} remote deletion waiting for an API key`);
   return parts.length ? `📦 Batch: ${parts.join(" | ")}` : undefined;
 }

@@ -221,6 +221,31 @@ test(
   }),
 );
 
+test(
+  "a missing API key is recorded once, shown as waiting, and not rewritten on every pass",
+  env("zdr", async ({ service, fake, key }) => {
+    const id = await settle(service, fake);
+    key.value = "";
+    await service.runRemoteDeletions();
+    const file = path.join(service.registry.jobDir(id), "manifest.json");
+    const first = { text: fs.readFileSync(file, "utf8"), mtime: fs.statSync(file).mtimeMs };
+    assert.equal(service.registry.read(id).remoteDeletion?.waitingForKey, true);
+    assert.match(badgeText(service.registry.list().jobs) ?? "", /1 remote deletion waiting for an API key/);
+    assert.match(describeJob(service.registry.read(id)).join("\n"), /waiting for an API key/);
+    await new Promise((r) => setTimeout(r, 20));
+    for (let i = 0; i < 3; i++) await service.runRemoteDeletions();
+    assert.equal(fs.readFileSync(file, "utf8"), first.text);
+    assert.equal(fs.statSync(file).mtimeMs, first.mtime);
+    key.value = FAKE_KEY;
+    fake.deleteReplies = [{ status: 204, body: "" }];
+    await service.runRemoteDeletions();
+    const d = service.registry.read(id).remoteDeletion!;
+    assert.equal(d.state, "done");
+    assert.equal(d.waitingForKey, undefined);
+    assert.doesNotMatch(badgeText(service.registry.list().jobs) ?? "", /waiting for an API key/);
+  }),
+);
+
 // ------------------------------------------------------------------ batches that end without retrieval
 
 for (const status of ["cancelled", "failed", "expired"] as const) {

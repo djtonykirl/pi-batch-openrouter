@@ -134,7 +134,9 @@ OpenRouter account settings.
 The effective level of a job or thread is the **stricter** of the thread and the project. Lowering the project level
 later does not lower an existing thread. The extension never sends anything less strict than the effective level.
 Every privacy decision reads the `privacy` config section fresh from disk, so a level raised in another Pi session, the
-standalone web UI or by editing the config file applies to this process's next decision too.
+standalone web UI or by editing the config file applies to this process's next decision too. A config file that can't
+be parsed, or an invalid `privacy` value (a typo such as `"ZDR"`), never relaxes anything: each setting then takes its
+most private value from what could be read, the last clean read and the settings this process started with.
 
 ### What is enforced per route
 
@@ -183,7 +185,8 @@ expired or cancelled) is deleted too; one OpenRouter reports gone (HTTP 410) is 
   deleted remotely, even if the project is raised later.
 - Deletion is retried with exponential backoff (30 s, doubling, at most 1 hour apart). 24 hours after the first
   attempt the job's remote deletion is marked `failed`, shown as needing attention in the status badge,
-  `/batch show` and the web UI; delete the batch yourself. A missing API key does not count as an attempt.
+  `/batch show` and the web UI; delete the batch yourself. A missing API key does not count as an attempt: the job
+  waits, shown as "waiting for an API key" in the badge, `/batch show` and the web UI, until a key is available.
 - Local files are unaffected.
 
 ### Model catalog
