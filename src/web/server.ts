@@ -254,6 +254,11 @@ export function inspectWorkspaceFiles(workspaceRoot: string, config: BatchConfig
   return entries;
 }
 
+/** The fallback notice shared by new threads and the job studio: "<id> [labels]: the default model … is refused …". */
+function modelFallbackNotice(pick: { id: string; labels: string[] }, model: string, level: PrivacyLevel, refusal: string): string {
+  return `${pick.id} [${pick.labels.join(", ")}]: the default model ${model} is refused at privacy level ${level} (${refusal}).`;
+}
+
 /** A route from a request body. `immediate` is accepted only for a free model (`:free`, or free in the catalog). */
 function parseRoute(value: unknown, model: string | undefined, catalog: ModelCatalog | undefined): Route | undefined {
   if (value === undefined || value === "") return undefined;
@@ -595,15 +600,31 @@ export class BatchWebServer {
       // setModel decides again; if it refuses, the thread keeps the default and the reason is shown.
       return { warning: `The default model ${model} is refused at privacy level ${level} (${refusal}); switching to ${pick.id} was refused too: ${err instanceof Error ? err.message : String(err)}` };
     }
-    return { notice: `Started on ${pick.id} [${pick.labels.join(", ")}]: the default model ${model} is refused at privacy level ${level} (${refusal}).` };
+    return { notice: `Started on ${modelFallbackNotice(pick, model, level, refusal)}` };
+  }
+
+  /**
+   * The New Batch Job studio's model when the default is refused at the project level: the first selectable batch
+   * model (a ZDR-labelled one first at zdr), as for new threads; jobs never take a free model. The job is still decided
+   * when it is planned and submitted.
+   */
+  private jobModelFallback(level: PrivacyLevel, refusal: string): { id: string; notice: string } | undefined {
+    const privacy = this.deps.service.privacyConfig();
+    const config = this.deps.getConfig();
+    const model = normalizeBatchModelSlug(config.defaultModel);
+    const entries = pickerEntries(this.deps.catalog?.snapshot(), this.batchCandidates(), level, privacy.accountNoTraining, allowedProviders(config), config);
+    const pick = fallbackPickerEntry(entries.filter((e) => e.route === "batch"), level);
+    return pick ? { id: pick.id, notice: `Model set to ${modelFallbackNotice(pick, model, level, refusal)}` } : undefined;
   }
 
   private privacyState(): Record<string, unknown> {
     const p = this.deps.service.privacyConfig();
     const config = this.deps.getConfig();
     const defaultModelRefusal = this.modelRefusal(normalizeBatchModelSlug(config.defaultModel), p.level);
+    const jobModel = defaultModelRefusal ? this.jobModelFallback(p.level, defaultModelRefusal) : undefined;
     return {
       ...(defaultModelRefusal ? { defaultModelRefusal } : {}),
+      ...(jobModel ? { jobModelFallback: jobModel } : {}),
       level: p.level,
       source: levelSource(this.deps.workspaceRoot),
       accountNoTraining: p.accountNoTraining,

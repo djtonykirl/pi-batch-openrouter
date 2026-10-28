@@ -13,7 +13,7 @@ import { BatchPoller } from "../src/poller.js";
 import { JobRegistry } from "../src/registry.js";
 import { BatchService } from "../src/service.js";
 import { BatchWebServer } from "../src/web/server.js";
-import { inflightHeadline, metadataWrittenText, renderWebUiHtml } from "../src/web/ui.js";
+import { inflightHeadline, messageNumbers, metadataWrittenText, renderWebUiHtml } from "../src/web/ui.js";
 import { webWording } from "../src/web/wording.js";
 import { FAKE_KEY, FakeOpenRouter, accepted, makeConfig } from "./fixtures/fake-openrouter.js";
 import { rm, tempWorkspace } from "./helpers.js";
@@ -165,3 +165,117 @@ test("6: the result survives the live refresh that writing a file triggers (the 
   assert.ok(html.includes("state.metadataCard = {"), "metadataOutput keeps the result in state");
   assert.ok(html.includes("'<div id=\"metadataActionOutput\">' + (saved ? saved.html : \"\") + \"</div>\""), "metadataActionsCard restores it");
 });
+
+// ------------------------------------------------------------------ 8a: the top bar never wraps
+
+test("8a: the top bar keeps one line: the badge truncates with its full text as a tooltip", () => {
+  const html = page();
+  assert.ok(html.includes(".topbar > * { white-space: nowrap; }"));
+  assert.ok(html.includes("#badgePill { max-width: 260px; overflow: hidden; text-overflow: ellipsis; }"));
+  assert.ok(html.includes("pill.title = pill.textContent;"));
+});
+
+// ------------------------------------------------------------------ 9: compact without window.prompt
+
+test("9: Compact opens an in-page form (delegated data-action), never window.prompt, and is guarded against a second start", () => {
+  const html = page();
+  assert.ok(!/prompt\("Optional focus/.test(html), "no window.prompt");
+  assert.ok(html.includes('id="compactThreadBtn" data-action="openCompactForm" data-args="[]"'));
+  assert.ok(html.includes('id="compactSubmitBtn" data-action="submitCompact" data-args="[]"'));
+  assert.ok(html.includes('id="compactCancelBtn" data-action="cancelCompact" data-args="[]"'));
+  assert.ok(html.includes('<textarea id="compactFocusInput"'));
+  assert.ok(html.includes('"openCompactForm", "submitCompact", "cancelCompact",'), "registered with the delegated click handler");
+  assert.ok(html.includes("if (!state.activeThreadId || compactInFlight) return;"), "a second click while one runs does nothing");
+  assert.ok(html.includes('document.getElementById("compactSubmitBtn").disabled = busy;'));
+  assert.ok(!html.includes('getElementById("compactThreadBtn").addEventListener'), "no second, direct listener");
+});
+
+test(
+  "9: the server refuses a second compaction while one is claimed (one at a time)",
+  withWeb(async ({ chat, store, post }) => {
+    const t = chat.newThread();
+    store.update(t.id, (th) => {
+      th.compacting = { throughSeq: 1, claimedAt: new Date().toISOString() };
+    });
+    const r = await post(`/api/threads/${t.id}/compact`, {});
+    assert.equal(r.status, 400);
+    assert.match(((await r.json()) as { error: string }).error, /Already compacting/);
+  }),
+);
+
+// ------------------------------------------------------------------ 7: duplicate toasts
+
+test("7: a toast already on screen is not added again", () => {
+  const html = page();
+  assert.ok(html.includes("if (Array.from(c.children).some((t) => t.textContent === msg)) return;"));
+});
+
+// ------------------------------------------------------------------ 10b: message numbers
+
+test("10b: only user and assistant messages are numbered; model switches don't shift them", () => {
+  const entries = [
+    { type: "model", seq: 1 },
+    { type: "model", seq: 2 },
+    { type: "user", seq: 3 },
+    { type: "assistant", seq: 4 },
+    { type: "title", seq: 5 },
+    { type: "user", seq: 6 },
+    { type: "assistant", seq: 7 },
+  ];
+  const n = messageNumbers(entries);
+  assert.deepEqual(n.of, { 3: 1, 4: 2, 6: 3, 7: 4 });
+  assert.equal(n.through(5), 2);
+  assert.equal(n.through(7), 4);
+  assert.equal(n.through(0), 0);
+  const html = page();
+  assert.ok(html.includes(messageNumbers.toString()));
+  assert.ok(html.includes("<strong>You</strong> · #' + numbers.of[e.seq]"));
+  assert.ok(html.includes("(through #' + numbers.through(e.throughSeq)"));
+});
+
+// ------------------------------------------------------------------ 10c: job studio model default
+
+const GEMINI = "google/gemini-3.8-flash";
+const CLAUDE = "anthropic/claude-opus-5.5";
+const ZDR_CATALOG = {
+  models: [
+    { id: `${GEMINI}:batch`, name: "Gemini (batch)", free: false },
+    { id: `${CLAUDE}:batch`, name: "Claude (batch)", free: false },
+    { id: "f/free:free", name: "Free", free: true },
+  ],
+  zdr: [
+    { model: GEMINI, provider: "google-vertex/global" },
+    { model: "f/free", provider: "p" },
+  ],
+  batchEndpoints: { [GEMINI]: ["google-vertex/global"], [CLAUDE]: ["anthropic"] },
+  freeEndpoints: { "f/free": ["p"] },
+} as CatalogData;
+
+test(
+  "10c: at zdr the job studio's model defaults to the first selectable batch model, with the new-thread notice text",
+  withWeb(
+    async ({ get }) => {
+      const p = (await (await get("/api/privacy")).json()) as { defaultModelRefusal?: string; jobModelFallback?: { id: string; notice: string } };
+      assert.ok(p.defaultModelRefusal);
+      assert.deepEqual(p.jobModelFallback, {
+        id: GEMINI,
+        notice: `Model set to ${GEMINI} [batch, ZDR]: the default model ${CLAUDE} is refused at privacy level zdr (${p.defaultModelRefusal}).`,
+      });
+    },
+    ZDR_CATALOG,
+    (c) => {
+      c.privacy.level = "zdr";
+    },
+  ),
+);
+
+test(
+  "10c: no fallback when the default is selectable; the page applies the fallback only to an untouched field",
+  withWeb(async ({ get }) => {
+    const p = (await (await get("/api/privacy")).json()) as { jobModelFallback?: unknown };
+    assert.equal(p.jobModelFallback, undefined);
+    const html = page();
+    assert.ok(html.includes("const untouched = input.value === def || (!!state.jobModelAuto && input.value === state.jobModelAuto);"));
+    assert.ok(html.includes('<div id="jobModelNotice"'));
+  }, ZDR_CATALOG),
+);

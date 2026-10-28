@@ -207,14 +207,28 @@ export function estimateTokens(messages: ChatMessage[]): number {
   return Math.ceil(messages.reduce((n, m) => n + m.content.length + (m.parts ?? []).reduce((k, p) => k + partCharacters(p), 0), 0) / 4);
 }
 
+/**
+ * `s` within `max` characters: unchanged when it fits; otherwise cut at the last word boundary (or mid-word only when
+ * one word fills more than half), trailing punctuation dropped, and "…" added.
+ */
+export function truncateAtWord(s: string, max = TITLE_MAX): string {
+  if (s.length <= max) return s;
+  let cut = s.slice(0, max - 1);
+  if (s[max - 1] !== " ") {
+    const space = cut.lastIndexOf(" ");
+    if (space > max / 2) cut = cut.slice(0, space);
+  }
+  return cut.replace(/[\s,;:.\-–—]+$/, "") + "…";
+}
+
 export function provisionalTitle(text: string): string {
-  return text.replace(/\s+/g, " ").trim().slice(0, TITLE_MAX);
+  return truncateAtWord(text.replace(/\s+/g, " ").trim());
 }
 
 export function cleanTitle(raw: string): string | undefined {
   const line = raw.split(/\r?\n/).find((l) => l.trim() !== "");
   if (line === undefined) return undefined;
   const strip = (s: string) => s.replace(/^[\s"'#*]+|[\s"'#*]+$/g, "");
-  const title = strip(strip(line).replace(/^Title:/i, "")).slice(0, TITLE_MAX).trim();
+  const title = truncateAtWord(strip(strip(line).replace(/^Title:/i, "")).replace(/\s+/g, " ").trim());
   return title === "" ? undefined : title;
 }

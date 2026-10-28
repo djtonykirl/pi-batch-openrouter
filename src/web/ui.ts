@@ -38,6 +38,29 @@ export function failureStates(
 }
 
 /**
+ * Message numbers for the chat view: only user and assistant messages are numbered (1, 2, …), so model switches,
+ * retitles and other events don't shift them. `of[seq]` is a message's number; `through(seq)` is the number of the
+ * last message at or before transcript seq `seq` (for "Compacted … through #n").
+ */
+export function messageNumbers(entries: ReadonlyArray<{ type: string; seq?: number }>): { of: Record<number, number>; through: (seq: number) => number } {
+  const of: Record<number, number> = {};
+  const numbered: Array<[number, number]> = [];
+  let n = 0;
+  for (const e of entries) {
+    if ((e.type === "user" || e.type === "assistant") && typeof e.seq === "number") {
+      of[e.seq] = ++n;
+      numbered.push([e.seq, n]);
+    }
+  }
+  const through = (seq: number): number => {
+    let last = 0;
+    for (const [s, k] of numbered) if (s <= seq && k > last) last = k;
+    return last;
+  };
+  return { of, through };
+}
+
+/**
  * The metadata handoff card's success line after writing review.md or approved.jsonl, as the CLI reports it: the
  * written path, the artifact ID and (approved) the table and value counts. Plain text.
  */
@@ -259,7 +282,16 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
       display: flex;
       align-items: center;
       gap: 10px;
+      flex-shrink: 0;
     }
+    /* The top bar never wraps: the badge is capped and truncates (full text in its tooltip), and the brand side gives
+       way, its workspace pill shrinking first. */
+    .topbar > * { white-space: nowrap; }
+    .topbar .brand { min-width: 0; flex-shrink: 1; overflow: hidden; }
+    .topbar .nav-tabs, .topbar .btn { flex-shrink: 0; }
+    .topbar .workspace-pill { min-width: 60px; flex-shrink: 1; }
+    .topbar .nav-tab { padding: 6px 10px; }
+    #badgePill { max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
     .badge-pill {
       font-size: 12px;
       padding: 4px 10px;
@@ -735,7 +767,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
             <span id="contextMeterText">0 tok</span>
             <div class="meter-bar"><div class="meter-fill" id="contextMeterFill" style="width:0%"></div></div>
           </div>
-          <button class="btn btn-sm" id="compactThreadBtn" title="Summarise earlier exchanges via batch compaction">🗜️ Compact</button>
+          <button class="btn btn-sm" id="compactThreadBtn" data-action="openCompactForm" data-args="[]" aria-expanded="false" aria-controls="compactForm" title="Summarise earlier exchanges via batch compaction">🗜️ Compact</button>
           <button class="btn btn-sm" id="exportThreadBtn" title="Download Markdown transcript">⬇️ Export .md</button>
         </div>
       </div>
@@ -748,6 +780,14 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         <span style="color:var(--text-muted);" id="chatCatalogState"></span>
       </div>
       <div id="chatModelAlert" style="padding:0 16px;"></div>
+      <div id="compactForm" style="display:none; padding:8px 16px; gap:8px; flex-direction:column; border-bottom:1px solid var(--border);">
+        <label for="compactFocusInput" style="font-size:12px; color:var(--text-muted);">Optional focus for the compaction summary (leave blank for the default)</label>
+        <textarea id="compactFocusInput" rows="2" style="width:100%; font-size:12px;"></textarea>
+        <div style="display:flex; gap:8px;">
+          <button class="btn btn-sm btn-primary" id="compactSubmitBtn" data-action="submitCompact" data-args="[]">Compact</button>
+          <button class="btn btn-sm" id="compactCancelBtn" data-action="cancelCompact" data-args="[]">Cancel</button>
+        </div>
+      </div>
 
       <div class="chat-stream" id="chatStream">
         <div style="margin:auto; text-align:center; color:var(--text-muted);">
@@ -1022,6 +1062,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
           <div>
             <label for="jobModelInput" style="font-size:12px; color:var(--text-muted);">Model Slug</label>
             <input type="text" id="jobModelInput" list="knownModelsList" style="width:100%; font-family:var(--mono);">
+            <div id="jobModelNotice" class="alert-box alert-warning" role="status" style="display:none; margin-top:6px;"></div>
           </div>
           <div>
             <label for="jobFormatSelect" style="font-size:12px; color:var(--text-muted);">Output Format</label>
@@ -1126,6 +1167,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
     ${failureStates.toString()}
     ${inflightHeadline.toString()}
     ${metadataWrittenText.toString()}
+    ${messageNumbers.toString()}
     const MAX_RATE_LIMITS = ${MAX_CONSECUTIVE_429};
     ${createCoalescer.toString()}
     ${privacyNoticeHtml.toString()}
@@ -1190,6 +1232,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
       "quickAttachToChat", "inspectJobItem", "generateJobArtifact", "exportDatasetJob", "previewArtifactFrame",
       "submitPreviewedJob", "cancelBatchJob", "retryBatchJob", "synthesizeBatchJob", "setJobSubTab",
       "writeMetadataReview", "writeMetadataApproved", "validateMetadataApproved",
+      "openCompactForm", "submitCompact", "cancelCompact",
     ]);
     function act(name, ...args) {
       return 'data-action="' + escapeHtml(name) + '" data-args="' + escapeHtml(JSON.stringify(args)) + '"';
@@ -1349,6 +1392,8 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
 
     function showToast(msg, level = "info") {
       const c = document.getElementById("toastContainer");
+      // A message already on screen is not shown a second time (one action never needs two identical toasts).
+      if (Array.from(c.children).some((t) => t.textContent === msg)) return;
       const el = document.createElement("div");
       el.className = "toast";
       if (level === "error" || level === "warning") el.style.borderColor = "var(--warning)";
@@ -1418,6 +1463,8 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
       document.getElementById("settingsDefaultAccount").value = state.config.defaultAccount || "";
       document.getElementById("settingsProjectInstructions").value = data.projectInstructions || "";
       document.getElementById("jobModelInput").value = state.config.defaultModel || "";
+      state.jobModelAuto = null;
+      applyJobModelFallback();
 
       const wfSel = document.getElementById("datasetWorkflowSelect");
       wfSel.innerHTML = state.workflows.length
@@ -1450,6 +1497,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
     function updateBadge(text) {
       const pill = document.getElementById("badgePill");
       pill.textContent = text || "📦 Batch: Idle";
+      pill.title = pill.textContent; // the pill may be truncated
     }
 
     // One EventSource and one handler. Each event asks for a refresh; refreshes arriving within 250 ms coalesce into
@@ -1726,6 +1774,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
           "</div>";
       } else {
         const failures = failureStates(entries, detail.thread.lastFailure);
+        const numbers = messageNumbers(entries);
         stream.innerHTML = entries
           .map((e, i) => {
             if (e.type === "user") {
@@ -1753,7 +1802,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
                 : "";
               return (
                 '<div class="msg-card msg-user">' +
-                '<div class="msg-header"><span><strong>You</strong> · #' + e.seq + "</span><span>" + escapeHtml(e.at.slice(11, 19)) + "</span></div>" +
+                '<div class="msg-header"><span><strong>You</strong> · #' + numbers.of[e.seq] + "</span><span>" + escapeHtml(e.at.slice(11, 19)) + "</span></div>" +
                 '<div class="msg-body">' + formatMarkdownLite(e.text) + "</div>" +
                 (atts ? '<div class="att-list">' + atts + "</div>" : "") +
                 previewBlock +
@@ -1764,7 +1813,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
               return (
                 '<div class="msg-card msg-assistant">' +
                 '<div class="msg-header" style="flex-wrap:wrap;">' +
-                '<span><strong style="color:#a5b4fc;">' + escapeHtml(e.model) + "</strong> · #" + e.seq + "</span>" +
+                '<span><strong style="color:#a5b4fc;">' + escapeHtml(e.model) + "</strong> · #" + numbers.of[e.seq] + "</span>" +
                 '<span style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">' +
                 (e.finishReason === "length" ? '<span class="status-dot status-waiting">truncated: max_tokens</span>' : "") +
                 '<button class="btn btn-sm" title="Render & download this reply as Markdown (.md)" ' + act("exportReplyArtifact", e.jobId, "markdown") + '>⬇️ .md</button>' +
@@ -1779,7 +1828,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
             if (e.type === "compaction") {
               return (
                 '<div class="msg-card" style="align-self:stretch; background:rgba(56,189,248,0.07); border-color:rgba(56,189,248,0.3);">' +
-                '<div class="msg-header"><strong>🗜️ Compacted Conversation (through #' + e.throughSeq + " · " + escapeHtml(e.model) + ")</strong><span>" + escapeHtml(e.jobId) + "</span></div>" +
+                '<div class="msg-header"><strong>🗜️ Compacted Conversation (through #' + numbers.through(e.throughSeq) + " · " + escapeHtml(e.model) + ")</strong><span>" + escapeHtml(e.jobId) + "</span></div>" +
                 '<details><summary style="cursor:pointer; font-size:12px; color:#7dd3fc;">View Compaction Summary</summary>' +
                 '<div class="msg-body" style="margin-top:8px;">' + formatMarkdownLite(e.summary) + "</div></details></div>"
               );
@@ -2001,21 +2050,43 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
       }
     });
 
-    document.getElementById("compactThreadBtn").addEventListener("click", async () => {
+    // Compact: an in-page form (no blocking window.prompt). One request at a time: both buttons are disabled while it
+    // runs, so a second click can't start another (the server also allows one compaction per thread).
+    let compactInFlight = false;
+    function setCompactBusy(busy) {
+      compactInFlight = busy;
+      document.getElementById("compactSubmitBtn").disabled = busy;
+      document.getElementById("compactThreadBtn").disabled = busy;
+    }
+    window.openCompactForm = () => {
       if (!state.activeThreadId) return;
-      const focus = prompt("Optional focus instructions for compaction summary (leave blank for default):", "");
-      if (focus === null) return;
+      document.getElementById("compactForm").style.display = "flex";
+      document.getElementById("compactThreadBtn").setAttribute("aria-expanded", "true");
+      document.getElementById("compactFocusInput").focus();
+    };
+    window.cancelCompact = () => {
+      document.getElementById("compactForm").style.display = "none";
+      document.getElementById("compactThreadBtn").setAttribute("aria-expanded", "false");
+      document.getElementById("compactFocusInput").value = "";
+    };
+    window.submitCompact = async () => {
+      if (!state.activeThreadId || compactInFlight) return;
+      const focus = document.getElementById("compactFocusInput").value.trim();
+      setCompactBusy(true);
       try {
         const res = await api("/api/threads/" + encodeURIComponent(state.activeThreadId) + "/compact", {
           method: "POST",
-          body: { instructions: focus.trim() || undefined },
+          body: { instructions: focus || undefined },
         });
+        window.cancelCompact();
         showToast("Compaction batch started: " + res.jobId);
         await refreshStateQuiet();
       } catch (err) {
         showToast(err.message, "error");
+      } finally {
+        setCompactBusy(false);
       }
-    });
+    };
 
     document.getElementById("exportThreadBtn").addEventListener("click", () => {
       if (!state.activeThreadId) return;
@@ -2882,6 +2953,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
     }
 
     function renderPrivacySettings() {
+      applyJobModelFallback();
       const p = state.privacy;
       if (!p) return;
       document.getElementById("privacy-level-select").value = p.level;
@@ -2905,6 +2977,28 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         renderPrivacySettings();
         if (state.activeThreadDetail) renderThreadPrivacy(state.activeThreadDetail);
       } catch {}
+    }
+
+    // The job studio's Model field starts on the first selectable batch model when the level refuses the default (as
+    // new threads do), with the server's notice. Only a field still holding the default (or that fallback) changes.
+    function applyJobModelFallback() {
+      const input = document.getElementById("jobModelInput");
+      const box = document.getElementById("jobModelNotice");
+      if (!input || !box) return;
+      const fb = state.privacy && state.privacy.jobModelFallback;
+      const def = (state.config && state.config.defaultModel) || "";
+      const untouched = input.value === def || (!!state.jobModelAuto && input.value === state.jobModelAuto);
+      if (fb && untouched) {
+        input.value = fb.id;
+        state.jobModelAuto = fb.id;
+        box.textContent = fb.notice;
+        box.style.display = "";
+      } else if (!fb && state.jobModelAuto && input.value === state.jobModelAuto) {
+        input.value = def;
+        state.jobModelAuto = null;
+        box.textContent = "";
+        box.style.display = "none";
+      }
     }
 
     function showPrivacyNotice(text) {
