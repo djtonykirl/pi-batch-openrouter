@@ -232,7 +232,11 @@ Models ending in `:free` run immediately, not as a batch. They work **only in ba
 (/batch chat); /batch ask and workflows need a batch model". Each chat turn is still a job and settles through the
 usual retrieval path.
 - **Per-minute 429:** the request is rescheduled using `Retry-After`, or with exponential backoff capped at 15 minutes.
-- **Daily 429:** the job fails with "Free-model daily limit reached; try later or switch model".
+  A 200 response whose error object is a rate limit (code 429, or a message such as "temporarily rate-limited
+  upstream") is treated the same way. After 8 rate limits in a row the turn fails with `rate_limited` ("Free model is
+  rate-limited; try again later or switch model"). The web thread shows when the next attempt is due.
+- **Daily 429:** only a 429 that says it is the daily limit fails the job with "Free-model daily limit reached; try
+  later or switch model".
 - **Crashes:** an immediate request is never sent twice. If the outcome is unknown after a crash, the job becomes
   `submission_unknown` and you decide whether to retry.
 

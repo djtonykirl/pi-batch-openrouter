@@ -183,7 +183,7 @@ test(
 );
 
 test(
-  "more than 8 consecutive 429s count as the daily limit",
+  "more than 8 consecutive per-minute 429s fail as rate_limited, not as the daily limit",
   withService("standard", async ({ service, fake }) => {
     fake.chatReplies = [{ status: 429, body: PER_MINUTE, headers: { "Retry-After": "1" } }];
     const job = await chatJob(service);
@@ -194,7 +194,40 @@ test(
     assert.equal(chatPosts(fake).length, 8);
     const r = await service.reconcile(job.localId, { force: true });
     assert.equal(r.status, "failed");
-    assert.equal(service.registry.read(job.localId).error?.code, "rate_limited_daily");
+    assert.deepEqual(service.registry.read(job.localId).error, { code: "rate_limited", message: "Free model is rate-limited; try again later or switch model" });
+  }),
+);
+
+test(
+  "a 200 whose error object is an upstream rate limit is rescheduled like a 429, not failed as provider_error",
+  withService("standard", async ({ service, fake }) => {
+    const upstream = { error: { message: "google/gemma-4-31b-it:free is temporarily rate-limited upstream. Please retry shortly, or add your own key", code: 429 } };
+    fake.chatReplies = [{ status: 200, body: upstream }];
+    const job = await chatJob(service);
+    const m = service.registry.read(job.localId);
+    assert.ok(m.localStatus === "submitted" || m.localStatus === "polling", m.localStatus);
+    assert.equal(m.error, undefined);
+    assert.equal(m.consecutivePollFailures, 1);
+    const delay = Date.parse(m.nextPollAt!) - Date.now();
+    assert.ok(delay > 28_000 && delay <= 30_000, `backoff ${delay}`);
+    // Message only (no code), and code 429 only (no rate-limit words), are both rate limits.
+    fake.chatReplies = [{ status: 200, body: { error: { message: "Rate limit exceeded upstream" } } }];
+    assert.notEqual((await service.reconcile(job.localId, { force: true })).status, "failed");
+    fake.chatReplies = [{ status: 200, body: { error: { code: "429", message: "Too many requests" } } }];
+    assert.notEqual((await service.reconcile(job.localId, { force: true })).status, "failed");
+    assert.equal(service.registry.read(job.localId).consecutivePollFailures, 3);
+    fake.chatReplies = [{ status: 200, body: chatCompletion("Done.") }];
+    assert.equal((await service.reconcile(job.localId, { force: true })).status, "ready");
+  }),
+);
+
+test(
+  "a 200 error object that is not a rate limit still fails as provider_error",
+  withService("standard", async ({ service, fake }) => {
+    fake.chatReplies = [{ status: 200, body: { error: { code: 404, message: "No endpoints found matching your data policy" } } }];
+    const job = await chatJob(service);
+    assert.equal(job.localStatus, "failed");
+    assert.equal(job.error?.code, "provider_error");
   }),
 );
 

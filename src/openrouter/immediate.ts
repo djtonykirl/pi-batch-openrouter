@@ -21,7 +21,7 @@ import type { BatchRequestItem } from "./types.js";
  * sending it. That gap is exposed only if the lock goes stale (held > 120 s) in that instant.
  */
 
-export type ImmediateFailureCode = "rate_limited_daily" | "provider_error" | "submission_unknown";
+export type ImmediateFailureCode = "rate_limited_daily" | "rate_limited" | "provider_error" | "submission_unknown";
 
 export type ImmediateOutcome =
   /** Every item has an outcome; `finalResponseText` is batch-shaped (normaliseBatchResult accepts it). */
@@ -54,13 +54,23 @@ export interface ImmediateOptions {
 }
 
 export const DAILY_LIMIT_MESSAGE = "Free-model daily limit reached; try later or switch model";
+/** After MAX_CONSECUTIVE_429 per-minute rate limits in a row (none of them saying "daily"). */
+export const RATE_LIMITED_MESSAGE = "Free model is rate-limited; try again later or switch model";
 export const UNKNOWN_OUTCOME_MESSAGE =
   "No response from OpenRouter for this request (Pi stopped, or the connection failed mid-call); it may have been answered. It was not sent again.";
-/** More consecutive 429s than this are treated as the daily limit. */
+/** More consecutive per-minute rate limits than this fail the turn (`rate_limited`; only a 429 that says so is "daily"). */
 export const MAX_CONSECUTIVE_429 = 8;
 const BASE_BACKOFF_MS = 30_000;
 const MAX_BACKOFF_MS = 15 * 60_000;
 const DAILY_PATTERN = /daily|per[\s_-]?day|free-models-per-day/i;
+/** A 200 body's error object that is really a rate limit (e.g. "… is temporarily rate-limited upstream. Please retry shortly"). */
+const RATE_LIMIT_MESSAGE_PATTERN = /rate-limited upstream|rate limit/i;
+
+/** Whether an error object in a 200 body is a rate limit: code 429 (number or string), or a rate-limit message. */
+export function isRateLimitErrorObject(err: Record<string, unknown>): boolean {
+  if (err.code === 429 || err.code === "429") return true;
+  return typeof err.message === "string" && RATE_LIMIT_MESSAGE_PATTERN.test(err.message);
+}
 
 /** The synthetic batch ID of an immediate job's final response (never a provider batch ID). */
 export function immediateResultId(localId: string): string {
@@ -170,18 +180,15 @@ async function callOnce(
     const err = asObject(body?.error);
     if (body && err && !Array.isArray(body.choices)) {
       const message = typeof err.message === "string" && err.message ? err.message : JSON.stringify(err).slice(0, 500);
+      // An upstream rate limit can arrive as a 200 with an error object: reschedule it exactly like an HTTP 429.
+      if (isRateLimitErrorObject(err)) return rateLimited(job, raw.bodyText, 0, message, now, raw.bodyText);
       return { item: { state: "failed", at: at(), code: "provider_error", message, status: raw.status, bodyText: raw.bodyText } };
     }
     return { item: { state: "completed", at: at(), status: raw.status, bodyText: raw.bodyText } };
   } catch (e) {
     if (e instanceof OpenRouterError && e.httpStatus === 429) {
       const c = classify429({ status: 429, bodyText: e.rawBody ?? e.detail, ...(e.retryAfter !== undefined ? { headers: { "retry-after": e.retryAfter } } : {}) });
-      const previous = job.consecutivePollFailures ?? 0;
-      if (c.daily || previous + 1 > MAX_CONSECUTIVE_429) {
-        return { item: { state: "failed", at: at(), code: "rate_limited_daily", message: DAILY_LIMIT_MESSAGE, status: 429, ...(e.rawBody ? { bodyText: e.rawBody } : {}) } };
-      }
-      const waitMs = c.retryAfterMs > 0 ? c.retryAfterMs : Math.min(MAX_BACKOFF_MS, BASE_BACKOFF_MS * 2 ** previous);
-      return { retry: { kind: "retry", notBefore: new Date(now().getTime() + waitMs).toISOString(), reason: `HTTP 429 (rate limited): ${e.detail}` } };
+      return rateLimited(job, e.rawBody ?? e.detail, c.retryAfterMs, `HTTP 429 (rate limited): ${e.detail}`, now, e.rawBody);
     }
     if (e instanceof OpenRouterError && e.httpStatus !== undefined) {
       // A definite HTTP rejection: the request was not answered.
@@ -191,6 +198,28 @@ async function callOnce(
     const detail = e instanceof OpenRouterError ? e.detail : String((e as Error)?.message ?? e);
     return { item: { state: "failed", at: at(), code: "submission_unknown", message: `${UNKNOWN_OUTCOME_MESSAGE} Detail: ${detail}` } };
   }
+}
+
+/**
+ * A rate limit (HTTP 429, or a 200 whose error object is one): a daily limit (only when the body says so) fails the
+ * turn; otherwise it is rescheduled with Retry-After or exponential backoff, until MAX_CONSECUTIVE_429 in a row, after
+ * which it fails as `rate_limited`.
+ */
+function rateLimited(
+  job: JobManifest,
+  text: string,
+  retryAfterMs: number,
+  reason: string,
+  now: () => Date,
+  bodyText?: string,
+): { item: ImmediateItemState } | { retry: Extract<ImmediateOutcome, { kind: "retry" }> } {
+  const at = now().toISOString();
+  const extra = { status: 429, ...(bodyText ? { bodyText } : {}) };
+  if (DAILY_PATTERN.test(text)) return { item: { state: "failed", at, code: "rate_limited_daily", message: DAILY_LIMIT_MESSAGE, ...extra } };
+  const previous = job.consecutivePollFailures ?? 0;
+  if (previous + 1 > MAX_CONSECUTIVE_429) return { item: { state: "failed", at, code: "rate_limited", message: RATE_LIMITED_MESSAGE, ...extra } };
+  const waitMs = retryAfterMs > 0 ? retryAfterMs : Math.min(MAX_BACKOFF_MS, BASE_BACKOFF_MS * 2 ** previous);
+  return { retry: { kind: "retry", notBefore: new Date(now().getTime() + waitMs).toISOString(), reason } };
 }
 
 /** In exactly the shape of a completed batch object (see test/fixtures/openrouter.ts `completed`). */

@@ -3,6 +3,7 @@
  * Served locally from 127.0.0.1 with an injected per-session CSRF token.
  */
 
+import { MAX_CONSECUTIVE_429 } from "../openrouter/immediate.js";
 import { neverReachedOpenRouter } from "../privacy/policy.js";
 
 /*
@@ -34,6 +35,30 @@ export function failureStates(
     }
   });
   return out;
+}
+
+/**
+ * The in-flight banner's headline for a thread's pending turn or compaction: names the route, and for a free-model
+ * (immediate) turn that OpenRouter rate-limited, when it retries (local time) and how many rate limits so far out of
+ * `maxRateLimits` (after which the turn fails). A batch turn whose last status check failed says so. Plain text.
+ */
+export function inflightHeadline(
+  kind: "turn" | "compaction",
+  job: { route?: string; nextPollAt?: string; consecutivePollFailures?: number; lastPollError?: { message?: string } } | null | undefined,
+  maxRateLimits: number,
+): string {
+  if (kind === "compaction") return "⏳ Compaction in flight";
+  if (job && job.route === "immediate") {
+    const n = job.consecutivePollFailures || 0;
+    const at = job.nextPollAt ? new Date(job.nextPollAt) : null;
+    if (n > 0 && at && Number.isFinite(at.getTime())) {
+      const hhmm = String(at.getHours()).padStart(2, "0") + ":" + String(at.getMinutes()).padStart(2, "0");
+      return "⏳ Free-model turn rate-limited by OpenRouter; retrying at " + hhmm + " (attempt " + n + " of " + maxRateLimits + ")";
+    }
+    return "⏳ Free-model turn in flight";
+  }
+  if (job && job.lastPollError && job.lastPollError.message) return "⏳ Batch turn in flight (last status check failed: " + job.lastPollError.message + ")";
+  return "⏳ Batch turn in flight";
 }
 
 /**
@@ -1069,6 +1094,8 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
 
   <script nonce="${nonceAttr}">
     ${failureStates.toString()}
+    ${inflightHeadline.toString()}
+    const MAX_RATE_LIMITS = ${MAX_CONSECUTIVE_429};
     ${createCoalescer.toString()}
     ${privacyNoticeHtml.toString()}
     ${neverReachedOpenRouter.toString()}
@@ -1765,7 +1792,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         inflight.innerHTML =
           '<div class="inflight-banner">' +
           "<div>" +
-          "<strong>⏳ " + (p ? "Batch Turn in Flight" : "Compaction in Flight") + "</strong> " +
+          "<strong>" + escapeHtml(inflightHeadline(p ? "turn" : "compaction", activeJob, MAX_RATE_LIMITS)) + "</strong> " +
           (jobId ? "(<code>" + escapeHtml(jobId) + "</code> · " + escapeHtml(jobStatus) + ")" : "") +
           '<div style="font-size:11px; color:var(--text-muted);">Messages sent while waiting are queued in the thread and automatically submitted as one turn when the reply lands.</div>' +
           "</div>" +
