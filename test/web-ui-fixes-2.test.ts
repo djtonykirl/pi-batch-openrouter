@@ -13,7 +13,7 @@ import { BatchPoller } from "../src/poller.js";
 import { JobRegistry } from "../src/registry.js";
 import { BatchService } from "../src/service.js";
 import { BatchWebServer } from "../src/web/server.js";
-import { inflightHeadline, renderWebUiHtml } from "../src/web/ui.js";
+import { inflightHeadline, metadataWrittenText, renderWebUiHtml } from "../src/web/ui.js";
 import { webWording } from "../src/web/wording.js";
 import { FAKE_KEY, FakeOpenRouter, accepted, makeConfig } from "./fixtures/fake-openrouter.js";
 import { rm, tempWorkspace } from "./helpers.js";
@@ -143,3 +143,25 @@ test(
     assert.doesNotMatch(err, /\/batch chat retry/);
   }),
 );
+
+// ------------------------------------------------------------------ 6: metadata handoff success line
+
+test("6: the success line names the path, the artifact and (approved) the counts, as the CLI does", () => {
+  assert.equal(
+    metadataWrittenText("review", { path: "metadata/review.md", artifactId: "A-1", gaps: 2 }),
+    "✅ Review written: metadata/review.md (artifact A-1)\n2 table(s) without a usable proposal are listed in it\nProposed metadata has not been applied to Databricks.",
+  );
+  assert.equal(
+    metadataWrittenText("approved", { path: "metadata/approved.jsonl", artifactId: "A-2", sha256: "abc", tables: 3, counts: { keptExisting: 4, fromProposal: 5, nullApproved: 1 } }),
+    "✅ Draft handoff written: metadata/approved.jsonl (artifact A-2, sha256 abc)\n3 table(s); values: 4 existing kept, 5 from proposals, 1 null\nThis is a draft for review; edit approved_* values, then validate it. Nothing has been applied to Databricks.",
+  );
+});
+
+test("6: the result survives the live refresh that writing a file triggers (the card restores it)", () => {
+  const html = page();
+  assert.ok(html.includes(metadataWrittenText.toString()));
+  assert.ok(html.includes("escapeHtml(metadataWrittenText(\"review\", res))"));
+  assert.ok(html.includes("escapeHtml(metadataWrittenText(\"approved\", res))"));
+  assert.ok(html.includes("state.metadataCard = {"), "metadataOutput keeps the result in state");
+  assert.ok(html.includes("'<div id=\"metadataActionOutput\">' + (saved ? saved.html : \"\") + \"</div>\""), "metadataActionsCard restores it");
+});

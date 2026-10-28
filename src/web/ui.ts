@@ -38,6 +38,36 @@ export function failureStates(
 }
 
 /**
+ * The metadata handoff card's success line after writing review.md or approved.jsonl, as the CLI reports it: the
+ * written path, the artifact ID and (approved) the table and value counts. Plain text.
+ */
+export function metadataWrittenText(
+  kind: "review" | "approved",
+  res: {
+    path: string;
+    artifactId: string;
+    gaps?: number;
+    sha256?: string;
+    tables?: number;
+    counts?: { keptExisting: number; fromProposal: number; nullApproved: number };
+  },
+): string {
+  if (kind === "review") {
+    return (
+      "✅ Review written: " + res.path + " (artifact " + res.artifactId + ")" +
+      (res.gaps ? "\n" + res.gaps + " table(s) without a usable proposal are listed in it" : "") +
+      "\nProposed metadata has not been applied to Databricks."
+    );
+  }
+  const c = res.counts;
+  return (
+    "✅ Draft handoff written: " + res.path + " (artifact " + res.artifactId + (res.sha256 ? ", sha256 " + res.sha256 : "") + ")" +
+    (c ? "\n" + (typeof res.tables === "number" ? res.tables + " table(s); " : "") + "values: " + c.keptExisting + " existing kept, " + c.fromProposal + " from proposals, " + c.nullApproved + " null" : "") +
+    "\nThis is a draft for review; edit approved_* values, then validate it. Nothing has been applied to Databricks."
+  );
+}
+
+/**
  * The in-flight banner's headline for a thread's pending turn or compaction: names the route, and for a free-model
  * (immediate) turn that OpenRouter rate-limited, when it retries (local time) and how many rate limits so far out of
  * `maxRateLimits` (after which the turn fails). A batch turn whose last status check failed says so. Plain text.
@@ -1095,6 +1125,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
   <script nonce="${nonceAttr}">
     ${failureStates.toString()}
     ${inflightHeadline.toString()}
+    ${metadataWrittenText.toString()}
     const MAX_RATE_LIMITS = ${MAX_CONSECUTIVE_429};
     ${createCoalescer.toString()}
     ${privacyNoticeHtml.toString()}
@@ -1127,6 +1158,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
       picker: { entries: [], catalog: null, key: "" },
       showBlocked: false,
       pickedRoute: null,
+      metadataCard: null,
     };
 
     function updateWorkspaceDisplay(rootPath) {
@@ -2468,29 +2500,44 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
       const dir = inPath.includes("/") ? inPath.slice(0, inPath.lastIndexOf("/") + 1) : "";
       const field = (id, label, value) =>
         '<div><label style="font-size:12px; color:var(--text-muted);">' + label + '</label><input type="text" id="' + id + '" value="' + escapeHtml(value) + '" style="width:100%; font-family:var(--mono);"></div>';
+      // Restored after a live refresh: what the user typed and ticked, and the last result.
+      const saved = state.metadataCard && state.metadataCard.jobId === j.localId ? state.metadataCard : null;
+      const checked = (on) => (on ? " checked" : "");
       return (
         '<div class="msg-card" style="max-width:none; display:flex; flex-direction:column; gap:10px;">' +
         "<strong>UC Metadata handoff</strong>" +
         '<div style="font-size:12px; color:var(--text-muted);">Writes files into the workspace through the artifact system. Proposals only: nothing is applied to Databricks.</div>' +
         '<div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">' +
-        field("metadataReviewOut", "Review file (.md)", dir + "review.md") +
-        field("metadataApprovedOut", "Approved file (.jsonl)", dir + "approved.jsonl") +
+        field("metadataReviewOut", "Review file (.md)", saved && saved.review !== undefined ? saved.review : dir + "review.md") +
+        field("metadataApprovedOut", "Approved file (.jsonl)", saved && saved.approved !== undefined ? saved.approved : dir + "approved.jsonl") +
         "</div>" +
         '<div style="display:flex; gap:14px; flex-wrap:wrap; font-size:12px;">' +
-        '<label><input type="checkbox" id="metadataOverwrite"> Overwrite existing file</label>' +
-        '<label><input type="checkbox" id="metadataAllowPartial"> Allow partial (tables without a proposal keep their existing values)</label>' +
+        '<label><input type="checkbox" id="metadataOverwrite"' + checked(saved && saved.overwrite) + "> Overwrite existing file</label>" +
+        '<label><input type="checkbox" id="metadataAllowPartial"' + checked(saved && saved.allowPartial) + "> Allow partial (tables without a proposal keep their existing values)</label>" +
         "</div>" +
         '<div style="display:flex; gap:8px; flex-wrap:wrap;">' +
         '<button class="btn btn-sm btn-primary" ' + act("writeMetadataReview", j.localId) + ">Write review.md</button>" +
         '<button class="btn btn-sm btn-primary" ' + act("writeMetadataApproved", j.localId) + ">Write approved.jsonl</button>" +
         '<button class="btn btn-sm" ' + act("validateMetadataApproved", j.localId) + ">Validate approved file</button>" +
         "</div>" +
-        '<div id="metadataActionOutput"></div>' +
+        '<div id="metadataActionOutput">' + (saved ? saved.html : "") + "</div>" +
         "</div>"
       );
     }
 
+    // The card is rebuilt by every live refresh (writing a file broadcasts artifact_created), so its fields and the last
+    // result are kept in state and restored by metadataActionsCard; otherwise the success line vanished at once.
     function metadataOutput(html) {
+      const v = (id) => (document.getElementById(id) || {}).value;
+      const c = (id) => !!(document.getElementById(id) || {}).checked;
+      state.metadataCard = {
+        jobId: state.selectedJobId,
+        review: v("metadataReviewOut"),
+        approved: v("metadataApprovedOut"),
+        overwrite: c("metadataOverwrite"),
+        allowPartial: c("metadataAllowPartial"),
+        html,
+      };
       const box = document.getElementById("metadataActionOutput");
       if (box) box.innerHTML = html;
     }
@@ -2507,7 +2554,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
           method: "POST",
           body: { out: document.getElementById("metadataReviewOut").value.trim() || undefined, overwrite: document.getElementById("metadataOverwrite").checked },
         });
-        metadataOutput('<div class="alert-box alert-success">Review written: ' + escapeHtml(res.path) + " (artifact " + escapeHtml(res.artifactId) + ")" + (res.gaps ? "\\n" + res.gaps + " table(s) without a usable proposal are listed in it" : "") + "</div>");
+        metadataOutput('<div class="alert-box alert-success" role="status">' + escapeHtml(metadataWrittenText("review", res)) + "</div>");
         showToast("Wrote " + res.path);
       } catch (err) {
         metadataOutput('<div class="alert-box alert-danger">' + escapeHtml(err.message) + "</div>");
@@ -2525,8 +2572,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
           },
         });
         metadataOutput(
-          '<div class="alert-box alert-success">Draft handoff written: ' + escapeHtml(res.path) + "\\nsha256 " + escapeHtml(res.sha256) + "\\n" + escapeHtml(metadataCounts(res.counts)) +
-            "\\nThis is a draft for review; edit approved_* values, then validate it.</div>" + metadataProblems(res.problems),
+          '<div class="alert-box alert-success" role="status">' + escapeHtml(metadataWrittenText("approved", res)) + "</div>" + metadataProblems(res.problems),
         );
         showToast("Wrote " + res.path);
       } catch (err) {
