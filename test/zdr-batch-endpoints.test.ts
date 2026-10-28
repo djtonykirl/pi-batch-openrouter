@@ -283,3 +283,63 @@ test("a zdr /batch ask on a Claude-shaped model is refused before anything is pe
     rm(root);
   }
 });
+
+/** A zdr service on Gemini whose catalog first loads as `firstLoad` and then starts a refresh that never finishes. */
+async function zdrServiceDuringRefresh(firstLoad: "fresh" | "failed", fn: (s: { service: BatchService; fake: FakeOpenRouter; jobsDir: string }) => Promise<void>): Promise<void> {
+  const root = tempWorkspace("pi batch zdr-refresh-");
+  writeFiles(root, { "src/auth.ts": "export function login() { return true; }\r\n" });
+  try {
+    const fake = new FakeOpenRouter();
+    fake.submitReplies = [accepted()];
+    const cfg = makeConfig((c) => {
+      c.privacy.level = "zdr";
+      c.defaultModel = GEMINI;
+      c.polling.requestTimeoutSeconds = 1;
+    });
+    let calls = 0;
+    const cat = new ModelCatalog({
+      file: path.join(root, "catalog.json"),
+      fetch: () => {
+        calls++;
+        if (calls > 1) return new Promise(() => {}); // the refresh never finishes
+        return firstLoad === "fresh" ? Promise.resolve({ models: [], zdr: ZDR, batchEndpoints: BATCH }) : Promise.reject(new Error("offline"));
+      },
+    });
+    await cat.load();
+    void cat.load();
+    const jobsDir = path.join(root, ".pi", "batches");
+    const service = new BatchService({
+      registry: new JobRegistry(jobsDir),
+      workspaceRoot: root,
+      getConfig: () => cfg,
+      resolveApiKey: async () => FAKE_KEY,
+      createClient: (apiKey, timeoutMs) => new OpenRouterBatchClient({ apiKey, fetchImpl: fake.fetch, timeoutMs }),
+      gitIgnored: () => new Set(),
+      catalog: cat,
+    });
+    await fn({ service, fake, jobsDir });
+  } finally {
+    rm(root);
+  }
+}
+
+test("zdr while a refresh is in flight and nothing was loaded this session: refused as still loading, nothing posted", async () => {
+  await zdrServiceDuringRefresh("failed", async ({ service, fake, jobsDir }) => {
+    await assert.rejects(service.createJob(await service.prepare(ASK), { previewOnly: false }), (err: unknown) => {
+      assert.ok(err instanceof SubmissionBlockedError);
+      assert.equal(err.message, "Privacy level zdr: the model catalog is still loading; try again in a moment");
+      return true;
+    });
+    assert.equal(fs.existsSync(jobsDir) ? fs.readdirSync(jobsDir, { withFileTypes: true }).filter((e) => e.isDirectory()).length : 0, 0);
+    assert.equal(fake.requests.filter((r) => r.method === "POST").length, 0);
+  });
+});
+
+test("zdr while a refresh is in flight after a successful load this session: the loaded catalog still pins", async () => {
+  await zdrServiceDuringRefresh("fresh", async ({ service, fake }) => {
+    const job = await service.createJob(await service.prepare(ASK), { previewOnly: false });
+    assert.equal(job.localStatus, "submitted", job.error?.message);
+    const posted = JSON.parse(fake.requests.filter((r) => r.method === "POST").at(-1)!.body!) as { provider?: unknown };
+    assert.deepEqual(posted.provider, { only: ["google-vertex/global"], allow_fallbacks: false });
+  });
+});

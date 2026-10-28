@@ -311,14 +311,18 @@ export class ChatService {
     const privacy = this.privacy();
     const thread = this.store.read(threadId);
     const level = effectiveLevelOf(privacy.level, thread.privacyLevel);
-    const catalog = level === "zdr" ? await this.deps.batch.catalog?.whenLoaded(config.polling.requestTimeoutSeconds * 1000) : undefined;
+    const catalog = level === "zdr" ? ((await this.deps.batch.catalog?.whenLoaded(config.polling.requestTimeoutSeconds * 1000)) ?? this.deps.batch.catalog?.view()) : undefined;
     if (route === "batch") {
       const d = resolveBatchProvider({ level, model: to, userPin: thread.providerPin, catalog, accountNoTraining: privacy.accountNoTraining, allowedProviders: allowedProviders(config) });
       if (!d.ok) throw new Error(d.reason);
     } else if (level === "zdr") {
       const base = normaliseModelSlug(to);
       if (!catalog?.fresh) {
-        throw new Error("Privacy level zdr: model catalog not loaded this session, so ZDR endpoints can't be verified (run /batch privacy refresh)");
+        throw new Error(
+          catalog?.loading
+            ? "Privacy level zdr: the model catalog is still loading; try again in a moment"
+            : "Privacy level zdr: model catalog not loaded this session, so ZDR endpoints can't be verified (run /batch privacy refresh)",
+        );
       }
       if (!catalog.zdr.some((e) => e.model === base)) throw new Error(`Privacy level zdr: no ZDR endpoint available for ${base}`);
     }

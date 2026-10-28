@@ -46,10 +46,15 @@ test("loadBatchEndpoints stops at its deadline: slow models are unknown, finishe
     { id: "m/slow:batch", name: "S", free: false },
   ];
   const started = Date.now();
-  const result = await loadBatchEndpoints(models, (id) => (id === "m/fast:batch" ? Promise.resolve(["fast-tag"]) : new Promise<string[]>(() => {})), 8, 50);
+  let finishSlow!: (tags: string[]) => void;
+  const slow = new Promise<string[]>((resolve) => (finishSlow = resolve));
+  const result = await loadBatchEndpoints(models, (id) => (id === "m/fast:batch" ? Promise.resolve(["fast-tag"]) : slow), 8, 50);
   assert.ok(Date.now() - started < 1000, "returns at the deadline, not when the slow request ends");
   assert.deepEqual(result.endpoints, { "m/fast": ["fast-tag"] });
   assert.deepEqual(result.failed, ["m/slow:batch"]);
+  finishSlow(["late-tag"]);
+  await new Promise((r) => setTimeout(r, 10));
+  assert.deepEqual(result.endpoints, { "m/fast": ["fast-tag"] }, "a result arriving after the deadline changes nothing");
 });
 
 test("model IDs with empty, '.' or '..' path segments are never fetched", async () => {
