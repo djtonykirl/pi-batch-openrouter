@@ -1,7 +1,8 @@
 import * as fs from "node:fs";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { parseArgs } from "./args.js";
-import { formatPin, formatPrivacyPolicy } from "./openrouter/routing.js";
+import { formatPrivacyPolicy, previewPin } from "./openrouter/routing.js";
+import type { PrivacyLevel } from "./privacy/policy.js";
 import { ArtifactError } from "./artifacts/service.js";
 import { TextViewerComponent } from "./dashboard.js";
 import { writeApprovedDraft, writeMetadataReview } from "./metadata/outputs.js";
@@ -20,13 +21,20 @@ import { resolveWorkspaceInput } from "./workspace-paths.js";
 export const METADATA_HELP = `/batch metadata — Databricks table descriptions and column comments (proposals only)
 
   plan --context <context.md> --input <tables.jsonl> [--preview] [--model <slug>] [--account] [--provider]
-                                     one request per table; --preview saves the plan without sending
+       [--domain <slug> --uc-prefix <PREFIX>]
+                                     one request per table; --preview saves the plan without sending.
+                                     --domain with --uc-prefix (both or neither) turns on UC standards mode:
+                                     Fulcrum description/comment formats, classification and column PII
+                                     tags; tables must start with the prefix and sit in a bronze, silver
+                                     or gold schema; framework audit columns are not sent
   summary <job>                      coverage, statuses and confidence totals
   review <job> [--out <file.md>] [--overwrite]
                                      Markdown review: existing vs proposed values (an artifact)
   approved <job> --out <approved.jsonl> [--overwrite] [--allow-partial]
                                      draft handoff: existing values kept, empty ones take the proposal,
-                                     insufficient evidence stays null; edit it, then validate it
+                                     insufficient evidence stays null; edit it, then validate it.
+                                     Standards mode: rows carry tags, and an existing value that fails
+                                     the standards takes the proposal (marked in the review)
   validate-approved <approved.jsonl> [--job <id>]
                                      check a handoff against the job's evidence and report edits
 
@@ -47,12 +55,21 @@ export async function cmdMetadata(rt: BatchRuntime, rest: string[], ctx: Extensi
   const service = rt.requireService();
   switch (sub) {
     case "plan": {
-      const parsed = parseArgs(args, { values: ["context", "input", "model", "account", "provider"], booleans: ["preview"] });
+      const parsed = parseArgs(args, { values: ["context", "input", "model", "account", "provider", "domain", "uc-prefix"], booleans: ["preview"] });
       if (parsed.errors.length) throw new Error(`/batch metadata plan: ${parsed.errors.join("; ")}`);
-      if (!parsed.values.context || !parsed.values.input) throw new Error("Usage: /batch metadata plan --context <context.md> --input <tables.jsonl> [--preview]");
-      const prepared = await service.planMetadata({ context: parsed.values.context, input: parsed.values.input, model: parsed.values.model, account: parsed.values.account, providerPin: parsed.values.provider });
+      if (!parsed.values.context || !parsed.values.input) throw new Error("Usage: /batch metadata plan --context <context.md> --input <tables.jsonl> [--domain <slug> --uc-prefix <PREFIX>] [--preview]");
+      const prepared = await service.planMetadata({
+        context: parsed.values.context,
+        input: parsed.values.input,
+        model: parsed.values.model,
+        account: parsed.values.account,
+        providerPin: parsed.values.provider,
+        domain: parsed.values.domain,
+        ucPrefix: parsed.values["uc-prefix"],
+      });
       const previewOnly = parsed.booleans.has("preview");
-      const preview = formatMetadataPreview(prepared, previewOnly, formatPrivacyPolicy(rt.loaded.config));
+      const privacy = service.privacyConfig();
+      const preview = formatMetadataPreview(prepared, previewOnly, formatPrivacyPolicy(rt.loaded.config, privacy), privacy.level);
       if (prepared.blockers.length > 0) throw new SubmissionBlockedError(`${preview}\n\nPLAN BLOCKED — nothing was saved or sent:\n\n${prepared.blockers.join("\n\n")}`);
       const job = await service.createMetadataJob(prepared, { previewOnly });
       if (previewOnly) {
@@ -86,15 +103,20 @@ export async function cmdMetadata(rt: BatchRuntime, rest: string[], ctx: Extensi
       if (!id || !parsed.values.out) throw new Error("Usage: /batch metadata approved <job> --out <approved.jsonl> [--overwrite] [--allow-partial]");
       const { manifest: m, validation, outcome } = await writeApprovedDraft(service, rt.requireArtifacts(), id, { out: parsed.values.out, overwrite: parsed.booleans.has("overwrite"), allowPartial: parsed.booleans.has("allow-partial") });
       const c = validation.counts;
+      const draftNote = outcome.standards
+        ? `   ${c.replacedNonStandard ?? 0} non-standard existing value(s) replaced by proposals\n` +
+          `   This is a DRAFT for review: standard existing values were kept; non-standard ones were replaced by proposals (marked in the review). Edit approved_* values and tags, then: /batch metadata validate-approved ${m.output!.path}\n`
+        : `   This is a DRAFT for review: existing comments were kept, not replaced. Edit approved_* values, then: /batch metadata validate-approved ${m.output!.path}\n`;
       rt.notify(
         `✅ Draft handoff written: ${m.output!.path} (artifact ${m.artifactId}, sha256 ${m.output!.sha256})\n` +
           `   ${outcome.tables.length} table(s); values: ${c.keptExisting} existing kept, ${c.fromProposal} from proposals, ${c.nullApproved} null (insufficient evidence or no proposal)\n` +
-          `   This is a DRAFT for review: existing comments were kept, not replaced. Edit approved_* values, then: /batch metadata validate-approved ${m.output!.path}\n` +
+          draftNote +
           `   Nothing has been applied to Databricks.`,
         validation.problems.length ? "warning" : "info",
       );
       return;
-    }    case "validate-approved": {
+    }
+    case "validate-approved": {
       const parsed = parseArgs(args, { values: ["job"] });
       if (parsed.errors.length) throw new Error(`/batch metadata validate-approved: ${parsed.errors.join("; ")}`);
       const file = parsed.positionals[0];
@@ -103,9 +125,12 @@ export async function cmdMetadata(rt: BatchRuntime, rest: string[], ctx: Extensi
       if (!r.ok) throw new ArtifactError(r.message);
       const v = validateApprovedText(fs.readFileSync(r.absPath, "utf8"), service, parsed.values.job);
       const c = v.counts;
-      const summary = `${r.relPath}: ${v.rows} table row(s)${v.jobId ? ` from job ${v.jobId}` : ""}; ${c.total} value(s): ${c.keptExisting} existing kept, ${c.fromProposal} as proposed, ${c.edited} edited by a reviewer, ${c.nullApproved} null`;
+      const summary =
+        `${r.relPath}: ${v.rows} table row(s)${v.jobId ? ` from job ${v.jobId}` : ""}; ${c.total} value(s): ${c.keptExisting} existing kept, ${c.fromProposal} as proposed, ${c.edited} edited by a reviewer, ${c.nullApproved} null` +
+        (c.replacedNonStandard !== undefined ? `; ${c.replacedNonStandard} non-standard existing value(s) replaced by proposals` : "");
       if (v.problems.length) throw new SubmissionBlockedError(`❌ ${summary}\n\nProblems:\n- ${v.problems.join("\n- ")}`);
-      rt.notify(`✅ ${summary}\n   Valid against the job's evidence. Hand it to the Databricks process for validation and application; Pi applies nothing.`, "info");
+      const nulls = v.nullValues?.length ? `\n   Null (skipped by the applier): ${v.nullValues.join(", ")}` : "";
+      rt.notify(`✅ ${summary}${nulls}\n   Valid against the job's evidence. Hand it to the Databricks process for validation and application; Pi applies nothing.`, "info");
       return;
     }
     case "help":
@@ -116,14 +141,16 @@ export async function cmdMetadata(rt: BatchRuntime, rest: string[], ctx: Extensi
   }
 }
 
-export function formatMetadataPreview(p: PreparedMetadataRun, previewOnly: boolean, privacy?: string): string {
+export function formatMetadataPreview(p: PreparedMetadataRun, previewOnly: boolean, privacy?: string, level?: PrivacyLevel): string {
   const plan = p.plan;
   const lines = [p.blockers.length ? "Metadata plan (BLOCKED)" : previewOnly ? "Metadata plan (not submitted)" : "Submitting metadata plan", ""];
   lines.push(`Workflow:          databricks-metadata (built-in): table descriptions and column comments only`);
   if (p.context) lines.push(`Context:           ${p.context.relPath}  (sha256 ${plan?.contextSha256 ?? "-"})`);
   if (p.input) lines.push(`Input:             ${p.input.relPath}  (sha256 ${plan?.inputSha256 ?? "-"})`);
+  lines.push(`Standards:         ${plan?.standards ? `${plan.standards.domain} / ${plan.standards.ucPrefix}` : "off"}`);
   if (plan) {
     lines.push(
+      `Audit columns:     ${plan.auditColumns} not sent${plan.standards ? "" : " (standards off: every column is sent)"}`,
       `Tables:            ${plan.tables}${plan.blankLines ? `  (${plan.blankLines} blank line(s) ignored)` : ""}`,
       `Requests:          ${plan.items.length}  (one per table, one batch)`,
       `Tables w/ samples: ${plan.tablesWithSamples}  (sample values are sent as given; they are not shown here)`,
@@ -131,7 +158,8 @@ export function formatMetadataPreview(p: PreparedMetadataRun, previewOnly: boole
       `Characters:        ${plan.totalCharacters} provider-bound (not a token count; no cost estimate)`,
       `Largest request:   ${plan.largest ? `${plan.largest.characters} characters (${plan.largest.table})` : "-"}`,
       `Model:             ${p.model}`,
-      `Provider pin:      ${formatPin(p.pin)}`,
+      `Provider pin:      ${previewPin(p.pin, level)}`,
+      ...(level ? [`Privacy level:     ${level}`] : []),
       ...(privacy ? [`Account privacy:   ${privacy}  (batch requests cannot carry ZDR/data-collection preferences)`] : []),
       `Secrets:           ${plan.secretFindings.length ? `${plan.secretFindings.length} potential finding(s)` : "none detected"} (context and each table's evidence)`,
       `Plan SHA-256:      ${plan.planSha256}`,

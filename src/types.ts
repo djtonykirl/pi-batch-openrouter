@@ -1,5 +1,6 @@
 import type { NormalisedUsage } from "./openrouter/normalise-result.js";
 import type { ProviderPin } from "./openrouter/types.js";
+import type { PrivacyLevel, Route } from "./privacy/policy.js";
 import type { LocalStatus } from "./state.js";
 
 /**
@@ -17,12 +18,25 @@ import type { LocalStatus } from "./state.js";
  *      JSON Schema output validation). Only these jobs (and their retries) are written
  *      as v3, so a Release 2 build reports them as unreadable instead of retrieving
  *      them without schema validation. Every other new job is still written as v2.
+ *   4  Batch chat jobs (kind "chat", with `chat` linkage). Only chat jobs are written as v4.
  */
 export const MANIFEST_SCHEMA_VERSION = 2;
 export const DATASET_MANIFEST_SCHEMA_VERSION = 3;
-export type ManifestSchemaVersion = 1 | 2 | 3;
+export const CHAT_MANIFEST_SCHEMA_VERSION = 4;
+export type ManifestSchemaVersion = 1 | 2 | 3 | 4;
 
-export type JobKind = "goal" | "workflow" | "synthesis";
+export type JobKind = "goal" | "workflow" | "synthesis" | "chat";
+
+export interface ChatLinkage {
+  threadId: string;
+  purpose: "turn" | "compact";
+  throughSeq: number;
+  titleItem: boolean;
+}
+
+export function isChatJob(job: Pick<JobManifest, "kind">): boolean {
+  return job.kind === "chat";
+}
 
 /**
  * Item result state, separate from both the local batch status and the
@@ -84,7 +98,9 @@ export type WorkflowInfo = MapFilesWorkflowInfo | DatasetWorkflowInfo | Metadata
  */
 export interface MetadataWorkflowInfo {
   name: "databricks-metadata";
-  version: 1;
+  /** 1: generic; 2: opt-in UC standards mode (then `standards` is set). */
+  version: 1 | 2;
+  standards?: { domain: string; ucPrefix: string };
   origin: "builtin";
   context: { path: string; sha256: string; bytes: number };
   input: { path: string; sha256: string; bytes: number; tables: number; tablesWithSamples: number };
@@ -198,6 +214,27 @@ export interface JobManifest {
   account: string;
   /** Optional upstream provider pin (`provider.only` in the OpenRouter request). */
   providerPin?: ProviderPin;
+  /** How the job's requests are sent. Absent means "batch" (every job made before the immediate route). */
+  route?: Route;
+  /**
+   * The privacy level enforced when this job was created, and how. Absent on
+   * jobs made before privacy levels existed (they were sent at `standard`).
+   */
+  privacy?: { level: PrivacyLevel; route: Route; enforcement: string };
+  /** Deletion of the finished batch at OpenRouter (strict levels only). Absent when not applicable. */
+  remoteDeletion?: {
+    state: "pending" | "done" | "failed";
+    /** DELETE calls made (a missing API key is not an attempt). */
+    attempts: number;
+    lastError?: string;
+    at?: string;
+    /** When the first DELETE was made; the 24-hour limit runs from here. */
+    firstAttemptAt?: string;
+    /** Earliest time of the next attempt (exponential backoff). */
+    nextAttemptAt?: string;
+    /** No API key was available at the last pass: nothing was attempted, and the user has to supply one. */
+    waitingForKey?: true;
+  };
   endpoint: "/v1/chat/completions";
   format: "markdown" | "json";
 
@@ -214,6 +251,7 @@ export interface JobManifest {
   items?: JobItem[];
   workflow?: WorkflowInfo;
   synthesis?: SynthesisLinkage;
+  chat?: ChatLinkage;
   /** Exports written by `/batch export` (explicit user command only). */
   exports?: ExportRecord[];
 

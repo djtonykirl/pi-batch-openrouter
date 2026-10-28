@@ -3,10 +3,10 @@ import * as path from "node:path";
 import type { BatchConfig } from "../config.js";
 import { canonicalJson, isInside, sha256Hex, writeFileAtomicExclusive } from "../fsutil.js";
 import { isUsable, itemText, jobItems, resolveItem, sourceLabel } from "../items.js";
-import type { BatchService } from "../service.js";
+import { ChatJobError, type BatchService } from "../service.js";
 import { TERMINAL_STATUSES } from "../state.js";
 import { nowIso } from "../time.js";
-import { isDatasetWorkflow, type JobItem, type JobManifest } from "../types.js";
+import { isChatJob, isDatasetWorkflow, type JobItem, type JobManifest } from "../types.js";
 import type { WorkflowDefinition } from "../workflows/definition.js";
 import { TemplateError } from "../workflows/template.js";
 import { resolveWorkspaceInput, resolveWorkspaceOutput } from "../workspace-paths.js";
@@ -121,6 +121,7 @@ export class ArtifactService {
     const registry = this.deps.batch.registry;
     const jobId = registry.resolveId(jobRef);
     const job = registry.read(jobId);
+    if (isChatJob(job)) throw new ChatJobError(`${job.localId} is a batch chat job; use /batch chat instead.`);
     if (opts.item && opts.synthesis) throw new ArtifactError("Use either --item or --synthesis, not both.");
 
     // Trusted workflow default (stored with the job, never the current file) when nothing explicit is given.

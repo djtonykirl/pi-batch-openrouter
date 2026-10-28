@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { BatchConfig } from "../config.js";
 import { isInside, sha256Hex } from "../fsutil.js";
+import { MAX_NOTEBOOK_RAW_BYTES, cleanNotebook, isNotebookPath } from "./notebook.js";
 import { IgnoreMatcher, hardDenyMatcher } from "./ignore.js";
 import { scanForSecrets, type SecretFinding } from "./secrets.js";
 
@@ -23,7 +24,7 @@ import { scanForSecrets, type SecretFinding } from "./secrets.js";
  * is listed in the package's `excluded` array and the preview.
  */
 
-export type ExclusionLayer = "hard-deny" | "batchignore" | "gitignore" | "config" | "binary" | "too-large" | "symlink";
+export type ExclusionLayer = "hard-deny" | "batchignore" | "gitignore" | "config" | "binary" | "too-large" | "symlink" | "invalid-notebook";
 
 export interface ExcludedFile {
   relPath: string;
@@ -38,12 +39,14 @@ export interface SelectedFile {
   sha256: string;
   lineEndings: "lf" | "crlf" | "mixed" | "none";
   selectedBy: "file" | "context";
+  /** Set when `content` is derived from the file (cleaned `.ipynb`): `bytes`/`sha256` describe the file on disk, `characters`/`content` the text sent. */
+  transform?: "ipynb-cleaned";
   /** Packaged text: UTF-8, CRLF normalised to LF so hashes are stable across checkouts. */
   content: string;
 }
 
 export interface PackageProblem {
-  kind: "outside_workspace" | "not_found" | "binary" | "too_large" | "excluded" | "unreadable" | "context_too_large" | "not_a_file";
+  kind: "outside_workspace" | "not_found" | "binary" | "too_large" | "excluded" | "unreadable" | "context_too_large" | "not_a_file" | "invalid_notebook";
   path: string;
   message: string;
 }
@@ -289,14 +292,16 @@ export function buildContextPackage(input: PackageInput): ContextPackage {
   // ---- 3. read, size/binary checks ----
   const files: SelectedFile[] = [];
   for (const c of accepted) {
+    const notebook = isNotebookPath(c.relPath);
     let buf: Buffer;
     try {
       const size = fs.statSync(c.absPath).size;
-      if (size > config.context.maxFileBytes) {
+      const limit = notebook ? MAX_NOTEBOOK_RAW_BYTES : config.context.maxFileBytes;
+      if (size > limit) {
         if (c.explicit) {
-          problems.push({ kind: "too_large", path: c.relPath, message: `${c.relPath} is ${size} bytes (limit ${config.context.maxFileBytes})` });
+          problems.push({ kind: "too_large", path: c.relPath, message: `${c.relPath} is ${size} bytes (limit ${limit})` });
         } else {
-          excluded.push({ relPath: c.relPath, layer: "too-large", rule: `> ${config.context.maxFileBytes} bytes` });
+          excluded.push({ relPath: c.relPath, layer: "too-large", rule: `> ${limit} bytes` });
         }
         continue;
       }
@@ -314,7 +319,29 @@ export function buildContextPackage(input: PackageInput): ContextPackage {
     if (raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1); // strip BOM
     const ext = path.extname(c.relPath).toLowerCase();
     if (ext && !KNOWN_TEXT_EXTENSIONS.has(ext)) warnings.push(`${c.relPath}: unrecognised extension "${ext}", accepted because content is valid text`);
-    const content = raw.replace(/\r\n/g, "\n");
+    let content = raw.replace(/\r\n/g, "\n");
+    let transform: SelectedFile["transform"];
+    if (notebook) {
+      // Never sent raw: outputs may hold cached data, images or secrets. maxFileBytes applies to the cleaned text.
+      const cleaned = cleanNotebook(content);
+      if (!cleaned.ok) {
+        if (c.explicit) problems.push({ kind: "invalid_notebook", path: c.relPath, message: `${c.relPath} is not a readable notebook: ${cleaned.reason}` });
+        else excluded.push({ relPath: c.relPath, layer: "invalid-notebook", rule: cleaned.reason });
+        continue;
+      }
+      const cleanedBytes = Buffer.byteLength(cleaned.text, "utf8");
+      if (cleanedBytes > config.context.maxFileBytes) {
+        if (c.explicit) {
+          problems.push({ kind: "too_large", path: c.relPath, message: `${c.relPath} is ${cleanedBytes} bytes after cleaning (limit ${config.context.maxFileBytes})` });
+        } else {
+          excluded.push({ relPath: c.relPath, layer: "too-large", rule: `> ${config.context.maxFileBytes} bytes after cleaning` });
+        }
+        continue;
+      }
+      content = cleaned.text;
+      transform = "ipynb-cleaned";
+      warnings.push(`${c.relPath}: notebook outputs stripped`); // shown in every preview's warnings
+    }
     files.push({
       relPath: c.relPath,
       bytes: buf.length,
@@ -322,6 +349,7 @@ export function buildContextPackage(input: PackageInput): ContextPackage {
       sha256: sha256Hex(buf),
       lineEndings: lineEndingsOf(raw),
       selectedBy: c.selectedBy,
+      ...(transform ? { transform } : {}),
       content,
     });
   }

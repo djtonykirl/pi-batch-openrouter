@@ -2,14 +2,17 @@ import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { parseArgs, tokenize, type ParsedArgs } from "./args.js";
 import { saveConfigUpdate } from "./config.js";
-import { formatPin } from "./openrouter/routing.js";
-import { BatchDashboardComponent, TextViewerComponent, describeJob, itemsCell } from "./dashboard.js";
+import { previewPin } from "./openrouter/routing.js";
+import type { PrivacyLevel } from "./privacy/policy.js";
+import { BatchDashboardComponent, TextViewerComponent, describeJob, itemsCell, retentionLine } from "./dashboard.js";
 import { discoverBatchModels } from "./models.js";
 import { INJECTED_MESSAGE_TYPE, type BatchRuntime } from "./runtime.js";
 import { jobItems, sourceLabel } from "./items.js";
 import { CHECK_LOCK_WAIT_MS, DuplicateActiveRequestError, SubmissionBlockedError, formatUsage, itemCounts, type InjectMode, type PreparedAsk, type PreparedDatasetRun, type PreparedPlan, type PreparedSynthesis } from "./service.js";
 import { cmdBatchArtifact } from "./artifact-commands.js";
 import { cmdMetadata } from "./metadata-commands.js";
+import { cmdChat } from "./chat/commands.js";
+import { cmdPrivacy } from "./privacy/commands.js";
 import { ArtifactError } from "./artifacts/service.js";
 import { formatLegacyInventory } from "./legacy.js";
 import { BUILTIN_WORKFLOWS, WorkflowNotFoundError, discoverWorkflows, findWorkflow, formatDiagnostics, validateWorkflowFile } from "./workflows/definition.js";
@@ -35,13 +38,16 @@ const SUBCOMMANDS: Record<string, { desc: string; nonTerminal: boolean }> = {
   artifact: { desc: "Write a controlled file from a validated result: artifact <id> [--synthesis|--item n] --format markdown|html|pdf|text [--template t] [--out path]", nonTerminal: true },
   metadata: { desc: "Databricks table descriptions/column comments: metadata plan|summary|review|approved|validate-approved", nonTerminal: true },
   "import-legacy": { desc: "Inventory a pre-Release-1 jobs.json (read-only): import-legacy <path> --preview", nonTerminal: true },
+  chat: { desc: "Chat with a model at batch prices: chat [continue|resume|clear|rename|model|compact|context|cost|export|off|retry|help]", nonTerminal: true },
   items: { desc: "List a job's request items", nonTerminal: true },
   item: { desc: "Inspect one item: item <id> <n|custom_id|path> [--text] [--raw]", nonTerminal: true },
   "retry-items": { desc: "Re-run failed/selected items as a new linked job: retry-items <id> --failed | --item n", nonTerminal: true },
   synthesize: { desc: "Synthesize a finished workflow job as a new linked job [--allow-partial] [--preview]", nonTerminal: true },
   view: { desc: "Open interactive TUI dashboard", nonTerminal: false },
+  web: { desc: "Start or stop local Web UI: web [--port n] [stop]", nonTerminal: false },
   model: { desc: "Select default batch model", nonTerminal: true },
   provider: { desc: "Select default OpenRouter account (Pi provider alias)", nonTerminal: true },
+  privacy: { desc: "Privacy level: privacy [standard|no-training|zdr|attest|unattest|refresh]", nonTerminal: true },
   help: { desc: "Show /batch usage", nonTerminal: false },
 };
 
@@ -84,6 +90,9 @@ const HELP = `/batch — deferred OpenRouter Batch goals
                                      Databricks table descriptions and column comments (see /batch metadata help)
   import-legacy <jobs.json> --preview
                                      read-only inventory of pre-Release-1 jobs (import itself is deferred)
+  chat                               start a chat thread (batch-priced replies; typed text goes to the thread)
+  chat continue | resume [thread] | clear | rename <title> | model [slug] | compact [focus]
+  chat context | cost | export [file] | retry | off | help   (see /batch chat help)
   run map-files [options] --prompt "<objective>"
                                      one request per file, all in ONE batch
       --file <path> (repeatable)  --context <dir>  --group-size <n>
@@ -102,8 +111,10 @@ const HELP = `/batch — deferred OpenRouter Batch goals
   retry-items <id> --failed | --item <sel> ... [--model <slug>] [--preview]
   synthesize <id> [--allow-partial] [--model] [--account] [--provider] [--preview]
   view                               TUI dashboard
+  web [--port <n>] [stop]            local Web UI studio (127.0.0.1)
   [--global] model [slug]            default batch model
   [--global] provider [alias]        default Pi account for the API key
+  [--global] privacy [level]         privacy level: standard | no-training | zdr; also attest, unattest, refresh
 
 IDs accept a unique suffix, e.g. "A7C2". Results are advisory and never applied to files automatically.`;
 
@@ -233,6 +244,8 @@ async function dispatch(rt: BatchRuntime, args: string, ctx: ExtensionCommandCon
       return cmdBatchArtifact(rt, rest);
     case "metadata":
       return cmdMetadata(rt, rest, ctx);
+    case "chat":
+      return cmdChat(rt, rest, ctx);
     case "import-legacy":
       return cmdImportLegacy(rt, rest, ctx);
     case "items":
@@ -263,8 +276,12 @@ async function dispatch(rt: BatchRuntime, args: string, ctx: ExtensionCommandCon
     case "ui":
     case "dashboard":
       return cmdView(rt, ctx);
+    case "web":
+      return cmdWeb(rt, rest);
     case "model":
       return cmdSetting(rt, "defaultModel", rest, isGlobal);
+    case "privacy":
+      return cmdPrivacy(rt, rest, isGlobal);
     case "provider":
     case "account":
       return cmdSetting(rt, "defaultAccount", rest, isGlobal);
@@ -308,7 +325,7 @@ async function cmdAsk(rt: BatchRuntime, rest: string[], ctx: ExtensionCommandCon
   });
   const previewOnly = parsed.booleans.has("preview");
   const config = rt.loaded.config;
-  const preview = formatPreview(prepared, previewOnly);
+  const preview = formatPreview(prepared, previewOnly, service.privacyConfig().level);
 
   if (prepared.blockers.length > 0) {
     // Nothing is persisted or sent when blocked.
@@ -343,13 +360,13 @@ async function cmdAsk(rt: BatchRuntime, rest: string[], ctx: ExtensionCommandCon
   }
 }
 
-function formatPreview(p: PreparedAsk, previewOnly: boolean): string {
+function formatPreview(p: PreparedAsk, previewOnly: boolean, level?: PrivacyLevel): string {
   const lines = [
     previewOnly ? "Batch goal preview (not submitted)" : "Submitting batch goal",
     "",
     `Objective:    ${p.options.objective.replace(/\s+/g, " ").slice(0, 100)}`,
     `Model:        ${p.model}`,
-    `Account:      ${p.account}${p.pin ? `   Provider pin: ${formatPin(p.pin)}` : ""}`,
+    `Account:      ${p.account}${p.pin || level === "zdr" ? `   Provider pin: ${previewPin(p.pin, level)}` : ""}`,
     `Files:        ${p.pkg.files.length}${p.pkg.files.length ? `  (${p.pkg.files.slice(0, 5).map((f) => f.relPath).join(", ")}${p.pkg.files.length > 5 ? ", …" : ""})` : ""}`,
     `Characters:   ${p.pkg.characters}  (context package; not a token count)`,
     `Excluded:     ${p.pkg.excluded.length}${p.pkg.excluded.length ? `  (${p.pkg.excluded.slice(0, 4).map((e) => `${e.relPath} [${e.layer}]`).join(", ")}${p.pkg.excluded.length > 4 ? ", …" : ""})` : ""}`,
@@ -424,6 +441,8 @@ async function cmdShow(rt: BatchRuntime, rest: string[], ctx: ExtensionCommandCo
     ),
   ];
   if (job.usage) lines.push("", `  Usage: ${formatUsage(job.usage)}`);
+  const retention = retentionLine(job, service.privacyConfig().deleteRemoteBatches);
+  if (retention) lines.push("", `  ${retention}`);
   const items = jobItems(service.registry, job);
   if (items.length > 1 || job.workflow || job.kind === "synthesis") {
     const c = itemCounts(items.map((i) => i.status));
@@ -600,7 +619,7 @@ async function cmdRun(rt: BatchRuntime, rest: string[], ctx: ExtensionCommandCon
     includeInstructions: !parsed.booleans.has("no-instructions"),
   });
   const previewOnly = forcePreview || parsed.booleans.has("preview");
-  const preview = formatPlanPreview(plan, previewOnly);
+  const preview = formatPlanPreview(plan, previewOnly, service.privacyConfig().level);
   if (plan.blockers.length > 0) {
     // Nothing is persisted or sent when blocked.
     throw new SubmissionBlockedError(`${preview}\n\nPLAN BLOCKED — nothing was saved or sent:\n\n${plan.blockers.join("\n\n")}`);
@@ -650,7 +669,7 @@ async function runDataset(rt: BatchRuntime, workflow: string, parsed: ParsedArgs
     providerPin: parsed.values.provider,
   });
   const previewOnly = forcePreview || parsed.booleans.has("preview");
-  const preview = formatDatasetPreview(prepared, previewOnly);
+  const preview = formatDatasetPreview(prepared, previewOnly, service.privacyConfig().level);
   if (prepared.blockers.length > 0) {
     throw new SubmissionBlockedError(`${preview}\n\nPLAN BLOCKED — nothing was saved or sent:\n\n${prepared.blockers.join("\n\n")}`);
   }
@@ -673,7 +692,7 @@ async function runDataset(rt: BatchRuntime, workflow: string, parsed: ParsedArgs
   notifySubmitted(rt, job, `${job.requestCount} request(s) in one batch`);
 }
 
-export function formatDatasetPreview(p: PreparedDatasetRun, previewOnly: boolean): string {
+export function formatDatasetPreview(p: PreparedDatasetRun, previewOnly: boolean, level?: PrivacyLevel): string {
   const def = p.definition;
   const plan = p.plan;
   const c = plan?.counts;
@@ -698,7 +717,7 @@ export function formatDatasetPreview(p: PreparedDatasetRun, previewOnly: boolean
       `Fields sent:       ${def.input.fields.join(", ")}  (only these reach the model; other columns are not read into prompts)`,
       `Model:             ${p.model}`,
       `Account:           ${p.account}`,
-      `Provider pin:      ${formatPin(p.pin)}`,
+      `Provider pin:      ${previewPin(p.pin, level)}`,
       `Output:            ${def.output.type === "json" ? "json — validated locally against the workflow's JSON Schema; invalid output makes the item corrupt" : "markdown"}`,
       `Characters:        ${plan.totalCharacters} provider-bound (not a token count; no cost estimate is made)`,
       `Largest item:      ${plan.largest ? `${plan.largest.characters} characters (${plan.largest.label})` : "-"}`,
@@ -807,7 +826,7 @@ async function cmdImportLegacy(rt: BatchRuntime, rest: string[], ctx: ExtensionC
   await showText(rt, ctx, "Legacy jobs (preview)", formatLegacyInventory(inventory));
 }
 
-function formatPlanPreview(p: PreparedPlan, previewOnly: boolean): string {
+function formatPlanPreview(p: PreparedPlan, previewOnly: boolean, level?: PrivacyLevel): string {
   const groups = p.workflow.options.groupSize > 1;
   const excluded = p.pkg.excluded;
   const lines = [
@@ -817,7 +836,7 @@ function formatPlanPreview(p: PreparedPlan, previewOnly: boolean): string {
     `Objective:         ${p.options.objective.replace(/\s+/g, " ").slice(0, 100)}`,
     `Model:             ${p.model}`,
     `Account:           ${p.account}`,
-    `Provider pin:      ${formatPin(p.pin)}`,
+    `Provider pin:      ${previewPin(p.pin, level)}`,
     `Requests:          ${p.items.length}`,
     `Selected files:    ${p.pkg.files.length}`,
     `Total characters:  ${p.totalCharacters}  (prompt characters; not a token count)`,
@@ -897,7 +916,7 @@ async function cmdSynthesize(rt: BatchRuntime, rest: string[], ctx: ExtensionCom
     providerPin: parsed.values.provider,
   });
   const previewOnly = parsed.booleans.has("preview");
-  const preview = formatSynthesisPreview(prepared, previewOnly);
+  const preview = formatSynthesisPreview(prepared, previewOnly, service.privacyConfig().level);
   if (prepared.blockers.length > 0) {
     throw new SubmissionBlockedError(`${preview}\n\nSYNTHESIS BLOCKED — nothing was saved or sent:\n\n${prepared.blockers.join("\n\n")}`);
   }
@@ -920,14 +939,14 @@ async function cmdSynthesize(rt: BatchRuntime, rest: string[], ctx: ExtensionCom
   notifySubmitted(rt, job, `synthesis of ${id}`);
 }
 
-function formatSynthesisPreview(p: PreparedSynthesis, previewOnly: boolean): string {
+function formatSynthesisPreview(p: PreparedSynthesis, previewOnly: boolean, level?: PrivacyLevel): string {
   const c = p.coverage;
   return [
     p.blockers.length > 0 ? "Synthesis plan (BLOCKED)" : previewOnly ? "Synthesis plan (not submitted)" : "Submitting synthesis",
     "",
     `Source job:        ${p.sourceJobId}`,
     `Model:             ${p.model}`,
-    `Provider pin:      ${formatPin(p.pin)}`,
+    `Provider pin:      ${previewPin(p.pin, level)}`,
     `Expected items:    ${c.expected}`,
     `Included items:    ${c.included}`,
     `Unusable items:    ${c.unusable.length}  (failed ${c.failed}, corrupt ${c.corrupt}, missing ${c.missing}${c.noResult ? `, no result ${c.noResult}` : ""})`,
@@ -988,8 +1007,34 @@ async function cmdView(rt: BatchRuntime, ctx: ExtensionCommandContext): Promise<
   }
 }
 
+async function cmdWeb(rt: BatchRuntime, rest: string[]): Promise<void> {
+  const parsed = parseArgs(rest, { values: ["port"], booleans: ["no-open"] });
+  if (parsed.errors.length > 0) throw new Error(`/batch web: ${parsed.errors.join("; ")}`);
+  const sub = parsed.positionals[0]?.toLowerCase();
+  if (sub === "stop" || sub === "off") {
+    if (!rt.webServer?.isRunning) {
+      rt.notify("Batch Web UI is not running.", "info");
+      return;
+    }
+    await rt.stopWebServer();
+    rt.notify("Batch Web UI stopped.", "info");
+    return;
+  }
+  const port = parsed.values.port !== undefined ? Number(parsed.values.port) : 0;
+  if (!Number.isInteger(port) || port < 0 || port > 65535) {
+    throw new Error("/batch web: --port must be an integer between 0 and 65535");
+  }
+  const srv = rt.ensureWebServer();
+  const url = await srv.start(port);
+  const launch = srv.createLaunchUrl() ?? url;
+  rt.notify(
+    `🌐 Batch Web UI running at ${url}\nOpen: ${launch}\n(One-time sign-in link; run /batch web again for a new one. Bound to 127.0.0.1 · /batch web stop to close it)`,
+    "info",
+  );
+}
+
 /** Long text: scrollable viewer in TUI, notification elsewhere (RPC). Never enters model context. */
-async function showText(rt: BatchRuntime, ctx: ExtensionCommandContext, title: string, body: string): Promise<void> {
+export async function showText(rt: BatchRuntime, ctx: ExtensionCommandContext, title: string, body: string): Promise<void> {
   if (ctx.hasUI && ctx.mode === "tui") {
     await ctx.ui.custom<void>((_tui, _theme, _kb, done) => new TextViewerComponent(title, body, () => done(undefined), () => process.stdout.rows ?? 24));
     return;

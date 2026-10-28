@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { prepareAttachments, type ChatAttachmentMeta, type UploadedFileInput } from "./attachments.js";
 import type { BatchConfig } from "./config.js";
 import { buildContextPackage, SYSTEM_PROMPT, type ContextPackage, type PackageInput } from "./context/package.js";
 import { formatSecretFindings, scanForSecrets } from "./context/secrets.js";
@@ -8,27 +9,34 @@ import { customIdFor, customIdProblems } from "./ids.js";
 import { combinedCoverage, isUsable, itemText, jobItems, resolveItem, sourceLabel, type Coverage } from "./items.js";
 import { nullLogger, type Logger } from "./logger.js";
 import { normalizeBatchModelSlug } from "./models.js";
+import type { ModelCatalog } from "./models/catalog.js";
 import { OpenRouterBatchClient, OpenRouterError, type RawExchange } from "./openrouter/client.js";
+import { immediateResultId, runImmediateJob, type ImmediateItemState, type ImmediateProgress } from "./openrouter/immediate.js";
 import { normaliseBatchResult, type NormalisedBatchResult } from "./openrouter/normalise-result.js";
-import { resolveRouting } from "./openrouter/routing.js";
-import { buildSubmitBody, submitBodyProblems, type BatchRequestItem, type ChatMessage, type ProviderPin, type SubmitBody } from "./openrouter/types.js";
+import { accountRequirementBlockers, allowListPin, allowedProviders, pinOutsideAllowList, resolveRouting } from "./openrouter/routing.js";
+import { buildSubmitBody, messageText, submitBodyProblems, type BatchRequestItem, type ChatMessage, type ProviderPin, type SubmitBody } from "./openrouter/types.js";
+import { effectiveLevel, resolveBatchProvider, routeForModel, stricter, type PrivacyLevel, type Route } from "./privacy/policy.js";
 import { compileOutputSchema, type OutputValidator } from "./workflows/structured.js";
 import { findWorkflow, formatDiagnostics, type WorkflowDefinition, type WorkflowEntry } from "./workflows/definition.js";
 import { planDatasetRun, type DatasetPlan, type EffectiveLimits } from "./workflows/dataset-run.js";
 import { resolveWorkspaceInput, resolveWorkspaceOutput } from "./workspace-paths.js";
 import { decodeDatasetBytes } from "./datasets/dataset.js";
-import { proposalProblems, type TableEvidence } from "./metadata/contract.js";
-import { METADATA_WORKFLOW, planMetadataRun, type MetadataPlan } from "./metadata/plan.js";
+import { promptEvidence, proposalProblems, type TableEvidence } from "./metadata/contract.js";
+import { metadataWorkflow, planMetadataRun, type MetadataPlan, type MetadataWorkflowId } from "./metadata/plan.js";
+import { standardsFromOptions, type MetadataStandards } from "./metadata/standards.js";
 import { buildExportRows, toCsv, toJsonl, writeExport } from "./export.js";
 import { inventoryLegacyJobs, type LegacyInventory } from "./legacy.js";
 import { ARTEFACTS, JobRegistry, JobUpdate } from "./registry.js";
 import { ACTIVE_STATUSES, POLLABLE_STATUSES, TERMINAL_STATUSES, type LocalStatus } from "./state.js";
 import { formatIsoShort, isoToEpochMs, nowIso, parseProviderTimestamp } from "./time.js";
 import {
+  CHAT_MANIFEST_SCHEMA_VERSION,
   DATASET_MANIFEST_SCHEMA_VERSION,
   MANIFEST_SCHEMA_VERSION,
+  isChatJob,
   isDatasetWorkflow,
   isMetadataWorkflow,
+  type ChatLinkage,
   type DatasetSelection,
   type DatasetWorkflowInfo,
   type ExportRecord,
@@ -48,6 +56,7 @@ export interface AskOptions {
   objective: string;
   files: string[];
   contexts: string[];
+  uploads?: UploadedFileInput[];
   model?: string;
   account?: string;
   /** Upstream provider slug to pin via `provider.only` (with allow_fallbacks: false). */
@@ -62,6 +71,7 @@ export interface PreparedAsk {
   account: string;
   pin?: ProviderPin;
   pkg: ContextPackage;
+  uploads?: ChatAttachmentMeta[];
   messages: ChatMessage[];
   contentSha256: string;
   /** Reasons the request must not be submitted (empty = OK). */
@@ -160,6 +170,9 @@ export interface MetadataRunOptions {
   model?: string;
   account?: string;
   providerPin?: string;
+  /** Opt-in UC standards mode: both or neither (domain slug and table prefix such as PNPT_). */
+  domain?: string;
+  ucPrefix?: string;
 }
 
 export interface PreparedMetadataRun {
@@ -178,7 +191,9 @@ export interface PreparedMetadataRun {
 }
 
 export interface StoredMetadataPlan {
-  workflow: typeof METADATA_WORKFLOW;
+  workflow: MetadataWorkflowId;
+  /** Present only for a standards-mode (version 2) job. */
+  standards?: MetadataStandards;
   context: MetadataWorkflowInfo["context"];
   input: MetadataWorkflowInfo["input"];
   planSha256: string;
@@ -186,10 +201,19 @@ export interface StoredMetadataPlan {
   createdAt: string;
 }
 
+export const IMMEDIATE_CHAT_ONLY = "Free models run only in batch chat (/batch chat); /batch ask and workflows need a batch model";
+
 export class SubmissionBlockedError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "SubmissionBlockedError";
+  }
+}
+
+export class ChatJobError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ChatJobError";
   }
 }
 
@@ -214,6 +238,13 @@ export interface ServiceDeps {
   onSettled?: (job: JobManifest) => void;
   /** For packaging tests only. */
   gitIgnored?: PackageInput["gitIgnored"];
+  /** Session model catalog; required for `zdr` batch jobs (without it they are refused). */
+  catalog?: ModelCatalog;
+  /**
+   * The `privacy` section read fresh at each decision (`readPrivacyConfig`), so a level raised by another process is
+   * honoured. Defaults to `getConfig().privacy`.
+   */
+  getPrivacy?: () => BatchConfig["privacy"];
 }
 
 export interface ReconcileOutcome {
@@ -230,7 +261,14 @@ interface JobDraft {
   objective: string;
   model: string;
   account: string;
+  /** The user's provider pin; replaced by the privacy decision before the body is built. */
   pin?: ProviderPin;
+  /** The thread's own level (chat); absent means the config's `privacy.level`. The stricter of the two applies. */
+  privacyLevel?: PrivacyLevel;
+  /** Explicit route; absent means derived from the model ID. */
+  route?: Route;
+  /** Re-check for an identical active job against the body as decided (the privacy pin can change it). */
+  checkDuplicate?: boolean;
   format: "markdown" | "json";
   items: Array<{
     source: ItemSource;
@@ -251,6 +289,7 @@ interface JobDraft {
   retryMode?: JobManifest["retryMode"];
   workflow?: WorkflowInfo;
   synthesis?: SynthesisLinkage;
+  chat?: ChatLinkage;
   /** Extra request artefacts (objective, context, manifests, plan, linkage). */
   writeArtefacts(localId: string, customIds: string[], itemShas: string[]): void;
   previewDetails: Record<string, unknown>;
@@ -262,11 +301,19 @@ const RECONCILE_STATUSES: ReadonlySet<LocalStatus> = new Set<LocalStatus>([...PO
 const INTERRUPTED_AFTER_MS = 30_000;
 /** Poll interval while an explicit user check waits for another check's lock. */
 const LOCK_RETRY_MS = 250;
+/** Remote batch deletion backoff: 30 s x 2^(attempt-1), capped at 1 h. */
+const DELETION_BACKOFF_BASE_MS = 30_000;
+const DELETION_BACKOFF_MAX_MS = 60 * 60_000;
+/** Remote batch deletion is abandoned (state "failed", needs attention) this long after the first attempt. */
+export const DELETION_TIME_LIMIT_MS = 24 * 60 * 60_000;
+/** Added to the request timeout: how long an immediate call recorded as started may still be in flight elsewhere. */
+const IMMEDIATE_IN_FLIGHT_MARGIN_MS = 30_000;
 /** How long `/batch check <id>` waits for an in-flight check before reporting "busy". */
 export const CHECK_LOCK_WAIT_MS = 10_000;
 
 export class BatchService {
   private readonly logger: Logger;
+  private threadLevel: ((threadId: string) => PrivacyLevel | undefined) | undefined;
 
   constructor(private readonly deps: ServiceDeps) {
     this.logger = deps.logger ?? nullLogger;
@@ -276,8 +323,25 @@ export class BatchService {
     return this.deps.registry;
   }
 
+  public get catalog(): ModelCatalog | undefined {
+    return this.deps.catalog;
+  }
+
   public get workspaceRoot(): string {
     return this.deps.workspaceRoot;
+  }
+
+  /** The privacy settings as they are now (fresh from the config files when wired so); used at every privacy decision. */
+  public privacyConfig(): BatchConfig["privacy"] {
+    return this.deps.getPrivacy?.() ?? this.deps.getConfig().privacy;
+  }
+
+  /**
+   * Batch chat registers how to read a thread's own (raised) level, so items sent later (after a 429 or a crash) go
+   * out at a level raised on the thread in the meantime.
+   */
+  public setThreadLevelLookup(lookup: (threadId: string) => PrivacyLevel | undefined): void {
+    this.threadLevel = lookup;
   }
 
   private client(apiKey: string): OpenRouterBatchClient {
@@ -285,7 +349,7 @@ export class BatchService {
     return this.deps.createClient ? this.deps.createClient(apiKey, timeoutMs) : new OpenRouterBatchClient({ apiKey, timeoutMs });
   }
 
-  private async knownSecrets(account: string): Promise<string[]> {
+  public async knownSecrets(account: string): Promise<string[]> {
     const out = new Set<string>();
     const env = process.env.OPENROUTER_API_KEY;
     if (env) out.add(env);
@@ -296,6 +360,10 @@ export class BatchService {
       // no key resolvable; nothing extra to protect
     }
     return [...out];
+  }
+
+  private assertNotChat(job: Pick<JobManifest, "kind" | "localId">): void {
+    if (isChatJob(job)) throw new ChatJobError(`${job.localId} is a batch chat job; use /batch chat instead.`);
   }
 
   private requestBody(messages: ChatMessage[]): BatchRequestItem["body"] {
@@ -309,8 +377,9 @@ export class BatchService {
     const objective = options.objective.trim();
     const model = normalizeBatchModelSlug(options.model ?? config.defaultModel);
     const account = options.account ?? config.defaultAccount;
-    const routing = resolveRouting(config, options.providerPin);
+    const routing = resolveRouting(config, options.providerPin, this.privacyConfig().level);
     const pin = routing.pin;
+    const knownSecrets = await this.knownSecrets(account);
     const pkg = buildContextPackage({
       workspaceRoot: this.deps.workspaceRoot,
       objective,
@@ -319,18 +388,45 @@ export class BatchService {
       includeInstructions: options.includeInstructions,
       format: options.format,
       config,
-      knownSecrets: await this.knownSecrets(account),
+      knownSecrets,
       gitIgnored: this.deps.gitIgnored,
     });
-    const messages = withSystemPrompt(options.includeInstructions, pkg.contextText);
 
     const blockers: string[] = [...routing.blockers];
     if (!objective) blockers.push("objective is empty");
     for (const p of pkg.problems) blockers.push(p.message);
     if (pkg.secretFindings.length > 0 && config.security.blockOnSecret) blockers.push(formatSecretFindings(pkg.secretFindings));
 
+    let uploadsMeta: ChatAttachmentMeta[] | undefined;
+    let userText = pkg.contextText;
+    let userParts: ChatMessage["parts"];
+    if (options.uploads && options.uploads.length > 0) {
+      const up = await prepareAttachments({
+        workspaceRoot: this.deps.workspaceRoot,
+        config,
+        knownSecrets,
+        input: { uploads: options.uploads },
+      });
+      uploadsMeta = up.attachments;
+      pkg.warnings.push(...up.warnings);
+      pkg.secretFindings.push(...up.secretFindings);
+      blockers.push(...up.blockers);
+      if (up.inlinedText) {
+        userText = `${userText.trimEnd()}\n\n${up.inlinedText}\n`;
+        pkg.contextText = userText;
+        pkg.characters = userText.length;
+      }
+      if (up.parts.length > 0) userParts = up.parts;
+    }
+
+    const messages = withSystemPrompt(options.includeInstructions, userText);
+    if (userParts && userParts.length > 0) {
+      const last = messages[messages.length - 1];
+      if (last && last.role === "user") last.parts = userParts;
+    }
+
     const contentSha256 = contentHash(buildSubmitBody({ model, provider: pin, requests: [{ custom_id: "{custom_id}", body: this.requestBody(messages) }] }));
-    return { options, model, account, pin, pkg, messages, contentSha256, blockers };
+    return { options, model, account, pin, pkg, ...(uploadsMeta ? { uploads: uploadsMeta } : {}), messages, contentSha256, blockers };
   }
 
   public findActiveDuplicate(contentSha256: string, excludeId?: string): JobManifest | undefined {
@@ -349,7 +445,7 @@ export class BatchService {
     const config = this.deps.getConfig();
     const { pkg } = prepared;
     const objective = prepared.options.objective.trim();
-    const job = this.persistJob({
+    const job = await this.persistJob({
       kind: "goal",
       objective,
       model: prepared.model,
@@ -367,6 +463,7 @@ export class BatchService {
       context: { fileCount: pkg.files.length, characters: pkg.characters, excludedCount: pkg.excluded.length },
       warnings: [...pkg.warnings],
       retryCount: 0,
+      checkDuplicate: !opts.previewOnly,
       writeArtefacts: (localId) => {
         atomicWriteFile(this.registry.artefact(localId, "objective"), objective + "\n");
         atomicWriteFile(this.registry.artefact(localId, "context"), pkg.contextText);
@@ -401,9 +498,17 @@ export class BatchService {
    * The single persistence path: allocates the local ID, derives provider-safe
    * custom_ids, validates the exact payload, writes the request artefacts
    * (whole-batch and per-item), then the manifest (draft -> previewed).
-   * Throws before anything is written if the payload is invalid.
+   * Throws before anything is written if the payload is invalid, or if the
+   * effective privacy level refuses the job (SubmissionBlockedError).
    */
-  private persistJob(draft: JobDraft): JobManifest {
+  private async persistJob(input: JobDraft): Promise<JobManifest> {
+    const { pin, route, privacy } = await this.decidePrivacy(input);
+    const draft: JobDraft = { ...input, pin };
+    if (draft.checkDuplicate) {
+      const masked = buildSubmitBody({ model: draft.model, provider: pin, requests: draft.items.map((it) => ({ custom_id: "{custom_id}", body: it.body })) });
+      const dup = this.findActiveDuplicate(contentHash(masked));
+      if (dup) throw new DuplicateActiveRequestError(dup.localId);
+    }
     const job = this.registry.create((localId) => {
       const customIds = draft.items.map((_, i) => customIdFor(localId, i));
       const body = buildSubmitBody({
@@ -451,6 +556,8 @@ export class BatchService {
         provider: "openrouter",
         account: draft.account,
         ...(draft.pin ? { providerPin: draft.pin } : {}),
+        ...(route !== "batch" ? { route } : {}),
+        privacy,
         endpoint: "/v1/chat/completions",
         format: draft.format,
         localStatus: "draft",
@@ -468,6 +575,7 @@ export class BatchService {
         })),
         ...(draft.workflow ? { workflow: draft.workflow } : {}),
         ...(draft.synthesis ? { synthesis: draft.synthesis } : {}),
+        ...(draft.chat ? { chat: draft.chat } : {}),
         createdAt: nowIso(),
         pollAttempts: 0,
         consecutivePollFailures: 0,
@@ -482,8 +590,49 @@ export class BatchService {
       u.transition("previewed", draft.previewDetails);
       return u.manifest;
     });
-    this.logger.log("info", "job_created", { localId: job.localId, kind: draft.kind, requests: job.requestCount, ...draft.previewDetails });
+    this.logger.log("info", "job_created", { localId: job.localId, kind: draft.kind, requests: job.requestCount, privacy: privacy.level, ...draft.previewDetails });
     return previewed;
+  }
+
+  /**
+   * Applies the effective privacy level (stricter of config and draft) before
+   * anything is written. Batch route: the policy's provider decision replaces
+   * the user's pin, or the job is refused. Immediate route: only recorded here
+   * (its provider fields are sent per request).
+   */
+  private async decidePrivacy(draft: JobDraft): Promise<{ pin?: ProviderPin; route: Route; privacy: NonNullable<JobManifest["privacy"]> }> {
+    const config = this.deps.getConfig();
+    const privacy = this.privacyConfig();
+    const level = effectiveLevel(privacy.level, draft.privacyLevel);
+    const route = routeForModel(draft.model, draft.route);
+    // routing.require* checked here, where the effective level (a chat thread's included) is known: zdr and
+    // no-training satisfy them (per request on the immediate route; by the ZDR pin or the attested account on batch).
+    const unmet = accountRequirementBlockers(config, level, route);
+    if (unmet.length) {
+      this.logger.log("warn", "routing_refused", { kind: draft.kind, level, model: draft.model });
+      throw new SubmissionBlockedError(unmet.join("\n\n"));
+    }
+    if (route === "immediate") {
+      // Spec non-goal (v1): immediate requests outside batch chat need a rate-paced queue.
+      if (draft.kind !== "chat") throw new SubmissionBlockedError(IMMEDIATE_CHAT_ONLY);
+      // The allow-list is sent as provider.only with each call (immediateStep); a user pin must still be within it.
+      const outsideList = pinOutsideAllowList(config, draft.pin);
+      if (outsideList) throw new SubmissionBlockedError(outsideList);
+      const enforcement = level === "zdr" ? "immediate: zdr=true" : level === "no-training" ? "immediate: data_collection=deny" : "none";
+      // The immediate body carries only the privacy fields, so a pin is never recorded as if it were sent.
+      return { route, privacy: { level, route, enforcement } };
+    }
+    const catalog = level === "zdr" ? await this.deps.catalog?.whenLoaded(config.polling.requestTimeoutSeconds * 1000) : undefined;
+    // routing.allowedProviders restricts every batch: a pin outside it is refused, and a job without a pin (chat) gets it.
+    const outside = pinOutsideAllowList(config, draft.pin);
+    if (outside) throw new SubmissionBlockedError(outside);
+    const userPin = draft.pin ?? allowListPin(config);
+    const decision = resolveBatchProvider({ level, model: draft.model, userPin, catalog, accountNoTraining: privacy.accountNoTraining, allowedProviders: allowedProviders(config) });
+    if (!decision.ok) {
+      this.logger.log("warn", "privacy_refused", { kind: draft.kind, level, model: draft.model });
+      throw new SubmissionBlockedError(decision.reason);
+    }
+    return { pin: decision.provider, route, privacy: { level, route, enforcement: decision.enforcement } };
   }
 
   // ------------------------------------------------------------ map-files
@@ -495,7 +644,7 @@ export class BatchService {
     const objective = options.objective.trim();
     const model = normalizeBatchModelSlug(options.model ?? config.defaultModel);
     const account = options.account ?? config.defaultAccount;
-    const routing = resolveRouting(config, options.providerPin);
+    const routing = resolveRouting(config, options.providerPin, this.privacyConfig().level);
     const pin = routing.pin;
     const groupSize = options.groupSize ?? 1;
     const workflow: MapFilesWorkflowInfo = { name: MAP_FILES.name, version: MAP_FILES.version, options: { groupSize, format: options.format, includeInstructions: options.includeInstructions } };
@@ -565,7 +714,7 @@ export class BatchService {
     this.assertNoActiveDuplicate(plan.contentSha256, opts.previewOnly);
     const config = this.deps.getConfig();
     const objective = plan.options.objective.trim();
-    const job = this.persistJob({
+    const job = await this.persistJob({
       kind: "workflow",
       objective,
       model: plan.model,
@@ -576,6 +725,7 @@ export class BatchService {
       context: { fileCount: plan.pkg.files.length, characters: plan.totalCharacters, excludedCount: plan.pkg.excluded.length },
       warnings: [...plan.pkg.warnings],
       retryCount: 0,
+      checkDuplicate: !opts.previewOnly,
       workflow: plan.workflow,
       writeArtefacts: (localId, customIds, itemShas) => {
         atomicWriteFile(this.registry.artefact(localId, "objective"), objective + "\n");
@@ -648,7 +798,7 @@ export class BatchService {
     const def = entry.definition;
     const model = normalizeBatchModelSlug(options.model ?? def.model.default ?? config.defaultModel);
     const pinSlug = options.providerPin ?? def.model.provider;
-    const routing = resolveRouting(config, pinSlug);
+    const routing = resolveRouting(config, pinSlug, this.privacyConfig().level);
     const pin = routing.pin;
     blockers.push(...routing.blockers);
     const maxTokens = def.request.maxTokens ?? config.request.maxTokens;
@@ -711,7 +861,7 @@ export class BatchService {
       selection: plan.selection,
       planSha256: plan.planSha256,
     };
-    const job = this.persistJob({
+    const job = await this.persistJob({
       kind: "workflow",
       schemaVersion: DATASET_MANIFEST_SCHEMA_VERSION,
       objective: prepared.objective,
@@ -730,6 +880,7 @@ export class BatchService {
       context: { fileCount: 1, characters: plan.totalCharacters, excludedCount: 0 },
       warnings: [...prepared.warnings],
       retryCount: 0,
+      checkDuplicate: !opts.previewOnly,
       workflow: info,
       writeArtefacts: (localId, customIds, itemShas) => {
         atomicWriteFile(this.registry.artefact(localId, "objective"), prepared.objective + "\n");
@@ -805,14 +956,24 @@ export class BatchService {
     const blockers: string[] = [];
     const account = options.account ?? config.defaultAccount;
     const model = normalizeBatchModelSlug(options.model ?? config.defaultModel);
-    const routing = resolveRouting(config, options.providerPin);
+    const routing = resolveRouting(config, options.providerPin, this.privacyConfig().level);
     const pin = routing.pin;
     blockers.push(...routing.blockers);
     const base: PreparedMetadataRun = { options, model, account, pin, maxTokens: config.request.maxTokens, objective: "", contentSha256: "", blockers, warnings: [] };
+    const mode = standardsFromOptions(options.domain, options.ucPrefix);
+    if (mode.error) {
+      blockers.push(mode.error);
+      return base;
+    }
     const read = (raw: string, what: string, maxBytes: number) => {
       const r = resolveWorkspaceInput(this.deps.workspaceRoot, raw, config, { what, maxBytes });
       if (!r.ok) {
         blockers.push(r.message);
+        return undefined;
+      }
+      // A raw notebook would send its cell outputs: Pass 2 takes the reviewed context, never a notebook.
+      if (/\.ipynb$/i.test(r.relPath)) {
+        blockers.push(`${r.relPath} is a notebook; use the reviewed <Domain>_context.md (Pass 1 output), not a notebook`);
         return undefined;
       }
       const bytes = fs.readFileSync(r.absPath);
@@ -834,25 +995,31 @@ export class BatchService {
       maxTokens: config.request.maxTokens,
       limits: { maxRequests: config.workflows.maxRequestsPerBatch, maxRows: config.workflows.maxRowsPerRun, maxCharactersPerItem: config.workflows.maxCharactersPerItem, maxTotalCharacters: config.workflows.maxTotalCharacters },
       security: { scanSecrets: config.security.scanSecrets, blockOnSecret: config.security.blockOnSecret, knownSecrets: await this.knownSecrets(account) },
+      ...(mode.standards ? { standards: mode.standards } : {}),
     });
     blockers.push(...plan.blockers);
     const contentSha256 = contentHash(buildSubmitBody({ model, provider: pin, requests: plan.items.map((it) => ({ custom_id: "{custom_id}", body: it.body })) }));
-    return { ...base, plan, context: { relPath: context.relPath, bytes: context.bytes.length, text: context.text }, input: { relPath: input.relPath, bytes: input.bytes.length }, objective: `Databricks metadata proposals for ${plan.tables} table(s) from ${input.relPath}`, contentSha256, warnings: plan.warnings };
+    // R7: metadata jobs have no thread, so the project level is the effective level. A warning, not a blocker.
+    const warnings = [...plan.warnings];
+    if (plan.tablesWithSamples > 0 && effectiveLevel(this.privacyConfig().level) === "standard") warnings.push("sample values will be sent at privacy level standard; consider /batch privacy zdr");
+    return { ...base, plan, context: { relPath: context.relPath, bytes: context.bytes.length, text: context.text }, input: { relPath: input.relPath, bytes: input.bytes.length }, objective: `Databricks metadata proposals for ${plan.tables} table(s) from ${input.relPath}`, contentSha256, warnings };
   }
 
   public async createMetadataJob(prepared: PreparedMetadataRun, opts: { previewOnly: boolean }): Promise<JobManifest> {
     const { plan, context, input } = prepared;
     if (prepared.blockers.length > 0 || !plan || !context || !input) throw new SubmissionBlockedError(prepared.blockers.join("\n\n") || "the metadata plan is incomplete");
     this.assertNoActiveDuplicate(prepared.contentSha256, opts.previewOnly);
+    const workflow = metadataWorkflow(plan.standards);
     const info: MetadataWorkflowInfo = {
-      name: METADATA_WORKFLOW.name,
-      version: METADATA_WORKFLOW.version,
+      name: workflow.name,
+      version: workflow.version,
+      ...(plan.standards ? { standards: plan.standards } : {}),
       origin: "builtin",
       context: { path: context.relPath, sha256: plan.contextSha256, bytes: context.bytes },
       input: { path: input.relPath, sha256: plan.inputSha256, bytes: input.bytes, tables: plan.tables, tablesWithSamples: plan.tablesWithSamples },
       planSha256: plan.planSha256,
     };
-    const job = this.persistJob({
+    const job = await this.persistJob({
       kind: "workflow",
       schemaVersion: DATASET_MANIFEST_SCHEMA_VERSION,
       objective: prepared.objective,
@@ -864,13 +1031,15 @@ export class BatchService {
       context: { fileCount: 2, characters: plan.totalCharacters, excludedCount: 0 },
       warnings: [...prepared.warnings],
       retryCount: 0,
+      checkDuplicate: !opts.previewOnly,
       workflow: info,
       writeArtefacts: (localId, customIds, itemShas) => {
         atomicWriteFile(this.registry.artefact(localId, "objective"), prepared.objective + "\n");
         // Exact copy of the shared context sent with every request.
         atomicWriteFile(this.registry.artefact(localId, "context"), context.text);
         atomicWriteJson(this.registry.artefact(localId, "metadataPlan"), {
-          workflow: METADATA_WORKFLOW,
+          workflow,
+          ...(plan.standards ? { standards: plan.standards } : {}),
           context: info.context,
           input: info.input,
           planSha256: plan.planSha256,
@@ -878,7 +1047,7 @@ export class BatchService {
           createdAt: nowIso(),
         });
       },
-      previewDetails: { workflow: METADATA_WORKFLOW.name, requests: plan.items.length, characters: plan.totalCharacters, planSha256: plan.planSha256 },
+      previewDetails: { workflow: workflow.name, requests: plan.items.length, characters: plan.totalCharacters, planSha256: plan.planSha256 },
     });
     if (opts.previewOnly) return job;
     return this.submit(job.localId, { skipDuplicateCheck: true });
@@ -894,12 +1063,15 @@ export class BatchService {
     if (isMetadataWorkflow(job.workflow)) {
       // Each item is checked against the evidence of ITS table (by the item's source, never the model's claim).
       try {
-        const byTable = new Map(this.metadataEvidence(job.localId).tables.map((t) => [t.table, t.evidence]));
+        const stored = this.metadataEvidence(job.localId);
+        // The standards stored with the job (copied to retries), never the current options.
+        const standards = stored.standards;
+        const byTable = new Map(stored.tables.map((t) => [t.table, t.evidence]));
         const items = job.items ?? [];
         return (value, customId) => {
           const it = items.find((i) => i.customId === customId);
           const ev = it?.source.sourceId !== undefined ? byTable.get(it.source.sourceId) : undefined;
-          return ev ? proposalProblems(value, ev) : ["no stored evidence for this item; its output cannot be validated"];
+          return ev ? proposalProblems(value, promptEvidence(ev, standards), standards) : ["no stored evidence for this item; its output cannot be validated"];
         };
       } catch {
         return () => ["the job's stored metadata evidence (request/metadata.json) is missing or unusable; output cannot be validated"];
@@ -927,15 +1099,33 @@ export class BatchService {
       if (job.localStatus !== "previewed") {
         throw new Error(`Job ${localId} is ${job.localStatus}; only previewed jobs can be submitted.`);
       }
+      // A preview made at a lower level (or before privacy levels) was never pinned for the current one.
+      const fresh = this.privacyConfig();
+      const current = fresh.level;
+      const recorded = job.privacy?.level ?? "standard";
+      if (current !== recorded && stricter(current, recorded) === current) {
+        throw new SubmissionBlockedError(`Privacy level ${current}: ${localId} was prepared at ${recorded}; cancel it and create it again`);
+      }
+      // A no-training batch job was allowed only on the account's attestation; it is not sent once that is withdrawn.
+      if (recorded === "no-training" && job.route !== "immediate" && !fresh.accountNoTraining) {
+        throw new SubmissionBlockedError(
+          `Privacy level no-training: ${localId} was prepared on your account's no-training attestation, but the attestation was removed; attest again (/batch privacy attest) or cancel it`,
+        );
+      }
+      // routing.* may have been tightened since the preview: its requirements are re-checked at the recorded level.
+      const routingConfig = this.deps.getConfig();
+      const unmet = accountRequirementBlockers(routingConfig, recorded, job.route === "immediate" ? "immediate" : "batch");
+      if (unmet.length) throw new SubmissionBlockedError(`Privacy level ${recorded}: ${localId} cannot be sent: ${unmet.join(" ")} It stays previewed.`);
       if (!opts.skipDuplicateCheck && job.contentSha256) {
         const dup = this.findActiveDuplicate(job.contentSha256, localId);
         if (dup) throw new DuplicateActiveRequestError(dup.localId);
       }
-      const bodyText = fs.readFileSync(this.registry.artefact(localId, "submittedRequest"), "utf8");
-      if (sha256Hex(bodyText) !== job.requestSha256) {
-        throw new Error(`Job ${localId}: submitted-request.json no longer matches request.sha256; refusing to submit.`);
+      const { bodyText, body } = this.storedRequest(job);
+      if (job.route !== "immediate" && allowedProviders(routingConfig).length) {
+        // The stored pin must still be within the current allow-list (a body with no pin is outside it).
+        const outside = body.provider ? pinOutsideAllowList(routingConfig, body.provider) : "the stored request has no provider pin, but routing.allowedProviders is now set";
+        if (outside) throw new SubmissionBlockedError(`Privacy level ${recorded}: ${localId} cannot be sent: ${outside}. Cancel it and create it again; it stays previewed.`);
       }
-      const body = JSON.parse(bodyText) as SubmitBody;
       // Re-validated at submit time too: previews made by earlier versions may predate a rule.
       const problems = [...customIdProblems(body.requests.map((r) => r.custom_id)), ...submitBodyProblems(body)];
       if (problems.length > 0) {
@@ -948,13 +1138,28 @@ export class BatchService {
         throw new Error(`Missing API key for account "${job.account}". Configure it in Pi (auth.json) or set OPENROUTER_API_KEY. Job ${localId} stays previewed.`);
       }
       const drift = this.workflowDrift(localId);
+      const immediate = job.route === "immediate";
       this.registry.update(localId, (u) => {
         if (drift) {
           u.note("workflow_changed_since_preview", { definitionFile: isDatasetWorkflow(job.workflow) ? job.workflow.definitionFile : undefined });
           if (!u.manifest.warnings.includes(drift)) u.manifest.warnings.push(drift);
         }
         u.transition("submitting");
+        if (immediate) {
+          // Nothing is sent yet: the per-item progress record (written before each call) is what
+          // makes the calls crash safe, so the job goes straight to in flight in this same write.
+          const m = u.manifest;
+          m.submittedAt = nowIso();
+          for (const it of m.items ?? []) if (it.status === "planned") it.status = "submitted";
+          m.nextPollAt = nowIso();
+          u.transition("submitted", { route: "immediate" });
+        }
       });
+      if (immediate) {
+        this.logger.log("info", "submit_immediate", { localId, model: job.model, requests: body.requests.length, privacy: job.privacy?.level });
+        await this.immediateStep(job.localId, body);
+        return this.registry.read(localId);
+      }
       this.logger.log("info", "submit_start", { localId, model: job.model, requests: body.requests.length });
 
       try {
@@ -1092,6 +1297,14 @@ export class BatchService {
         return u.manifest;
       });
     }
+    if (job.route === "immediate") {
+      if (!POLLABLE_STATUSES.has(job.localStatus)) return { localId, status: job.localStatus, polled: false, skipped: "not_pollable" };
+      // provider_completed (a recovered retrieval) rebuilds from saved progress without calling, so it is always due.
+      if (!opts.force && job.localStatus !== "provider_completed" && job.nextPollAt && isoToEpochMs(job.nextPollAt) > Date.now()) {
+        return { localId, status: job.localStatus, polled: false, skipped: "not_due" };
+      }
+      return this.immediateStep(localId, this.storedRequest(job).body);
+    }
     if (!POLLABLE_STATUSES.has(job.localStatus) || !job.providerBatchId) {
       return { localId, status: job.localStatus, polled: false, skipped: "not_pollable" };
     }
@@ -1144,11 +1357,14 @@ export class BatchService {
       } else if (s === "failed") {
         m.error = { code: "provider_failed", message: fetched.errorMessage ?? "OpenRouter reported the batch as failed" };
         u.transition("failed", { providerStatus: s });
+        this.markRemoteDeletion(u);
       } else if (s === "expired") {
         m.error = { code: "provider_expired", message: "OpenRouter did not complete the batch within its 24h window" };
         u.transition("expired", { providerStatus: s });
+        this.markRemoteDeletion(u);
       } else if (s === "cancelled") {
         u.transition("cancelled", { providerStatus: s });
+        this.markRemoteDeletion(u);
       } else if (providerChanged) {
         // validating / in_progress / finalizing / cancelling / unknown future values
         u.transition(m.localStatus === "cancel_requested" ? "cancel_requested" : "polling", { providerStatus: s });
@@ -1202,10 +1418,131 @@ export class BatchService {
     return { localId: job.localId, status: updated.localStatus, polled: true, error: e.message };
   }
 
+  /** The exact stored request body; refuses one that no longer matches its recorded hash. */
+  private storedRequest(job: JobManifest): { bodyText: string; body: SubmitBody } {
+    const bodyText = fs.readFileSync(this.registry.artefact(job.localId, "submittedRequest"), "utf8");
+    if (sha256Hex(bodyText) !== job.requestSha256) {
+      throw new Error(`Job ${job.localId}: submitted-request.json no longer matches request.sha256; refusing to submit.`);
+    }
+    return { bodyText, body: JSON.parse(bodyText) as SubmitBody };
+  }
+
+  /** The immediate route's per-item call state, rewritten atomically (provider/immediate-progress.json). */
+  private immediateProgress(localId: string): ImmediateProgress {
+    const file = this.registry.artefact(localId, "immediateProgress");
+    return {
+      // An unreadable record throws: nothing is sent when what was sent is unknown.
+      read: () => (fs.existsSync(file) ? (JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, ImmediateItemState>) : {}),
+      write: (state) => atomicWriteJson(file, state),
+    };
+  }
+
+  /**
+   * One immediate-route step (caller holds the job lock): sends the items that have no
+   * outcome yet through POST /chat/completions, then settles through the normal retrieval
+   * path, reschedules after a per-minute 429, or fails the job when the reply item failed.
+   */
+  private async immediateStep(localId: string, body: SubmitBody): Promise<ReconcileOutcome> {
+    let job = this.registry.read(localId);
+    const config = this.deps.getConfig();
+    let apiKey: string;
+    try {
+      apiKey = await this.deps.resolveApiKey(job.account);
+      if (!apiKey) throw new OpenRouterError("auth", undefined, `no API key available for account "${job.account}"`, "chat");
+    } catch (err) {
+      return this.recordPollError(job, err);
+    }
+    const level = this.immediateSendLevel(job);
+    const outcome = await runImmediateJob(job, body.requests, this.client(apiKey), level, undefined, {
+      progress: this.immediateProgress(localId),
+      inFlightMs: config.polling.requestTimeoutSeconds * 1000 + IMMEDIATE_IN_FLIGHT_MARGIN_MS,
+      // routing.allowedProviders applies to the immediate route too (read at send time, like the level).
+      allowList: { only: allowedProviders(config), allowFallbacks: config.routing.allowFallbacks },
+    });
+
+    if (outcome.kind === "in_flight") {
+      this.logger.log("info", "immediate_in_flight", { localId, item: outcome.ordinal, until: outcome.until });
+      return { localId, status: job.localStatus, polled: false, skipped: "locked" };
+    }
+    if (outcome.kind === "retry") {
+      job = this.registry.update(localId, (u) => {
+        const m = u.manifest;
+        m.consecutivePollFailures += 1;
+        m.pollAttempts += 1;
+        m.lastPollAt = nowIso();
+        m.nextPollAt = outcome.notBefore;
+        delete m.lastPollError; // OpenRouter answered: a rate limit is not a poll error
+        if (m.localStatus === "submitted") u.transition("polling", { route: "immediate" });
+        u.note("immediate_rate_limited", { reason: outcome.reason, notBefore: outcome.notBefore, consecutive: m.consecutivePollFailures });
+        return m;
+      });
+      this.logger.log("warn", "immediate_rate_limited", { localId, notBefore: outcome.notBefore, consecutive: job.consecutivePollFailures });
+      return { localId, status: job.localStatus, polled: true };
+    }
+    if (outcome.kind === "failed") {
+      job = this.registry.update(localId, (u) => {
+        const m = u.manifest;
+        m.lastPollAt = nowIso();
+        m.error = { code: outcome.code, message: outcome.message };
+        const first = m.items?.[0];
+        if (first) {
+          first.status = "failed";
+          first.error = { code: outcome.code, message: outcome.message };
+        }
+        u.transition("failed", { code: outcome.code, route: "immediate" });
+        return m;
+      });
+      this.logger.log("error", "immediate_failed", { localId, code: outcome.code });
+      this.deps.onSettled?.(job);
+      return { localId, status: job.localStatus, polled: true, error: outcome.message };
+    }
+    this.registry.update(localId, (u) => {
+      const m = u.manifest;
+      m.lastPollAt = nowIso();
+      m.consecutivePollFailures = 0;
+      delete m.lastPollError;
+      m.providerStatus = "completed";
+      if (m.localStatus === "submitted") u.transition("polling", { route: "immediate" });
+      if (m.localStatus !== "provider_completed") u.transition("provider_completed", { route: "immediate" });
+      u.transition("retrieving");
+    });
+    job = this.saveFinalAndFinish(localId, outcome.finalResponseText, { route: "immediate" });
+    if (TERMINAL_STATUSES.has(job.localStatus)) this.deps.onSettled?.(job);
+    return { localId, status: job.localStatus, polled: true };
+  }
+
+  /**
+   * The level an immediate item is sent at now: the stricter of the job's recorded level, the project level and the
+   * linked thread's own level. Never below the recorded level; an escalation is recorded as an event (once per level).
+   */
+  private immediateSendLevel(job: JobManifest): PrivacyLevel {
+    const recorded = job.privacy?.level ?? "standard";
+    let level = stricter(recorded, this.privacyConfig().level);
+    const threadId = job.chat?.threadId;
+    if (threadId && this.threadLevel) {
+      try {
+        const own = this.threadLevel(threadId);
+        if (own) level = stricter(level, own);
+      } catch (err) {
+        // A thread that can't be read (removed) leaves the recorded and project levels in force.
+        this.logger.log("warn", "thread_level_unreadable", { localId: job.localId, threadId, message: (err as Error).message });
+      }
+    }
+    if (level !== recorded) {
+      const already = this.registry.events(job.localId).some((e) => e.eventType === "privacy_escalated" && e.details?.level === level);
+      if (!already) {
+        this.registry.update(job.localId, (u) => u.note("privacy_escalated", { recorded, level }));
+        this.logger.log("info", "privacy_escalated", { localId: job.localId, recorded, level });
+      }
+    }
+    return level;
+  }
+
   private normalise(job: JobManifest, rawText: string): NormalisedBatchResult {
     return normaliseBatchResult(rawText, {
       localJobId: job.localId,
-      providerBatchId: job.providerBatchId!,
+      // Immediate jobs never have a provider batch: their final response carries a synthetic ID.
+      providerBatchId: job.route === "immediate" ? immediateResultId(job.localId) : job.providerBatchId!,
       expectedCustomIds: job.customIds,
       // Release 1 jobs never validated JSON output; keep their semantics.
       format: job.schemaVersion >= 2 ? job.format : "markdown",
@@ -1239,15 +1576,20 @@ export class BatchService {
       });
     }
 
+    return this.saveFinalAndFinish(localId, raw.bodyText, {});
+  }
+
+  /** In `retrieving`: saves the raw final response (write-once), records where it is, then settles from it. */
+  private saveFinalAndFinish(localId: string, rawText: string, details: Record<string, unknown>): JobManifest {
     // 1. Raw evidence first (write-once), and record where it is before interpreting it.
-    const finalPath = writeOnce(this.registry.artefact(localId, "finalResponse"), raw.bodyText);
+    const finalPath = writeOnce(this.registry.artefact(localId, "finalResponse"), rawText);
     const rel = path.relative(this.registry.jobDir(localId), finalPath).split(path.sep).join("/");
     this.registry.update(localId, (u) => {
       u.manifest.finalResponseFile = rel;
-      u.note("final_response_saved", { file: rel, bytes: Buffer.byteLength(raw.bodyText) });
+      u.note("final_response_saved", { file: rel, bytes: Buffer.byteLength(rawText) });
     });
     // 2..10. Interpret, write item artefacts and summary, settle the outcome.
-    return this.finishRetrieval(localId, raw.bodyText, finalPath, {});
+    return this.finishRetrieval(localId, rawText, finalPath, details);
   }
 
   /** Normalises a saved final response and settles the job. Idempotent: safe to re-run after a crash. */
@@ -1296,10 +1638,94 @@ export class BatchService {
         delete m.error;
       }
       u.transition(next, { finalResponse: path.basename(finalPath), ...counts, issues: normalised.issues.length ? normalised.issues : undefined, ...details });
+      // The raw final response is on disk.
+      this.markRemoteDeletion(u);
       return m;
     });
     this.logger.log(next === "ready" ? "info" : "warn", "retrieved", { localId, providerBatchId: job.providerBatchId, outcome: next, ...counts });
     return updated;
+  }
+
+  /**
+   * Marks a batch that has ended at OpenRouter (retrieved, failed, expired or cancelled) for deletion there, when this
+   * job's OWN recorded level is no-training or zdr and `deleteRemoteBatches` is on. Never on the current config level,
+   * and never for a batch OpenRouter already reported gone (410), which does not come through here.
+   */
+  private markRemoteDeletion(u: JobUpdate): void {
+    const m = u.manifest;
+    const ownLevel = m.privacy?.level;
+    if ((ownLevel !== "no-training" && ownLevel !== "zdr") || m.route === "immediate" || !m.providerBatchId || m.remoteDeletion) return;
+    if (!this.privacyConfig().deleteRemoteBatches) return;
+    m.remoteDeletion = { state: "pending", attempts: 0 };
+    u.note("remote_deletion_pending", { level: ownLevel, localStatus: m.localStatus });
+  }
+
+  /**
+   * Deletes ended batches at OpenRouter for jobs marked pending (strict levels only). Never changes localStatus; each
+   * attempt is an event. A failed attempt is retried with exponential backoff (`nextAttemptAt`: 30 s x 2^n, capped at
+   * 1 h); 24 hours after the first attempt the deletion is given up as `failed`, which needs the user's attention. A
+   * missing API key is not an attempt: it neither counts nor starts the 24-hour limit.
+   */
+  public async runRemoteDeletions(): Promise<void> {
+    const now = Date.now();
+    const pending = this.registry
+      .list()
+      .jobs.filter((j) => j.remoteDeletion?.state === "pending" && j.route !== "immediate" && j.providerBatchId && !(j.remoteDeletion.nextAttemptAt && isoToEpochMs(j.remoteDeletion.nextAttemptAt) > now));
+    for (const job of pending) {
+      const localId = job.localId;
+      let apiKey = "";
+      let keyError: string | undefined;
+      try {
+        apiKey = await this.deps.resolveApiKey(job.account);
+      } catch (err) {
+        keyError = (err as Error).message;
+      }
+      if (!apiKey) {
+        const lastError = `no API key available for account "${job.account}"${keyError ? ` (${keyError})` : ""}; not counted as an attempt`;
+        // Recorded (and logged) once per change, not on every pass: the job waits until a key is available.
+        if (job.remoteDeletion?.waitingForKey && job.remoteDeletion.lastError === lastError) continue;
+        this.registry.update(localId, (u) => {
+          const prev = u.manifest.remoteDeletion;
+          if (prev?.state === "pending") u.manifest.remoteDeletion = { ...prev, lastError, waitingForKey: true };
+          return u.manifest;
+        });
+        this.logger.log("warn", "remote_delete_no_key", { localId, account: job.account });
+        continue;
+      }
+      let deleted = false;
+      let error: string | undefined;
+      try {
+        const res = await this.client(apiKey).deleteBatch(job.providerBatchId!);
+        deleted = res.deleted;
+        if (!deleted) error = res.detail ? `not finished yet: ${res.detail}` : "not finished yet (HTTP 409)";
+      } catch (err) {
+        error = (err as Error).message;
+      }
+      this.registry.update(localId, (u) => {
+        const prev = u.manifest.remoteDeletion;
+        if (prev?.state !== "pending") return u.manifest;
+        const attempts = prev.attempts + 1;
+        const at = nowIso();
+        const firstAttemptAt = prev.firstAttemptAt ?? at;
+        if (deleted) {
+          u.manifest.remoteDeletion = { state: "done", attempts, at, firstAttemptAt };
+          u.note("remote_deletion_done", { attempts });
+          return u.manifest;
+        }
+        const lastError = error ?? "unknown error";
+        if (Date.now() - isoToEpochMs(firstAttemptAt) >= DELETION_TIME_LIMIT_MS) {
+          u.manifest.remoteDeletion = { state: "failed", attempts, lastError, at, firstAttemptAt };
+          u.note("remote_deletion_failed", { attempts, error });
+          return u.manifest;
+        }
+        const backoffMs = Math.min(DELETION_BACKOFF_MAX_MS, DELETION_BACKOFF_BASE_MS * 2 ** (attempts - 1));
+        const nextAttemptAt = new Date(Date.now() + backoffMs).toISOString();
+        u.manifest.remoteDeletion = { state: "pending", attempts, lastError, at, firstAttemptAt, nextAttemptAt };
+        u.note("remote_deletion_retry", { attempts, error, nextAttemptAt });
+        return u.manifest;
+      });
+      this.logger.log(deleted ? "info" : "warn", deleted ? "remote_deleted" : "remote_delete_failed", { localId, providerBatchId: job.providerBatchId, ...(error ? { error } : {}) });
+    }
   }
 
   private writeResultArtefacts(job: JobManifest, n: NormalisedBatchResult, finalPath: string): void {
@@ -1400,6 +1826,24 @@ export class BatchService {
     if (job.localStatus !== "submitted" && job.localStatus !== "polling" && job.localStatus !== "cancel_requested") {
       return { job, message: `${localId} is ${job.localStatus}; it cannot be cancelled now.` };
     }
+    if (job.route === "immediate") {
+      // No provider batch to cancel. Under the lock no call is in progress, so stopping here sends nothing more.
+      job = this.withLock(localId, () =>
+        this.registry.update(localId, (u) => {
+          const m = u.manifest;
+          if (m.localStatus !== "submitted" && m.localStatus !== "polling" && m.localStatus !== "cancel_requested") return m;
+          if (m.localStatus !== "cancel_requested") {
+            m.cancelRequestedAt = nowIso();
+            u.transition("cancel_requested");
+          }
+          u.transition("cancelled", { route: "immediate" });
+          return m;
+        }),
+      );
+      if (job.localStatus !== "cancelled") return { job, message: `${localId} is ${job.localStatus}; it cannot be cancelled now.` };
+      this.deps.onSettled?.(job);
+      return { job, message: `${localId} was cancelled; no further requests will be sent for it.` };
+    }
 
     if (job.localStatus !== "cancel_requested") {
       job = this.withLock(localId, () =>
@@ -1451,6 +1895,7 @@ export class BatchService {
   /** Every item of a finished job, re-run as a new linked job from the exact original request bodies. */
   public async retry(localId: string, opts: { model?: string } = {}): Promise<JobManifest> {
     const source = this.registry.read(localId);
+    this.assertNotChat(source);
     if (!TERMINAL_STATUSES.has(source.localStatus)) {
       throw new Error(`${localId} is ${source.localStatus}; only finished jobs (ready/partial/failed/cancelled/expired/corrupt) can be retried.`);
     }
@@ -1466,6 +1911,7 @@ export class BatchService {
    */
   public async retryItems(localId: string, opts: { failed?: boolean; selectors?: string[]; model?: string; previewOnly?: boolean }): Promise<JobManifest> {
     const source = this.registry.read(localId);
+    this.assertNotChat(source);
     if (!TERMINAL_STATUSES.has(source.localStatus)) {
       throw new Error(`${localId} is ${source.localStatus}; only finished jobs can have items retried.`);
     }
@@ -1510,13 +1956,15 @@ export class BatchService {
     }
 
     const model = opts.model ? normalizeBatchModelSlug(opts.model) : srcBody.model;
-    const promptOf = (body: BatchRequestItem["body"]) => body.messages.filter((m) => m.role === "user").map((m) => m.content).join("\n\n");
-    const child = this.persistJob({
+    const promptOf = (body: BatchRequestItem["body"]) => body.messages.filter((m) => m.role === "user").map((m) => messageText(m)).join("\n\n");
+    const child = await this.persistJob({
       kind: source.kind ?? "goal",
       objective: source.objective,
       model,
       account: source.account,
       pin: srcBody.provider,
+      // A retry never drops below the level its source was sent at (e.g. a zdr thread under a standard project).
+      ...(source.privacy ? { privacyLevel: source.privacy.level } : {}),
       format: source.format,
       items: bodies.map(({ item, body }) => ({
         source: item.source,
@@ -1610,6 +2058,7 @@ export class BatchService {
   public async prepareSynthesis(sourceJobId: string, opts: SynthesisOptions): Promise<PreparedSynthesis> {
     const config = this.deps.getConfig();
     const source = this.registry.read(sourceJobId);
+    this.assertNotChat(source);
     if (source.kind === "synthesis") throw new Error(`${sourceJobId} is itself a synthesis job; synthesize its source job instead.`);
     if (!TERMINAL_STATUSES.has(source.localStatus)) throw new Error(`${sourceJobId} is ${source.localStatus}; wait until it has finished.`);
     if (isDatasetWorkflow(source.workflow) && !source.workflow.synthesisEnabled) {
@@ -1617,7 +2066,7 @@ export class BatchService {
     }
     const model = normalizeBatchModelSlug(opts.model ?? config.defaultModel);
     const account = opts.account ?? source.account;
-    const routing = resolveRouting(config, opts.providerPin);
+    const routing = resolveRouting(config, opts.providerPin, effectiveLevel(this.privacyConfig().level, source.privacy?.level));
     const pin = routing.pin;
     const coverage = this.coverage(sourceJobId);
 
@@ -1684,12 +2133,14 @@ export class BatchService {
     this.assertNoActiveDuplicate(prepared.contentSha256, opts.previewOnly);
     const source = this.registry.read(prepared.sourceJobId);
     const objective = `Synthesis of ${prepared.sourceJobId}: ${source.objective}`;
-    const job = this.persistJob({
+    const job = await this.persistJob({
       kind: "synthesis",
       objective,
       model: prepared.model,
       account: prepared.account,
       pin: prepared.pin,
+      // Like a retry: a synthesis carries its source's results, so the stricter of the source's and the project's level applies.
+      ...(source.privacy ? { privacyLevel: source.privacy.level } : {}),
       format: "markdown",
       items: [
         {
@@ -1702,6 +2153,7 @@ export class BatchService {
       context: { fileCount: 0, characters: prepared.characters, excludedCount: prepared.linkage.excluded.length },
       warnings: prepared.linkage.excluded.length ? [`partial synthesis: ${prepared.linkage.excluded.length} of ${prepared.linkage.expectedItems} source item(s) not included`] : [],
       retryCount: 0,
+      checkDuplicate: !opts.previewOnly,
       synthesis: prepared.linkage,
       writeArtefacts: (localId) => {
         atomicWriteFile(this.registry.artefact(localId, "objective"), objective + "\n");
@@ -1714,6 +2166,53 @@ export class BatchService {
       this.registry.update(prepared.sourceJobId, (u) => u.note("synthesis_created", { synthesisJobId: job.localId, included: prepared.linkage.included.length, allowPartial: prepared.linkage.allowPartial })),
     );
     if (opts.previewOnly) return job;
+    return this.submit(job.localId, { skipDuplicateCheck: true });
+  }
+
+  /** Chat turn/compaction: item 1 is the reply (or summary), optional item 2 a title. Submitted immediately. */
+  public async createChatJob(input: {
+    threadId: string;
+    purpose: "turn" | "compact";
+    throughSeq: number;
+    model: string;
+    account: string;
+    pin?: ProviderPin;
+    /** The thread's own privacy level; the stricter of it and the config level applies. */
+    privacyLevel?: PrivacyLevel;
+    route?: Route;
+    main: ChatMessage[];
+    title?: ChatMessage[];
+  }): Promise<JobManifest> {
+    const objective = `${input.purpose === "turn" ? "Chat turn" : "Chat compaction"} in ${input.threadId}`;
+    const render = (m: ChatMessage[]): string => m.map((x) => x.content).join("\n\n");
+    const mk = (messages: ChatMessage[], label: string) => {
+      const prompt = render(messages);
+      return { source: { kind: "goal" as const, label }, body: this.requestBody(messages), characters: prompt.length, prompt };
+    };
+    const items = [mk(input.main, input.purpose === "turn" ? "chat-reply" : "chat-summary")];
+    if (input.title) items.push(mk(input.title, "chat-title"));
+    const characters = items.reduce((n, it) => n + it.characters, 0);
+    const chat: ChatLinkage = { threadId: input.threadId, purpose: input.purpose, throughSeq: input.throughSeq, titleItem: input.title !== undefined };
+    const job = await this.persistJob({
+      kind: "chat",
+      schemaVersion: CHAT_MANIFEST_SCHEMA_VERSION,
+      objective,
+      model: input.model,
+      account: input.account,
+      pin: input.pin,
+      ...(input.privacyLevel ? { privacyLevel: input.privacyLevel } : {}),
+      ...(input.route ? { route: input.route } : {}),
+      format: "markdown",
+      items,
+      context: { fileCount: 0, characters, excludedCount: 0 },
+      warnings: [],
+      retryCount: 0,
+      chat,
+      writeArtefacts: (localId) => {
+        atomicWriteFile(this.registry.artefact(localId, "objective"), objective + "\n");
+      },
+      previewDetails: { threadId: input.threadId, purpose: input.purpose, characters },
+    });
     return this.submit(job.localId, { skipDuplicateCheck: true });
   }
 
@@ -1739,6 +2238,7 @@ export class BatchService {
    */
   public exportResults(localId: string, opts: { format: "jsonl" | "csv"; out?: string; overwrite?: boolean; jobOnly?: boolean }): ExportRecord {
     const job = this.registry.read(localId);
+    this.assertNotChat(job);
     if (!TERMINAL_STATUSES.has(job.localStatus)) throw new Error(`${localId} is ${job.localStatus}; only finished jobs can be exported.`);
     const combined = !opts.jobOnly;
     const rows = buildExportRows(this.registry, job, { combined });
@@ -1978,6 +2478,7 @@ export class BatchService {
       return this.buildInjection(syn.localId, mode);
     }
     const job = this.registry.read(localId);
+    this.assertNotChat(job);
     if (job.localStatus !== "ready" && job.localStatus !== "partial") {
       return {
         ok: false,

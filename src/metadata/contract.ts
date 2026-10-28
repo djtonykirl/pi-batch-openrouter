@@ -1,6 +1,7 @@
 import { Ajv } from "ajv";
 import { canonicalJson, sha256Hex } from "../fsutil.js";
 import { formatErrors } from "../workflows/structured.js";
+import { BOOLEAN_TAG, CLASSIFICATIONS, PII_TYPES, SENSITIVITIES, columnCommentProblems, descriptionProblems, isAuditColumn, piiTextProblems, type MetadataStandards, type PiiTags } from "./standards.js";
 
 /**
  * Databricks metadata enrichment: the data contracts.
@@ -10,13 +11,18 @@ import { formatErrors } from "../workflows/structured.js";
  *   approved.jsonl the reviewed handoff back to Databricks (no SQL, no instructions)
  *
  * All three are validated strictly: unknown fields are rejected, nothing is
- * coerced or defaulted. Only descriptions and column comments are in scope.
+ * coerced or defaulted. Only descriptions and column comments are in scope, plus
+ * (in opt-in standards mode, see standards.ts) the classification and column PII tags.
  *
  * tables.jsonl contract v2 is a strict superset of v1: it adds optional,
  * already-obfuscated evidence computed inside Databricks (a per-column `profile`
  * and table-level layer/grain/lineage fields). Every v1 line is a valid v2 line and
  * hashes exactly as before. The schema mirrors the Databricks side's
  * `contract/tables.v2.schema.json` field for field (checked by test).
+ *
+ * Pi also accepts optional `existing_tags` (ungoverned UC tags) on tables and columns,
+ * used by standards mode; it is not part of the Databricks v2 contract file (see
+ * PI_TABLE_EVIDENCE_SCHEMA).
  */
 
 /** catalog.schema.table: three non-empty parts without whitespace, dots or control characters. */
@@ -24,6 +30,9 @@ export const TABLE_NAME_PATTERN = "^[^.\\s\\u0000-\\u001f`]+\\.[^.\\s\\u0000-\\u
 export const CONFIDENCE = ["high", "medium", "low", "insufficient"] as const;
 export type Confidence = (typeof CONFIDENCE)[number];
 const MAX_SAMPLES = 20;
+
+/** Ungoverned UC tags: key to string value. Key order is significant in the handoff. */
+export type TagMap = Record<string, string>;
 
 /** 0 open (reference values), 1 shape, 2 statistics, 3 label only. */
 export type DisclosureTier = 0 | 1 | 2 | 3;
@@ -50,6 +59,7 @@ export interface ColumnEvidence {
   data_type: string;
   nullable: boolean;
   existing_comment: string | null;
+  existing_tags?: TagMap;
   sample_values?: Array<string | number | boolean | null>;
   /** v2 only. */
   profile?: ColumnProfile;
@@ -58,6 +68,7 @@ export interface ColumnEvidence {
 export interface TableEvidence {
   table: string;
   existing_description: string | null;
+  existing_tags?: TagMap;
   columns: ColumnEvidence[];
   /** v2 only: "2" makes a profile required on every column. */
   contract_version?: "2";
@@ -84,19 +95,40 @@ export interface ColumnProposal {
   comment: string | null;
   confidence: Confidence;
   reason: string;
+  /** Standards mode only: PII tags for a column that holds personal data, otherwise null. */
+  pii_tags?: PiiTags | null;
 }
 
 export interface TableProposal {
   table: string;
+  /** Standards mode only. */
+  classification?: string;
   table_description: { comment: string | null; confidence: Confidence; reason: string };
   columns: ColumnProposal[];
 }
 
+export interface ApprovedColumn {
+  name: string;
+  existing_comment: string | null;
+  approved_comment: string | null;
+  /** Standards mode only (required there, rejected on a version 1 job). */
+  existing_tags?: TagMap;
+  approved_tags?: TagMap;
+}
+
+/**
+ * One table of approved.jsonl. Key order is part of the contract (TDD §3.3):
+ * table, existing_description, approved_description, [existing_tags, approved_tags,]
+ * columns[name, existing_comment, approved_comment, [existing_tags, approved_tags]], provenance.
+ * Version 1 rows carry no tag keys.
+ */
 export interface ApprovedRow {
   table: string;
   existing_description: string | null;
   approved_description: string | null;
-  columns: Array<{ name: string; existing_comment: string | null; approved_comment: string | null }>;
+  existing_tags?: TagMap;
+  approved_tags?: TagMap;
+  columns: ApprovedColumn[];
   provenance: {
     job_id: string;
     result_job_id: string | null;
@@ -108,6 +140,7 @@ export interface ApprovedRow {
 }
 
 const nullableText = { anyOf: [{ type: "string", minLength: 1, maxLength: 4000 }, { type: "null" }] };
+const tagMap = { type: "object", maxProperties: 50, propertyNames: { minLength: 1, maxLength: 255 }, additionalProperties: { type: "string", maxLength: 1000 } };
 
 /**
  * tables.jsonl line, contract v2 (strict superset of v1). Tier rules are schema-enforced:
@@ -213,6 +246,20 @@ export const TABLE_EVIDENCE_SCHEMA = {
   then: { properties: { columns: { items: { required: ["profile"] } } } },
 } as const;
 
+/**
+ * What Pi validates tables.jsonl lines against: the Databricks contract above (kept a verbatim
+ * mirror) plus the optional `existing_tags` on the table and on each column (standards mode).
+ * Both are optional, so v1 and v2 lines validate and hash exactly as before.
+ */
+export const PI_TABLE_EVIDENCE_SCHEMA = {
+  ...TABLE_EVIDENCE_SCHEMA,
+  definitions: {
+    ...TABLE_EVIDENCE_SCHEMA.definitions,
+    column: { ...TABLE_EVIDENCE_SCHEMA.definitions.column, properties: { ...TABLE_EVIDENCE_SCHEMA.definitions.column.properties, existing_tags: tagMap } },
+  },
+  properties: { ...TABLE_EVIDENCE_SCHEMA.properties, existing_tags: tagMap },
+} as const;
+
 const confidenceProp = { enum: [...CONFIDENCE] };
 const reasonProp = { type: "string", minLength: 1, maxLength: 2000 };
 const commentProp = { anyOf: [{ type: "string", minLength: 1, maxLength: 4000 }, { type: "null" }] };
@@ -242,46 +289,100 @@ export const PROPOSAL_SCHEMA = {
   },
 } as const;
 
-export const APPROVED_SCHEMA = {
+const piiTagsProp = {
+  anyOf: [
+    { type: "null" },
+    {
+      type: "object",
+      additionalProperties: false,
+      required: ["pii_type", "sensitivity", "requires_masking"],
+      properties: { pii_type: { enum: [...PII_TYPES] }, sensitivity: { enum: [...SENSITIVITIES] }, requires_masking: { enum: [...BOOLEAN_TAG] } },
+    },
+  ],
+};
+
+/**
+ * Standards mode (workflow version 2): v1 plus the table `classification` and each
+ * column's `pii_tags`. The model never proposes data_domain, uc_prefix,
+ * medallion_layer or the table pii tag; Pi derives those (standards.ts).
+ */
+export const PROPOSAL_SCHEMA_V2 = {
   type: "object",
   additionalProperties: false,
-  required: ["table", "existing_description", "approved_description", "columns", "provenance"],
+  required: ["table", "classification", "table_description", "columns"],
   properties: {
-    table: { type: "string", pattern: TABLE_NAME_PATTERN },
-    existing_description: nullableText,
-    approved_description: nullableText,
+    table: { type: "string" },
+    classification: { enum: [...CLASSIFICATIONS] },
+    table_description: PROPOSAL_SCHEMA.properties.table_description,
     columns: {
       type: "array",
-      minItems: 1,
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["name", "existing_comment", "approved_comment"],
-        properties: { name: { type: "string", minLength: 1 }, existing_comment: nullableText, approved_comment: nullableText },
-      },
-    },
-    provenance: {
-      type: "object",
-      additionalProperties: false,
-      required: ["job_id", "result_job_id", "result_custom_id", "input_sha256", "context_sha256", "proposal_sha256"],
-      properties: {
-        job_id: { type: "string", pattern: "^B-\\d{8}-[0-9A-Z]{4,8}$" },
-        result_job_id: { anyOf: [{ type: "string" }, { type: "null" }] },
-        result_custom_id: { anyOf: [{ type: "string" }, { type: "null" }] },
-        input_sha256: { type: "string", pattern: "^[0-9a-f]{64}$" },
-        context_sha256: { type: "string", pattern: "^[0-9a-f]{64}$" },
-        proposal_sha256: { anyOf: [{ type: "string", pattern: "^[0-9a-f]{64}$" }, { type: "null" }] },
+        required: ["name", "comment", "confidence", "reason", "pii_tags"],
+        properties: { ...PROPOSAL_SCHEMA.properties.columns.items.properties, pii_tags: piiTagsProp },
       },
     },
   },
 } as const;
 
+/**
+ * approved.jsonl row schema. `tags` decides the tag keys: "none" is the version 1
+ * contract (tag keys are unknown properties), "optional" is the published schema,
+ * and "required" is what a standards-mode (version 2) job's rows must satisfy.
+ */
+function approvedSchema(tags: "none" | "optional" | "required") {
+  const tagProps = tags === "none" ? {} : { existing_tags: tagMap, approved_tags: tagMap };
+  const tagKeys = tags === "required" ? ["existing_tags", "approved_tags"] : [];
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["table", "existing_description", "approved_description", ...tagKeys, "columns", "provenance"],
+    properties: {
+      table: { type: "string", pattern: TABLE_NAME_PATTERN },
+      existing_description: nullableText,
+      approved_description: nullableText,
+      ...tagProps,
+      columns: {
+        type: "array",
+        minItems: 1,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["name", "existing_comment", "approved_comment", ...tagKeys],
+          properties: { name: { type: "string", minLength: 1 }, existing_comment: nullableText, approved_comment: nullableText, ...tagProps },
+        },
+      },
+      provenance: APPROVED_PROVENANCE,
+    },
+  };
+}
+
+const APPROVED_PROVENANCE = {
+  type: "object",
+  additionalProperties: false,
+  required: ["job_id", "result_job_id", "result_custom_id", "input_sha256", "context_sha256", "proposal_sha256"],
+  properties: {
+    job_id: { type: "string", pattern: "^B-\\d{8}-[0-9A-Z]{4,8}$" },
+    result_job_id: { anyOf: [{ type: "string" }, { type: "null" }] },
+    result_custom_id: { anyOf: [{ type: "string" }, { type: "null" }] },
+    input_sha256: { type: "string", pattern: "^[0-9a-f]{64}$" },
+    context_sha256: { type: "string", pattern: "^[0-9a-f]{64}$" },
+    proposal_sha256: { anyOf: [{ type: "string", pattern: "^[0-9a-f]{64}$" }, { type: "null" }] },
+  },
+} as const;
+
+/** The published approved.jsonl schema: tag keys allowed; validateApprovedText requires or rejects them by job version. */
+export const APPROVED_SCHEMA = approvedSchema("optional");
+
 // strictRequired is off because the v2 tier rules use `if: { required: [...] }` conditionals
 // (an authoring check only; validation is unchanged).
 const ajv = new Ajv({ allErrors: true, strict: true, strictTypes: false, strictRequired: false, coerceTypes: false, useDefaults: false, removeAdditional: false, logger: false });
-const tableValidator = ajv.compile(TABLE_EVIDENCE_SCHEMA);
+const tableValidator = ajv.compile(PI_TABLE_EVIDENCE_SCHEMA);
 const proposalValidator = ajv.compile(PROPOSAL_SCHEMA);
-const approvedValidator = ajv.compile(APPROVED_SCHEMA);
+const proposalValidatorV2 = ajv.compile(PROPOSAL_SCHEMA_V2);
+const approvedValidatorV1 = ajv.compile(approvedSchema("none"));
+const approvedValidatorV2 = ajv.compile(approvedSchema("required"));
 
 /** Databricks identifiers are case-insensitive: duplicates are compared case-insensitively. */
 export const identityKey = (s: string): string => s.toLowerCase();
@@ -305,13 +406,22 @@ export function evidenceHash(t: TableEvidence): string {
   return sha256Hex(canonicalJson(t));
 }
 
+/** The evidence sent to the model: in standards mode, without the framework audit columns. */
+export function promptEvidence(ev: TableEvidence, standards?: MetadataStandards): TableEvidence {
+  if (!standards) return ev;
+  return { ...ev, columns: ev.columns.filter((c) => !isAuditColumn(c.name)) };
+}
+
 /**
  * Proposal checks for one table: the JSON Schema, then deterministic consistency
- * with the evidence the request was built from. They check identity and
- * structure, not whether the prose is right.
+ * with the evidence the request was built from (`expected` is the evidence as sent,
+ * see promptEvidence). They check identity and structure, not whether the prose is
+ * right. With `standards`, the v2 schema applies, and every non-null comment must
+ * follow the description/comment formats and carry no PII-looking text.
  */
-export function proposalProblems(value: unknown, expected: TableEvidence): string[] {
-  if (!proposalValidator(value)) return formatErrors(proposalValidator.errors ?? []);
+export function proposalProblems(value: unknown, expected: TableEvidence, standards?: MetadataStandards): string[] {
+  const validator = standards ? proposalValidatorV2 : proposalValidator;
+  if (!validator(value)) return formatErrors(validator.errors ?? []);
   const p = value as TableProposal;
   const problems: string[] = [];
   if (p.table !== expected.table) problems.push(`/table is not the requested table (expected ${JSON.stringify(expected.table)})`);
@@ -333,9 +443,20 @@ export function proposalProblems(value: unknown, expected: TableEvidence): strin
   };
   consistency("/table_description", p.table_description);
   p.columns.forEach((c, i) => consistency(`/columns/${i}`, c));
+  if (standards) {
+    const td = p.table_description.comment;
+    if (td !== null) problems.push(...[...descriptionProblems(td, p.classification), ...piiTextProblems(td)].map((m) => `/table_description/comment: ${m}`));
+    p.columns.forEach((c, i) => {
+      if (c.comment !== null) problems.push(...[...columnCommentProblems(c.comment), ...piiTextProblems(c.comment)].map((m) => `/columns/${i}/comment: ${m}`));
+    });
+    const piiColumns = p.columns.filter((c) => c.pii_tags).length;
+    if (p.classification === "public" && piiColumns > 0) problems.push(`/classification: "public" is not allowed when a column has pii_tags (${piiColumns} column(s)); use a stricter classification`);
+  }
   return problems;
 }
 
-export function approvedRowProblems(value: unknown): string[] {
-  return approvedValidator(value) ? [] : formatErrors(approvedValidator.errors ?? []);
+/** Schema problems of one approved row: version 1 rejects tag keys; standards mode requires them. */
+export function approvedRowProblems(value: unknown, standards?: MetadataStandards): string[] {
+  const validator = standards ? approvedValidatorV2 : approvedValidatorV1;
+  return validator(value) ? [] : formatErrors(validator.errors ?? []);
 }

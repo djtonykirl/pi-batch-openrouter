@@ -22,11 +22,18 @@ export class BatchPoller {
     private readonly getService: () => BatchService | null,
     private readonly isEnabled: () => boolean,
     private readonly onBadge?: BadgeCallback,
+    /** Runs after every pass (chat housekeeping). Errors are swallowed so scheduling never stops. */
+    private readonly onTick?: () => Promise<void>,
   ) {}
 
   public start(): void {
     this.stopped = false;
     this.schedule(0);
+  }
+
+  /** True between start() and stop(). */
+  public get isRunning(): boolean {
+    return !this.stopped;
   }
 
   public stop(): void {
@@ -82,6 +89,16 @@ export class BatchPoller {
         outcomes.push({ localId: job.localId, status: job.localStatus, polled: false, error: (err as Error).message });
       }
     }
+    try {
+      await service.runRemoteDeletions();
+    } catch {
+      // Deletion is best-effort and retried on the next pass; it never affects polling.
+    }
+    try {
+      await this.onTick?.();
+    } catch {
+      // The tick owner logs its own failures; polling must carry on.
+    }
     return outcomes;
   }
 
@@ -104,10 +121,15 @@ export function badgeText(jobs: readonly JobManifest[]): string | undefined {
   const partial = jobs.filter((j) => j.localStatus === "partial" && !j.injectedAt).length;
   const ready = jobs.filter((j) => j.localStatus === "ready" && !j.injectedAt).length;
   const attention = jobs.filter((j) => (j.localStatus === "corrupt" || (ACTIVE_STATUSES.has(j.localStatus) && j.lastPollError)) && !j.injectedAt).length;
+  // A batch that could not be deleted at OpenRouter stays there (up to 30 days): the user has to act.
+  const deletionFailed = jobs.filter((j) => j.remoteDeletion?.state === "failed").length;
+  const deletionNoKey = jobs.filter((j) => j.remoteDeletion?.state === "pending" && j.remoteDeletion.waitingForKey).length;
   const parts: string[] = [];
   if (active) parts.push(`${active} active`);
   if (partial) parts.push(`${partial} partial`);
   if (ready) parts.push(`${ready} ready`);
   if (attention) parts.push(`${attention} attention`);
+  if (deletionFailed) parts.push(`${deletionFailed} remote deletion failed`);
+  if (deletionNoKey) parts.push(`${deletionNoKey} remote deletion waiting for an API key`);
   return parts.length ? `📦 Batch: ${parts.join(" | ")}` : undefined;
 }

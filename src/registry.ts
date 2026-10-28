@@ -46,6 +46,8 @@ export const ARTEFACTS = {
   submissionResponse: "provider/submission-response.json",
   latestStatus: "provider/latest-status.json",
   finalResponse: "provider/final-response.json",
+  /** Immediate route: per-item call state (started / completed / failed), rewritten atomically before and after each call. */
+  immediateProgress: "provider/immediate-progress.json",
   cancelResponse: "provider/cancel-response.json",
   resultMd: "result/result.md",
   resultJson: "result/result.json",
@@ -198,7 +200,7 @@ export class JobRegistry {
       throw new CorruptManifestError(localId, (err as Error).message);
     }
     const m = parsed as Partial<JobManifest>;
-    if (!m || m.localId !== localId || !isLocalStatus(m.localStatus) || (m.schemaVersion !== 1 && m.schemaVersion !== 2 && m.schemaVersion !== 3)) {
+    if (!m || m.localId !== localId || !isLocalStatus(m.localStatus) || (m.schemaVersion !== 1 && m.schemaVersion !== 2 && m.schemaVersion !== 3 && m.schemaVersion !== 4)) {
       throw new CorruptManifestError(localId, "missing or invalid localId/localStatus/schemaVersion");
     }
     return m as JobManifest;

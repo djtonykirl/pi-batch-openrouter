@@ -1,6 +1,8 @@
 import type { Component } from "@earendil-works/pi-tui";
 import { matchesKey, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { ACTIVE_STATUSES, TERMINAL_STATUSES as TERMINAL, type LocalStatus } from "./state.js";
+import { formatPin } from "./openrouter/routing.js";
+import { RETENTION_DELETED, RETENTION_KEPT } from "./privacy/policy.js";
 import { formatIsoShort } from "./time.js";
 import { sourceLabel } from "./items.js";
 import { isDatasetWorkflow, isMetadataWorkflow, type JobManifest } from "./types.js";
@@ -177,13 +179,17 @@ export function describeJob(job: JobManifest, storageDir?: string): string[] {
   const multi = (job.items?.length ?? 0) > 1;
   const rows: Array<[string, string | number | undefined]> = [
     ["Job", job.localId],
-    ["Provider batch ID", job.providerBatchId],
+    ["Provider batch ID", job.providerBatchId ?? (job.route === "immediate" ? "none (immediate route)" : undefined)],
+    ["Route", job.route ?? job.privacy?.route],
+    ["Privacy", job.privacy?.level],
+    ["Enforcement", job.privacy?.enforcement],
+    ["Remote deletion", remoteDeletionCell(job)],
     ["Local status", job.localStatus],
     ["Provider status", job.providerStatus],
     ["Objective", job.objective.replace(/\s+/g, " ")],
     ["Model", job.model],
     ["Account", job.account],
-    ["Provider pin", job.providerPin ? `${job.providerPin.only.join(",")} (fallbacks ${job.providerPin.allow_fallbacks === false ? "off" : "on"})` : undefined],
+    ["Provider pin", job.providerPin ? formatPin(job.providerPin) : undefined],
     ["Parent job", job.parentJobId],
     ["Retry count", job.retryCount || undefined],
     ["Kind", job.kind && job.kind !== "goal" ? job.kind : undefined],
@@ -220,6 +226,28 @@ export function describeJob(job: JobManifest, storageDir?: string): string[] {
   const lines = rows.filter(([, v]) => v !== undefined && v !== "").map(([k, v]) => `  ${k.padEnd(20)} ${v}`);
   for (const w of job.warnings) lines.push(`  ${"Warning".padEnd(20)} ${w}`);
   return lines;
+}
+
+function remoteDeletionCell(job: JobManifest): string | undefined {
+  const d = job.remoteDeletion;
+  if (!d) return undefined;
+  const at = d.at ? ` ${formatIsoShort(d.at)}` : "";
+  const err = d.lastError ? `, last error: ${d.lastError}` : "";
+  const next = d.state === "pending" && d.nextAttemptAt ? `, next attempt ${formatIsoShort(d.nextAttemptAt)}` : "";
+  const cell = `${d.state}${at} (${d.attempts} attempt${d.attempts === 1 ? "" : "s"}${next}${err})`;
+  if (d.state === "failed") return `${cell}; NEEDS ATTENTION: the batch is still at OpenRouter (kept up to 30 days); delete it there`;
+  return d.state === "pending" && d.waitingForKey ? `${cell}; waiting for an API key for account "${job.account}" before it can be deleted` : cell;
+}
+
+/**
+ * Where a batch job's data stays at OpenRouter, for a job not (yet) marked for deletion; undefined for an immediate
+ * job or one marked for deletion (its "Remote deletion" row says what happened). A strict-level job that is still
+ * running will be deleted when it ends; any other job is kept up to 30 days.
+ */
+export function retentionLine(job: JobManifest, deleteRemoteBatches: boolean): string | undefined {
+  if ((job.route ?? "batch") !== "batch" || job.remoteDeletion) return undefined;
+  const strict = job.privacy?.level === "no-training" || job.privacy?.level === "zdr";
+  return strict && deleteRemoteBatches && !TERMINAL.has(job.localStatus) ? RETENTION_DELETED : RETENTION_KEPT;
 }
 
 function workflowCell(job: JobManifest): string | undefined {
