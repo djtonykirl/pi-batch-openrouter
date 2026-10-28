@@ -158,6 +158,7 @@ const REPLACES_MARK = "_replaces a non-standard existing value_";
 const KEPT_PII_MARK = "_kept existing PII tag (model proposed none)_";
 const DROPPED_MARK = "_non-taxonomy tags dropped_";
 const WITHHELD_MARK = "_description withheld: its CLASSIFICATION line conflicts with the table's tags; rewrite it_";
+const NONSTANDARD_WITHHELD_MARK = "_non-standard existing text withheld (approved value null, so the live value is left unchanged); rewrite it to the standard to approve it_";
 const tagsChangedMark = (existing: TagMap | undefined, approved: TagMap | undefined) => `_tags changed: ${fmtTags(existing)} → ${fmtTags(approved)}_`;
 
 /** Standards review: the table's tag change, and which existing tags fell outside the taxonomy. */
@@ -206,6 +207,11 @@ export function metadataReviewMarkdown(o: MetadataOutcome): string {
       if (row) {
         const changed = row.columns.filter((c) => !isAuditColumn(c.name) && !sameTags(c.existing_tags, c.approved_tags));
         if (changed.length) out.push("", ...changed.map((c) => `- ${cell(c.name)}: ${tagsChangedMark(c.existing_tags, c.approved_tags)}`));
+        const withheld = [
+          ...(row.approved_description === null && row.existing_description !== null ? ["description"] : []),
+          ...row.columns.filter((c) => !isAuditColumn(c.name) && c.approved_comment === null && c.existing_comment !== null).map((c) => `column ${cell(c.name)}`),
+        ];
+        if (withheld.length) out.push("", `${NONSTANDARD_WITHHELD_MARK} (${withheld.join(", ")})`);
       }
       continue;
     }
@@ -287,7 +293,8 @@ function draftProvenance(o: MetadataOutcome, t: TableOutcome): ApprovedRow["prov
 /**
  * Standards mode (R4):
  * - a text value that passes the standards checks is kept, otherwise the proposal takes
- *   its place; a table without a usable proposal keeps its existing text values;
+ *   its place; in a table without a usable proposal, a non-standard existing text value is
+ *   withheld as null (R5: the applier skips null, so the live value is left unchanged);
  * - column tags: the proposed pii_tags, else the existing tags when they are valid
  *   (a valid existing PII tag is never dropped), else {};
  * - table tags are always the five taxonomy keys: classification from the proposal (with
@@ -306,7 +313,8 @@ function standardsDraftRow(o: MetadataOutcome, t: TableOutcome, standards: Metad
     if (isAuditColumn(c.name)) return { name: c.name, existing_comment: c.existing_comment, approved_comment: c.existing_comment, existing_tags: existing, approved_tags: { ...existing } };
     const pc = byName.get(c.name);
     const approvedTags = pc?.pii_tags ? columnTagsFromProposal(pc.pii_tags) : validColumnTags(existing);
-    const approvedComment = pc ? standardsDraftValue(c.existing_comment, pc.comment, commentIsStandard) : c.existing_comment;
+    const existingComment = c.existing_comment !== null && commentIsStandard(c.existing_comment) ? c.existing_comment : null;
+    const approvedComment = pc ? standardsDraftValue(c.existing_comment, pc.comment, commentIsStandard) : existingComment;
     return { name: c.name, existing_comment: c.existing_comment, approved_comment: approvedComment, existing_tags: existing, approved_tags: approvedTags };
   });
   const anyColumnPii = columns.some((c) => !isAuditColumn(c.name) && c.approved_tags?.pii === "true");
@@ -314,10 +322,11 @@ function standardsDraftRow(o: MetadataOutcome, t: TableOutcome, standards: Metad
   const base = p ? (p.classification ?? "") : existingClass !== undefined && (CLASSIFICATIONS as readonly string[]).includes(existingClass) ? existingClass : "pii_scan_required";
   // A kept PII tag never sits under "public" (tableTagProblems rejects it).
   const classification = base === "public" && anyColumnPii ? "pii_scan_required" : base;
-  // The draft never fails its own check: a description whose CLASSIFICATION: line no longer
-  // matches the derived classification is withheld (null, R5) for the reviewer to rewrite.
+  // The draft never fails its own check: a description that is not standard under the derived
+  // classification (its CLASSIFICATION: line conflicts, or, with no proposal, an existing
+  // non-standard text) is withheld (null, R5) for the reviewer to rewrite.
   const chosen = standardsDraftValue(ev.existing_description, p?.table_description.comment, (s) => descriptionIsStandard(s, p?.classification));
-  const description = p && chosen !== null && !descriptionIsStandard(chosen, classification) ? null : chosen;
+  const description = chosen !== null && !descriptionIsStandard(chosen, classification) ? null : chosen;
   return {
     table: t.table,
     existing_description: ev.existing_description,
@@ -469,9 +478,9 @@ export function validateApprovedText(text: string, service: BatchService, jobOve
  * - every non-null approved description and non-audit column comment follows the standard
  *   format and carries no PII-looking text.
  * Audit columns are locked: approved_comment and approved_tags must equal the existing
- * values (the applier assigns their standard definitions). Tags are always checked. A table
- * without a usable proposal is exempt from the text checks where a value is left unchanged
- * (equal to its existing value), as the draft keeps it; a changed value is checked.
+ * values (the applier assigns their standard definitions) and are exempt from the text
+ * checks. Tags are always checked. Every other non-null value is checked, including existing
+ * text kept in a table without a usable proposal (the draft withholds non-standard text as null).
  * Also counts replacedNonStandard and lists the null values (R5).
  */
 function standardsRowProblems(line: number, row: ApprovedRow, t: TableOutcome, std: MetadataStandards, res: ApprovedValidation): string[] {
@@ -479,7 +488,6 @@ function standardsRowProblems(line: number, row: ApprovedRow, t: TableOutcome, s
   const at = (m: string) => `line ${line}: ${m}`;
   const ev = t.evidence;
   const p = t.proposal;
-  const leftAsIs = !p;
   if (!sameTags(row.existing_tags, ev.existing_tags)) problems.push(at("existing_tags differs from the evidence (it must be reproduced exactly)"));
   const evCols = new Map(ev.columns.map((c) => [c.name, c]));
   const proposed = new Map((p?.columns ?? []).map((c) => [c.name, c]));
@@ -497,14 +505,14 @@ function standardsRowProblems(line: number, row: ApprovedRow, t: TableOutcome, s
 
   const desc = row.approved_description;
   if (desc === null) res.nullValues!.push(`${row.table} description`);
-  else if (!(leftAsIs && desc === row.existing_description)) problems.push(...[...descriptionProblems(desc, tags.classification), ...piiTextProblems(desc)].map((m) => at(`approved_description: ${m}`)));
+  else problems.push(...[...descriptionProblems(desc, tags.classification), ...piiTextProblems(desc)].map((m) => at(`approved_description: ${m}`)));
   if (replacesNonStandard(row.existing_description, desc, p?.table_description.comment, (s) => descriptionIsStandard(s, p?.classification))) res.counts.replacedNonStandard!++;
 
   for (const c of business) {
     const name = JSON.stringify(c.name);
     const v = c.approved_comment;
     if (v === null) res.nullValues!.push(`${row.table} column ${name}`);
-    else if (!(leftAsIs && v === c.existing_comment)) problems.push(...[...columnCommentProblems(v), ...piiTextProblems(v)].map((m) => at(`column ${name} approved_comment: ${m}`)));
+    else problems.push(...[...columnCommentProblems(v), ...piiTextProblems(v)].map((m) => at(`column ${name} approved_comment: ${m}`)));
     const ct = c.approved_tags ?? {};
     problems.push(...columnTagProblems(ct).map((m) => at(`column ${name} approved_tags: ${m}`)));
     if (replacesNonStandard(c.existing_comment, v, proposed.get(c.name)?.comment, commentIsStandard)) res.counts.replacedNonStandard!++;

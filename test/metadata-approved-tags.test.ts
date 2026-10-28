@@ -305,7 +305,7 @@ test("standards audit columns: locked to their existing values and tags (problem
     assert.ok(hasUcPrefix(AUDIT_ONLY, "PNPT_"));
   }, spFiles));
 
-test("standards partial: --allow-partial keeps existing text values of a table without a proposal; its tags are made taxonomy-valid", () =>
+test("standards partial: --allow-partial withholds non-standard existing text of a table without a proposal (null), keeps standard text; its tags are made taxonomy-valid", () =>
   withWorkspace(async (root, service, fake) => {
     const o = await standardsJob(service, fake, [2]);
     const art = artifactsFor(root, service);
@@ -314,7 +314,8 @@ test("standards partial: --allow-partial keeps existing text values of a table w
     assert.deepEqual(res.validation.problems, []);
     const rows = parseRows(fs.readFileSync(path.join(root, "metadata/pinpoint/approved.jsonl"), "utf8"));
     const plant = rows[2]!;
-    assert.equal(plant.approved_description, "Plants.");
+    assert.equal(plant.approved_description, null, '"Plants." is not standard: withheld, so the live value is left unchanged');
+    assert.ok(res.validation.nullValues?.includes(`${PLANT} description`));
     // Tags stay taxonomy-valid: derived facts, pii_scan_required for a non-taxonomy classification, invalid tags dropped.
     assert.equal(JSON.stringify(plant.approved_tags), JSON.stringify({ classification: "pii_scan_required", data_domain: "pinpoint", uc_prefix: "PNPT_", medallion_layer: "bronze", pii: "false" }));
     assert.deepEqual((plant.columns as Row[]).map((c) => [c.approved_comment, c.approved_tags]), [[PLANT_COMMENT, {}], [null, {}]]);
@@ -322,9 +323,31 @@ test("standards partial: --allow-partial keeps existing text values of a table w
     assert.match(md, /_non-taxonomy tags dropped_ \(table, column plant_nm\)/);
     assert.match(md, /\*\*Tags:\*\* _tags changed: `owner=legacy` → `classification=pii_scan_required, /);
     assert.match(md, /- plant_nm: _tags changed: `note=x` → none_/);
-    // Changing a value of that table makes it subject to the standards again.
+    assert.match(md, /_non-standard existing text withheld \(approved value null, so the live value is left unchanged\); rewrite it to the standard to approve it_ \(description\)/);
+    // Every non-null value is checked: a reviewer putting the legacy text back, or changing it, gets a problem.
+    plant.approved_description = "Plants.";
+    assert.match(validateApprovedText(joinRows(rows), service).problems.join("\n"), /line 3: approved_description: .*GRAIN:/);
     plant.approved_description = "Plants of the bottling network.";
     assert.match(validateApprovedText(joinRows(rows), service).problems.join("\n"), /line 3: approved_description: .*GRAIN:/);
+  }, spFiles));
+
+test("standards partial: a non-standard existing column comment of a table without a proposal is withheld; audit columns keep their lock", () =>
+  withWorkspace(async (_root, service, fake) => {
+    const o = await standardsJob(service, fake, [0]);
+    const draft = toApprovedJsonl(approvedDraftRows(o));
+    const rows = parseRows(draft);
+    const loc = rows[0]!;
+    assert.equal(loc.approved_description, null);
+    assert.equal(col(loc, "pk_loc_id").approved_comment, null, '"Location id" is not standard');
+    assert.equal(col(loc, "Address1_ds").approved_comment, null);
+    assert.deepEqual([col(loc, "fw_ingestdate").approved_comment, col(loc, "fw_ingestdate").approved_tags], ["Ingest date", { legacy: "yes" }]);
+    const v = validateApprovedText(draft, service);
+    assert.deepEqual(v.problems, [], "the draft passes its own check");
+    assert.ok(v.nullValues?.includes(`${LOCATION} column "pk_loc_id"`));
+    assert.match(metadataReviewMarkdown(o), /_non-standard existing text withheld .*_ \(column pk_loc_id\)/);
+    // A reviewer restoring the legacy comment gets the standards problem.
+    col(loc, "pk_loc_id").approved_comment = "Location id";
+    assert.match(validateApprovedText(joinRows(rows), service).problems.join("\n"), /line 1: column "pk_loc_id" approved_comment: .*TYPE:/);
   }, spFiles));
 
 test("standards review: tags line, PII column, audit rows and the non-standard replacement marker", () =>
