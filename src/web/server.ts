@@ -19,6 +19,7 @@ import { atomicWriteFile, isInside, sha256Hex, writeFileAtomicExclusive } from "
 import { jobItems, sourceLabel } from "../items.js";
 import { formatMetadataPreview } from "../metadata-commands.js";
 import { writeApprovedDraft, writeMetadataReview } from "../metadata/outputs.js";
+import { webWording } from "./wording.js";
 import { validateApprovedText } from "../metadata/report.js";
 import { FileLogger } from "../logger.js";
 import { fetchCatalogData, immediateRouteAllowed, immediateRouteRefusal, ModelCatalog, type CatalogData } from "../models/catalog.js";
@@ -1009,8 +1010,10 @@ export class BatchWebServer {
         const action = threadMatch[2];
 
         if (method === "GET" && !action) {
-          const thread = this.deps.chatStore.read(threadId);
-          const entries = conversationOrder(this.deps.chatStore.transcript(threadId).entries);
+          const stored = this.deps.chatStore.read(threadId);
+          // Failure messages are stored with terminal hints (/batch chat retry); the page words them for its buttons.
+          const thread = stored.lastFailure ? { ...stored, lastFailure: { ...stored.lastFailure, message: webWording(stored.lastFailure.message) } } : stored;
+          const entries = conversationOrder(this.deps.chatStore.transcript(threadId).entries).map((e) => (e.type === "failure" ? { ...e, message: webWording(e.message) } : e));
           const estimate = this.deps.chat.nextRequestEstimate(threadId);
           const threadJobs = this.deps.service.registry.list().jobs.filter((j) => j.chat?.threadId === threadId);
           const pendingJob = thread.pending?.jobId ? this.safeReadJob(thread.pending.jobId) : undefined;
@@ -1524,6 +1527,9 @@ export class BatchWebServer {
   }
 
   private sendJson(res: http.ServerResponse, status: number, payload: unknown): void {
+    // An `error` (a refusal, a failed send) is shown on the page: word its command hints for the page.
+    const p = payload as Record<string, unknown> | null;
+    if (p && typeof p === "object" && !Array.isArray(p) && typeof p.error === "string") payload = { ...p, error: webWording(p.error) };
     const body = JSON.stringify(payload);
     res.writeHead(status, {
       "Content-Type": "application/json; charset=utf-8",
