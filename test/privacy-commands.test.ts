@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
-import { loadConfig, projectConfigPath } from "../src/config.js";
+import { loadConfig, projectConfigPath, readPrivacyConfig, saveConfigUpdate } from "../src/config.js";
 import { describeJob } from "../src/dashboard.js";
 import type { CatalogSnapshot } from "../src/models/catalog.js";
 import { cmdPrivacy, formatPrivacyStatus, pickerEntries, PRIVACY_NOTICE } from "../src/privacy/commands.js";
@@ -89,6 +89,7 @@ function fakeRt(dir: string): { rt: BatchRuntime; notes: string[] } {
   const state = {
     cwd: dir,
     loaded: loadConfig(dir, empty),
+    privacy: () => readPrivacyConfig(dir, empty, state.loaded.config.privacy),
     catalog: null,
     notify: (m: string) => notes.push(m),
     reloadConfig: () => {
@@ -132,6 +133,15 @@ test("cmdPrivacy with no argument shows status; refresh without a catalog explai
   await cmdPrivacy(rt, [], false);
   assert.match(notes.at(-1) ?? "", /Privacy level: standard/);
   await assert.rejects(() => cmdPrivacy(rt, ["refresh"], false), /catalog/i);
+});
+
+test("cmdPrivacy shows the level as it is now, including a change made by another process", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "privcmd-"));
+  const { rt, notes } = fakeRt(dir);
+  saveConfigUpdate({ privacy: { level: "zdr" } }, { cwd: dir, global: false }); // another Pi session or the web UI
+  assert.equal(rt.loaded.config.privacy.level, "standard", "this process's snapshot is stale");
+  await cmdPrivacy(rt, [], false);
+  assert.match(notes.at(-1) ?? "", /Privacy level: zdr/);
 });
 
 test("describeJob shows privacy, route, enforcement and deletion; immediate jobs have no batch ID", () => {

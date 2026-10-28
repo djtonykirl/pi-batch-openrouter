@@ -98,7 +98,7 @@ const USAGE = `Usage: /batch [--global] privacy [${PRIVACY_LEVELS.join("|")}|att
 
 export async function cmdPrivacy(rt: BatchRuntime, rest: string[], isGlobal: boolean): Promise<void> {
   const arg = rest.join(" ").trim().toLowerCase();
-  const config = () => rt.loaded.config.privacy;
+  const config = () => rt.privacy();
   const save = (privacy: Partial<ReturnType<typeof config>>): string => {
     const file = saveConfigUpdate({ privacy }, { cwd: rt.cwd, global: isGlobal });
     rt.reloadConfig();

@@ -1,6 +1,6 @@
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { loadConfig, readPrivacyConfig, type LoadedConfig } from "./config.js";
+import { loadConfig, readPrivacyConfig, type BatchConfig, type LoadedConfig } from "./config.js";
 import { FileLogger, type Logger } from "./logger.js";
 import { discoverBatchModels, resolveApiKeyForProvider } from "./models.js";
 import { BatchPoller } from "./poller.js";
@@ -73,6 +73,14 @@ export class BatchRuntime {
     this.reloadConfig();
   }
 
+  /**
+   * The `privacy` section read fresh from the config files: another process may have changed the level since this
+   * process's snapshot. Used by every privacy decision and every display of the level.
+   */
+  public privacy(): BatchConfig["privacy"] {
+    return this.cwd ? readPrivacyConfig(this.cwd, undefined, this.loaded.config.privacy) : this.loaded.config.privacy;
+  }
+
   public reloadConfig(): void {
     this.loaded = loadConfig(this.cwd);
     if (!this.cwd) {
@@ -92,9 +100,7 @@ export class BatchRuntime {
       this.catalogFile = catalogFile;
       this.catalog = new ModelCatalog({ file: catalogFile, logger: this.logger, fetch: () => this.fetchCatalog() });
     }
-    const cwd = this.cwd;
-    // Privacy decisions read the config files fresh: another process may have raised the level since this snapshot.
-    const getPrivacy = () => readPrivacyConfig(cwd, undefined, this.loaded.config.privacy);
+    const getPrivacy = () => this.privacy();
     this.service = new BatchService({
       registry,
       catalog: this.catalog,
