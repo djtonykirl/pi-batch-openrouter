@@ -26,6 +26,18 @@ export interface CatalogDeps {
   logger?: Logger;
 }
 
+/**
+ * Whether `route: "immediate"` may be chosen explicitly for `modelId`: only a `:free` ID, or a model the catalog lists
+ * as free under that exact ID. Anything else is a batch model and goes through the batch route's privacy checks.
+ */
+export function immediateRouteAllowed(modelId: string, snapshot: CatalogSnapshot | undefined): boolean {
+  return modelId.endsWith(":free") || !!snapshot?.models.some((m) => m.id === modelId && m.free);
+}
+
+export function immediateRouteRefusal(modelId: string): string {
+  return `Route immediate is only for free models (a ":free" ID or one the model catalog lists as free); ${modelId} is not one`;
+}
+
 /** Session model catalog: one deduplicated load at a time; `fresh` is true only after a successful network load. */
 export class ModelCatalog {
   private current: CatalogSnapshot | undefined;

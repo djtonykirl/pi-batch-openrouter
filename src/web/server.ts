@@ -20,7 +20,8 @@ import { formatMetadataPreview } from "../metadata-commands.js";
 import { writeApprovedDraft, writeMetadataReview } from "../metadata/outputs.js";
 import { validateApprovedText } from "../metadata/report.js";
 import { FileLogger } from "../logger.js";
-import { ModelCatalog, type CatalogModel } from "../models/catalog.js";
+import { immediateRouteAllowed, immediateRouteRefusal, ModelCatalog, type CatalogModel } from "../models/catalog.js";
+import { normalizeBatchModelSlug } from "../models.js";
 import { OpenRouterBatchClient } from "../openrouter/client.js";
 import { ATTEST_NOTE, attestationUpdate, catalogStateLine, levelSource, levelUpdate, pickerEntries, PRIVACY_NOTICE, PRIVACY_SETTINGS_URL } from "../privacy/commands.js";
 import { isPrivacyLevel, type PrivacyLevel, type Route, type ZdrEndpoint } from "../privacy/policy.js";
@@ -238,10 +239,15 @@ export function inspectWorkspaceFiles(workspaceRoot: string, config: BatchConfig
   return entries;
 }
 
-function parseRoute(value: unknown): Route | undefined {
+/** A route from a request body. `immediate` is accepted only for a free model (`:free`, or free in the catalog). */
+function parseRoute(value: unknown, model: string | undefined, catalog: ModelCatalog | undefined): Route | undefined {
   if (value === undefined || value === "") return undefined;
-  if (value === "batch" || value === "immediate") return value;
-  throw new Error(`Unknown route "${String(value)}". Use batch or immediate.`);
+  if (value !== "batch" && value !== "immediate") throw new Error(`Unknown route "${String(value)}". Use batch or immediate.`);
+  if (value === "immediate") {
+    const id = normalizeBatchModelSlug((model ?? "").trim());
+    if (!immediateRouteAllowed(id, catalog?.snapshot())) throw new Error(immediateRouteRefusal(id || "(no model)"));
+  }
+  return value;
 }
 
 /** Constant-time string comparison (length is not secret). */
@@ -920,7 +926,7 @@ export class BatchWebServer {
 
       if (method === "POST" && pathname === "/api/threads") {
         const body = await this.readJson<{ model?: string; title?: string; route?: string }>(req);
-        const route = parseRoute(body.route);
+        const route = parseRoute(body.route, body.model, this.deps.catalog);
         const thread = this.deps.chat.newThread();
         try {
           if (body.model?.trim()) await this.deps.chat.setModel(thread.id, body.model.trim(), { route });
@@ -993,7 +999,7 @@ export class BatchWebServer {
 
         if (method === "POST" && action === "model") {
           const body = await this.readJson<{ model: string; route?: string }>(req);
-          await this.deps.chat.setModel(threadId, body.model ?? "", { route: parseRoute(body.route) });
+          await this.deps.chat.setModel(threadId, body.model ?? "", { route: parseRoute(body.route, body.model, this.deps.catalog) });
           this.broadcast({ type: "thread_updated", threadId });
           this.sendJson(res, 200, { thread: this.deps.chatStore.read(threadId) });
           return;

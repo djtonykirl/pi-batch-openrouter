@@ -6,6 +6,7 @@ import { formatSecretFindings, scanForSecrets } from "../context/secrets.js";
 import { isUsable, itemText, jobItems } from "../items.js";
 import { nullLogger, type Logger } from "../logger.js";
 import { normalizeBatchModelSlug } from "../models.js";
+import { immediateRouteAllowed, immediateRouteRefusal } from "../models/catalog.js";
 import {
   effectiveLevel as effectiveLevelOf,
   normaliseModelSlug,
@@ -303,6 +304,7 @@ export class ChatService {
   public async setModel(threadId: string, slug: string, opts: { route?: Route } = {}): Promise<void> {
     const to = normalizeBatchModelSlug(slug.trim());
     if (!to) throw new Error("Model slug is empty.");
+    if (opts.route === "immediate" && !immediateRouteAllowed(to, this.deps.batch.catalog?.snapshot())) throw new Error(immediateRouteRefusal(to));
     const route = routeForModel(to, opts.route);
     const config = this.deps.getConfig();
     const privacy = this.privacy();

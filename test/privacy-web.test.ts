@@ -21,6 +21,10 @@ const ZDR: ZdrEndpoint[] = [{ model: "y/model", provider: "azure/eu" }];
 const MODELS = [
   { id: "c/free-one:free", name: "Free One", free: true },
   { id: "d/free-two:free", name: "Free Two", free: true },
+  // Free by pricing ("0"), without a ":free" suffix.
+  { id: "z/zero-priced", name: "Zero Priced", free: true },
+  { id: "z/other-free", name: "Other Free", free: true },
+  { id: "p/paid", name: "Paid", free: false },
 ];
 
 interface Env {
@@ -253,6 +257,46 @@ test(
     assert.ok(html.includes("state.pickedRoute = null"), "editing the box clears the route");
   }),
 );
+
+test(
+  "route immediate is accepted only for a free model; anything else is 400 and leaves nothing behind",
+  withWeb(async ({ post, store, chat }) => {
+    const t = chat.newThread();
+    for (const model of ["p/paid", "y/model", "q/unknown", ""]) {
+      const r = await post(`/api/threads/${t.id}/model`, { model, route: "immediate" });
+      assert.equal(r.status, 400, model);
+      assert.match(((await r.json()) as { error: string }).error, /Route immediate is only for free models/);
+    }
+    assert.notEqual(store.read(t.id).route, "immediate");
+    assert.equal((await post(`/api/threads/${t.id}/model`, { model: "c/free-one:free", route: "immediate" })).status, 200);
+    assert.equal(store.read(t.id).route, "immediate");
+    // Batch stays allowed for any model.
+    assert.equal((await post(`/api/threads/${t.id}/model`, { model: "p/paid", route: "batch" })).status, 200);
+    assert.equal(store.read(t.id).route, "batch");
+
+    const before = store.list().length;
+    const refused = await post("/api/threads", { model: "p/paid", route: "immediate" });
+    assert.equal(refused.status, 400);
+    assert.equal(store.list().length, before, "no orphan thread");
+  }),
+);
+
+test(
+  "ChatService.setModel refuses an explicit immediate route for a model that is not free",
+  withWeb(async ({ chat, store }) => {
+    const t = chat.newThread();
+    await assert.rejects(chat.setModel(t.id, "p/paid", { route: "immediate" }), /Route immediate is only for free models .*; p\/paid is not one/);
+    await assert.rejects(chat.setModel(t.id, "q/unknown", { route: "immediate" }), /Route immediate is only for free models/);
+    assert.notEqual(store.read(t.id).model, "p/paid");
+    await chat.setModel(t.id, "z/zero-priced", { route: "immediate" });
+    assert.equal(store.read(t.id).route, "immediate");
+    await chat.setModel(t.id, "q/unknown:free", { route: "immediate" });
+    assert.equal(store.read(t.id).route, "immediate");
+    await chat.setModel(t.id, "p/paid");
+    assert.equal(store.read(t.id).route, "batch");
+  }),
+);
+
 
 test(
   "send at zdr for a batch model with no ZDR provider: no job, refusal recorded",
