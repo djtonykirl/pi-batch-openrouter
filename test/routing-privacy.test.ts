@@ -17,6 +17,7 @@ import { FAKE_KEY, FakeOpenRouter, accepted, makeConfig, makeService } from "./f
 import { metadataWorkspace } from "./fixtures/metadata.js";
 import { chatCompletion, completed, successItem } from "./fixtures/openrouter.js";
 import { rm, tempWorkspace, writeFiles } from "./helpers.js";
+import { batchEndpointsMatchingZdr } from "./fixtures/catalog.js";
 
 /**
  * routing.* (provider allow-list, account requirements) linked with the privacy levels:
@@ -54,7 +55,7 @@ function withEnv(
         c.privacy.accountNoTraining = opts.accountNoTraining ?? false;
         Object.assign(c.routing, opts.routing ?? {});
       });
-      const catalog = new ModelCatalog({ fetch: async () => ({ models: [], zdr: ZDR }), file: path.join(root, "catalog.json") });
+      const catalog = new ModelCatalog({ fetch: async () => ({ models: [], zdr: ZDR, batchEndpoints: batchEndpointsMatchingZdr(ZDR) }), file: path.join(root, "catalog.json") });
       await catalog.load();
       const jobsDir = path.join(root, ".pi", "batches");
       const service = new BatchService({
@@ -96,7 +97,7 @@ test("allow-list entries admit equal tags and base providers only", () => {
 });
 
 test("policy: zdr intersects the ZDR tags with the allow-list, never with fallbacks", () => {
-  const catalog = { fresh: true, zdr: ZDR };
+  const catalog = { fresh: true, zdr: ZDR, batchEndpoints: batchEndpointsMatchingZdr(ZDR) };
   const base = { level: "zdr" as const, model: MODEL, catalog, accountNoTraining: false };
   assert.deepEqual(resolveBatchProvider({ ...base, allowedProviders: ["azure"] }), { ok: true, provider: { only: ["azure/eu"], allow_fallbacks: false }, enforcement: "pinned to ZDR providers: azure/eu" });
   assert.deepEqual(resolveBatchProvider({ ...base, allowedProviders: ["anthropic", "groq"], userPin: { only: ["anthropic", "groq"], allow_fallbacks: true } }), {
@@ -384,7 +385,7 @@ test(
 );
 
 test("model picker at zdr: a batch model with no ZDR endpoint in the allow-list is blocked with decidePrivacy's reason", () => {
-  const snap = { fresh: true, loadedAt: new Date().toISOString(), models: [{ id: "meta/llama-free:free", free: true }], zdr: ZDR } as never;
+  const snap = { fresh: true, loadedAt: new Date().toISOString(), models: [{ id: "meta/llama-free:free", free: true }], zdr: ZDR, batchEndpoints: batchEndpointsMatchingZdr(ZDR) } as never;
   const blocked = pickerEntries(snap, [MODEL], "zdr", false, ["groq"]).find((e) => e.id === MODEL)!;
   assert.equal(blocked.blocked, `Privacy level zdr: no ZDR provider for ${MODEL} within routing.allowedProviders (groq)`);
   assert.equal(pickerEntries(snap, [MODEL], "zdr", false, ["azure"]).find((e) => e.id === MODEL)!.blocked, undefined);

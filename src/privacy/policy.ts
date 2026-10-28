@@ -41,6 +41,33 @@ export interface ZdrEndpoint {
 export interface CatalogView {
   fresh: boolean;
   zdr: ZdrEndpoint[];
+  /**
+   * Normalised model ID -> the endpoint tags of its `:batch` model (GET /models/{id}:batch/endpoints). Batch jobs run
+   * only on these, which are a different set from the sync endpoints that /endpoints/zdr lists. No entry: unknown.
+   */
+  batchEndpoints?: Record<string, string[]>;
+}
+
+/**
+ * The batch-route ZDR view of one model: its ZDR (sync) endpoint tags, its batch endpoint tags (undefined when they
+ * were not loaded), and `pinnable`, the batch endpoints whose exact tag is on the ZDR list. A batch endpoint is
+ * treated as ZDR when its tag appears on OpenRouter's ZDR list.
+ */
+export function batchZdrView(catalog: CatalogView | undefined, model: string): { zdr: string[]; batch?: string[]; pinnable: string[] } {
+  const slug = normaliseModelSlug(model);
+  const zdr = [...new Set((catalog?.zdr ?? []).filter((e) => e.model === slug).map((e) => e.provider))].sort();
+  const map = catalog?.batchEndpoints;
+  const batch = map && Object.hasOwn(map, slug) && Array.isArray(map[slug]) ? [...new Set(map[slug])].sort() : undefined;
+  return { zdr, batch, pinnable: batch ? batch.filter((t) => zdr.includes(t)) : [] };
+}
+
+/** Why `model` can't run on the batch route at zdr from the catalog alone (fresh catalog, no pin, no allow-list), or undefined. */
+function batchZdrRefusal(slug: string, view: ReturnType<typeof batchZdrView>): string | undefined {
+  if (!view.batch) return `Privacy level zdr: the batch endpoints of ${slug} could not be loaded this session (run /batch privacy refresh)`;
+  if (view.pinnable.length === 0) {
+    return `Privacy level zdr: ${slug} has no batch endpoint on OpenRouter's ZDR list (its batch endpoints: ${view.batch.join(", ") || "none"}; ZDR endpoints: ${view.zdr.join(", ") || "none"})`;
+  }
+  return undefined;
 }
 
 export type ProviderDecision =
@@ -74,8 +101,13 @@ export function resolveBatchProvider(input: {
     };
   }
   const slug = normaliseModelSlug(model);
-  let only = [...new Set(catalog.zdr.filter((e) => e.model === slug).map((e) => e.provider))].sort();
-  if (allow.length && only.length) {
+  // Batch jobs run on the model's :batch endpoints only, so the pin is the ZDR tags that are also batch endpoint tags
+  // (exact tag equality); provider.only is checked by the Batch API against the batch endpoints.
+  const view = batchZdrView(catalog, slug);
+  const refusal = batchZdrRefusal(slug, view);
+  if (refusal) return { ok: false, reason: refusal };
+  let only = view.pinnable;
+  if (allow.length) {
     only = only.filter((p) => providerAllowed(allow, p));
     if (only.length === 0) return { ok: false, reason: `Privacy level zdr: no ZDR provider for ${slug} within routing.allowedProviders (${allow.join(", ")})` };
   }

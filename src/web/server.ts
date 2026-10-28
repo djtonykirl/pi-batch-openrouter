@@ -21,11 +21,11 @@ import { formatMetadataPreview } from "../metadata-commands.js";
 import { writeApprovedDraft, writeMetadataReview } from "../metadata/outputs.js";
 import { validateApprovedText } from "../metadata/report.js";
 import { FileLogger } from "../logger.js";
-import { immediateRouteAllowed, immediateRouteRefusal, ModelCatalog, type CatalogModel } from "../models/catalog.js";
+import { fetchCatalogData, immediateRouteAllowed, immediateRouteRefusal, ModelCatalog, type CatalogData } from "../models/catalog.js";
 import { normalizeBatchModelSlug } from "../models.js";
 import { OpenRouterBatchClient } from "../openrouter/client.js";
 import { ATTEST_NOTE, attestationUpdate, catalogStateLine, levelSource, levelUpdate, pickerEntries, PRIVACY_NOTICE, PRIVACY_SETTINGS_URL } from "../privacy/commands.js";
-import { isPrivacyLevel, type PrivacyLevel, type Route, type ZdrEndpoint } from "../privacy/policy.js";
+import { isPrivacyLevel, type PrivacyLevel, type Route } from "../privacy/policy.js";
 import { badgeText, BatchPoller } from "../poller.js";
 import { JobRegistry } from "../registry.js";
 import { BatchService } from "../service.js";
@@ -321,11 +321,10 @@ export class BatchWebServer {
     const catalog = new ModelCatalog({
       file: path.join(storage, "model-catalog.json"),
       logger,
-      fetch: async (): Promise<{ models: CatalogModel[]; zdr: ZdrEndpoint[] }> => {
+      fetch: async (): Promise<CatalogData> => {
         const apiKey = await keys.resolve(loaded.config.defaultAccount);
         const client = new OpenRouterBatchClient({ apiKey, timeoutMs: loaded.config.polling.requestTimeoutSeconds * 1000 });
-        const [models, zdr] = await Promise.all([client.listModels(), client.listZdrEndpoints()]);
-        return { models: models.models, zdr: zdr.endpoints };
+        return fetchCatalogData(client, logger);
       },
     });
     // Privacy decisions read the config files fresh: another process may have raised the level since this snapshot.

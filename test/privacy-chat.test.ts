@@ -14,6 +14,7 @@ import { BatchService } from "../src/service.js";
 import { FAKE_KEY, FakeOpenRouter, accepted, makeConfig } from "./fixtures/fake-openrouter.js";
 import { chatCompletion } from "./fixtures/openrouter.js";
 import { rm, tempWorkspace } from "./helpers.js";
+import { batchEndpointsMatchingZdr } from "./fixtures/catalog.js";
 
 interface Ctx {
   root: string;
@@ -38,7 +39,7 @@ function withChat(opts: { zdr?: ZdrEndpoint[] | Error }, fn: (c: Ctx) => Promise
       const catalog = new ModelCatalog({
         fetch: async () => {
           if (zdr instanceof Error) throw zdr;
-          return { models: [], zdr };
+          return { models: [], zdr, batchEndpoints: batchEndpointsMatchingZdr(zdr) };
         },
         file: join(root, "catalog.json"),
       });
