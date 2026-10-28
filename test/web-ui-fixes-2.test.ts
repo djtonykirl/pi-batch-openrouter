@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 import { ArtifactService } from "../src/artifacts/service.js";
 import { ArtifactStore } from "../src/artifacts/store.js";
-import { ChatService, SUBMISSION_UNKNOWN, SUBMISSION_UNKNOWN_ADVICE } from "../src/chat/service.js";
+import { CHAT_RETRY_HINT, ChatService, PROJECT_INSTRUCTIONS_FILE, SUBMISSION_UNKNOWN, SUBMISSION_UNKNOWN_ADVICE } from "../src/chat/service.js";
+import { approvedGapsMessage } from "../src/metadata/outputs.js";
+import { immediateZdrRefusal, resolveBatchProvider } from "../src/privacy/policy.js";
 import { ThreadStore } from "../src/chat/store.js";
 import type { BatchConfig } from "../src/config.js";
 import { ModelCatalog, type CatalogData } from "../src/models/catalog.js";
@@ -11,10 +14,10 @@ import { OpenRouterBatchClient } from "../src/openrouter/client.js";
 import { MAX_CONSECUTIVE_429 } from "../src/openrouter/immediate.js";
 import { BatchPoller } from "../src/poller.js";
 import { JobRegistry } from "../src/registry.js";
-import { BatchService } from "../src/service.js";
+import { BatchService, IMMEDIATE_CHAT_ONLY } from "../src/service.js";
 import { BatchWebServer } from "../src/web/server.js";
 import { inflightHeadline, messageNumbers, metadataWrittenText, renderWebUiHtml } from "../src/web/ui.js";
-import { webWording } from "../src/web/wording.js";
+import { webWording, webWordingPayload } from "../src/web/wording.js";
 import { FAKE_KEY, FakeOpenRouter, accepted, makeConfig } from "./fixtures/fake-openrouter.js";
 import { rm, tempWorkspace } from "./helpers.js";
 
@@ -114,17 +117,61 @@ test("4a: the page embeds inflightHeadline with the real cap and no longer says 
 
 // ------------------------------------------------------------------ 5: web messages name page controls, not commands
 
-test("5: webWording maps each terminal hint to the page control; other text is unchanged", () => {
+test("5: webWording rewords the real builders' messages for the page; other text is unchanged", () => {
   assert.equal(
-    webWording("2 of 3 table(s) have no usable proposal: a, b.\nRetry them (/batch retry-items B-1 --failed), or pass --allow-partial to include them with their existing values unchanged."),
+    webWording(approvedGapsMessage(["a", "b"], 3, "B-1")),
     "2 of 3 table(s) have no usable proposal: a, b.\nRetry the failed items (Retry Failed Items button on this job), or tick Allow partial to include them with their existing values unchanged.",
   );
-  assert.equal(webWording("The reply job B-1 can no longer be read (gone). Use /batch chat retry."), "The reply job B-1 can no longer be read (gone). Use Retry Turn.");
-  assert.equal(webWording("Nothing was sent. Fix .pi/x.md, then /batch chat retry."), "Nothing was sent. Fix .pi/x.md, then use Retry Turn.");
+  assert.equal(webWording(`The reply job B-1 can no longer be read (gone). ${CHAT_RETRY_HINT}`), "The reply job B-1 can no longer be read (gone). Use Retry Turn.");
   assert.match(webWording(SUBMISSION_UNKNOWN_ADVICE), /only if the turn was not billed, use Retry anyway \(a plain retry is refused/);
-  assert.equal(webWording("Do not resubmit before checking /batch show B-7."), "Do not resubmit before checking job B-7 (Inspect).");
+  assert.doesNotMatch(webWording(SUBMISSION_UNKNOWN_ADVICE), /\/batch/);
+  assert.equal(webWording(IMMEDIATE_CHAT_ONLY), "Free models run only in Batch Chat; batch jobs and workflows need a batch model");
+  assert.equal(webWording(immediateZdrRefusal(undefined, "x/y:free")!), "Privacy level zdr: model catalog not loaded this session, so ZDR endpoints can't be verified (use Refresh models)");
+  const noTraining = resolveBatchProvider({ level: "no-training", model: "x/y", accountNoTraining: false });
+  assert.doesNotMatch(webWording(noTraining.ok ? "" : noTraining.reason), /\/batch/);
+  assert.match(webWording(noTraining.ok ? "" : noTraining.reason), /\(attest in Workspace & Settings\)/);
+  assert.equal(webWording("sample values will be sent at privacy level standard; consider /batch privacy zdr"), "sample values will be sent at privacy level standard; consider setting the privacy level to zdr in Workspace & Settings");
   assert.equal(webWording("Nothing to compact yet."), "Nothing to compact yet.");
 });
+
+test("5: webWordingPayload rewords message fields only, never transcript text or other strings", () => {
+  const hint = CHAT_RETRY_HINT;
+  const out = webWordingPayload({
+    error: hint,
+    warnings: [hint],
+    entries: [{ type: "user", text: hint }],
+    entries2: [{ blocked: hint }],
+    privacy: { reason: hint },
+    other: { reason: hint },
+    catalog: { text: "models fresh (batch endpoints unknown for 1 model; /batch privacy refresh retries)" },
+  }) as Record<string, unknown>;
+  assert.deepEqual(out, {
+    error: "Use Retry Turn.",
+    warnings: ["Use Retry Turn."],
+    entries: [{ type: "user", text: hint }],
+    entries2: [{ blocked: "Use Retry Turn." }],
+    privacy: { reason: "Use Retry Turn." },
+    other: { reason: hint },
+    catalog: { text: "models fresh (batch endpoints unknown for 1 model; Refresh models retries)" },
+  });
+});
+
+test(
+  "5: a refused web retry (secret in the project instructions) says 'then use Retry Turn.'",
+  withWeb(async ({ root, chat, store, post }) => {
+    const t = chat.newThread();
+    store.update(t.id, (th) => {
+      th.lastFailure = { purpose: "turn", code: "provider_error", message: "x", at: new Date().toISOString() };
+    });
+    fs.mkdirSync(join(root, ".pi"), { recursive: true });
+    fs.writeFileSync(join(root, PROJECT_INSTRUCTIONS_FILE), "token ghp_abcdefghijklmnopqrstuvwxyz0123456789\n");
+    const r = await post(`/api/threads/${t.id}/retry`, {});
+    assert.equal(r.status, 400);
+    const err = ((await r.json()) as { error: string }).error;
+    assert.match(err, /, then use Retry Turn\.$/);
+    assert.doesNotMatch(err, /\/batch chat/);
+  }),
+);
 
 test("5: the CLI keeps its wording (the message builders are unchanged)", () => {
   assert.match(SUBMISSION_UNKNOWN_ADVICE, /\/batch chat retry --force/);
@@ -286,3 +333,11 @@ test(
     assert.ok(html.includes('<div id="jobModelNotice"'));
   }, ZDR_CATALOG),
 );
+
+test("5: Retry Failed Items also renders for a one-request job with an unusable item", () => {
+  assert.ok(page().includes('(j.requestCount > 1 || (j.items || []).some((it) => ["failed", "corrupt", "missing"].includes(it.status)))'));
+});
+
+test("compact form closes when another thread is selected", () => {
+  assert.ok(page().includes("if (state.activeThreadId !== threadId) {\n        document.getElementById(\"chatModelAlert\").innerHTML = \"\";\n        window.cancelCompact();"));
+});

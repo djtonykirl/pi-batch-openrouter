@@ -19,7 +19,7 @@ import { atomicWriteFile, isInside, sha256Hex, writeFileAtomicExclusive } from "
 import { jobItems, sourceLabel } from "../items.js";
 import { formatMetadataPreview } from "../metadata-commands.js";
 import { writeApprovedDraft, writeMetadataReview } from "../metadata/outputs.js";
-import { webWording } from "./wording.js";
+import { webWording, webWordingPayload } from "./wording.js";
 import { validateApprovedText } from "../metadata/report.js";
 import { FileLogger } from "../logger.js";
 import { fetchCatalogData, immediateRouteAllowed, immediateRouteRefusal, ModelCatalog, type CatalogData } from "../models/catalog.js";
@@ -1548,9 +1548,8 @@ export class BatchWebServer {
   }
 
   private sendJson(res: http.ServerResponse, status: number, payload: unknown): void {
-    // An `error` (a refusal, a failed send) is shown on the page: word its command hints for the page.
-    const p = payload as Record<string, unknown> | null;
-    if (p && typeof p === "object" && !Array.isArray(p) && typeof p.error === "string") payload = { ...p, error: webWording(p.error) };
+    // Messages shown on the page (errors, refusals, warnings, notices) get page wording for their command hints.
+    payload = webWordingPayload(payload);
     const body = JSON.stringify(payload);
     res.writeHead(status, {
       "Content-Type": "application/json; charset=utf-8",

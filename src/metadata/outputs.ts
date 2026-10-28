@@ -38,6 +38,14 @@ export async function writeMetadataReview(service: BatchService, art: ArtifactSe
   return { manifest: art.execute(plan), outcome: o, gaps };
 }
 
+/** The approved-handoff refusal when tables have no usable proposal (CLI wording; the web page rewords its hint). */
+export function approvedGapsMessage(gapTables: readonly string[], total: number, jobId: string): string {
+  return (
+    `${gapTables.length} of ${total} table(s) have no usable proposal: ${gapTables.join(", ")}.\n` +
+    `Retry them (/batch retry-items ${jobId} --failed), or pass --allow-partial to include them with their existing values unchanged.`
+  );
+}
+
 export async function writeApprovedDraft(
   service: BatchService,
   art: ArtifactService,
@@ -49,10 +57,7 @@ export async function writeApprovedDraft(
   finished(o);
   const gaps = o.tables.filter((t) => !t.proposal);
   if (gaps.length && !opts.allowPartial) {
-    throw new SubmissionBlockedError(
-      `${gaps.length} of ${o.tables.length} table(s) have no usable proposal: ${gaps.map((g) => g.table).join(", ")}.\n` +
-        `Retry them (/batch retry-items ${o.job.localId} --failed), or pass --allow-partial to include them with their existing values unchanged.`,
-    );
+    throw new SubmissionBlockedError(approvedGapsMessage(gaps.map((g) => g.table), o.tables.length, o.job.localId));
   }
   const content = toApprovedJsonl(approvedDraftRows(o));
   const pre = validateApprovedText(content, service, o.job.localId);

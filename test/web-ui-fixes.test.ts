@@ -593,7 +593,7 @@ test(
 
 test("R4/R5: a thread switch clears the model notice; privacy/catalog events coalesce their /api/privacy fetch", () => {
   const s = script();
-  assert.ok(s.includes('if (state.activeThreadId !== threadId) document.getElementById("chatModelAlert").innerHTML = "";'));
+  assert.ok(s.includes('if (state.activeThreadId !== threadId) {\n        document.getElementById("chatModelAlert").innerHTML = "";'));
   assert.ok(s.includes("const privacyRefresh = createCoalescer(loadPrivacy, 250);"));
   assert.ok(s.includes("privacyRefresh.request();"));
   assert.equal(/await loadPrivacy\(\);\s*\}\s*liveRefresh/.test(s), false);

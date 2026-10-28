@@ -57,6 +57,8 @@ export const SUBMISSION_UNKNOWN = "submission_unknown";
 /** What to do after a `submission_unknown` turn failure. Never a plain retry. */
 export const SUBMISSION_UNKNOWN_ADVICE =
   "Check your OpenRouter activity first; only if the turn was not billed, use /batch chat retry --force (a plain retry is refused to avoid paying twice).";
+/** The retry hint on a chat turn failure (CLI wording; the web page shows "Use Retry Turn."). */
+export const CHAT_RETRY_HINT = "Use /batch chat retry.";
 /** Consecutive poller ticks a job manifest may fail to read (Windows EBUSY/EPERM) before a turn is failed. */
 const READ_FAILURE_TICKS = 5;
 /** Lock wait for updates no user is waiting on (settling, recording a job ID or a failure). */
@@ -621,7 +623,7 @@ export class ChatService {
   private jobOutcome(job: JobManifest): { reply?: { text: string; finishReason?: string }; title?: string; error: string; code?: string } {
     const compact = job.chat?.purpose === "compact";
     const what = compact ? "summary" : "reply";
-    const next = compact ? "The thread is unchanged." : "Use /batch chat retry.";
+    const next = compact ? "The thread is unchanged." : CHAT_RETRY_HINT;
     if (job.localStatus !== "ready" && job.localStatus !== "partial") {
       const code = job.error?.code;
       if (code === SUBMISSION_UNKNOWN && !compact) {
@@ -841,7 +843,7 @@ export class ChatService {
     if (p && !p.jobId && isStale(p)) {
       const r = this.adoptStale(thread.id, "turn", p);
       if (r.adopted) p = r.adopted;
-      else if (r.expire) this.recordFailure(thread.id, p, "The turn was never submitted (Pi stopped while sending it). Use /batch chat retry.");
+      else if (r.expire) this.recordFailure(thread.id, p, `The turn was never submitted (Pi stopped while sending it). ${CHAT_RETRY_HINT}`);
     }
     if (c?.jobId) {
       const { job, failure } = this.readLinkedJob(thread.id, c.jobId);
@@ -850,7 +852,7 @@ export class ChatService {
     }
     if (p?.jobId) {
       const { job, failure } = this.readLinkedJob(thread.id, p.jobId);
-      if (failure) this.recordFailure(thread.id, p, `The reply job ${p.jobId} can no longer be read (${failure}). Use /batch chat retry.`, p.jobId);
+      if (failure) this.recordFailure(thread.id, p, `The reply job ${p.jobId} can no longer be read (${failure}). ${CHAT_RETRY_HINT}`, p.jobId);
       if (job && TERMINAL_STATUSES.has(job.localStatus)) this.settle(job);
     }
     // A reply settled here starts automatic compaction too (settle calls afterReply).
@@ -878,7 +880,7 @@ export class ChatService {
   private sendInBackground(threadId: string): void {
     void this.sendUnsent(threadId).catch((err: unknown) => {
       this.logger.log("warn", "chat_send_queued_failed", { threadId, error: errorMessage(err) });
-      this.recordFailure(threadId, undefined, `The queued messages could not be sent: ${errorMessage(err)}. Use /batch chat retry.`);
+      this.recordFailure(threadId, undefined, `The queued messages could not be sent: ${errorMessage(err)}. ${CHAT_RETRY_HINT}`);
     });
   }
 }

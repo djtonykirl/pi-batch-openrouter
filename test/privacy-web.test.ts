@@ -14,6 +14,7 @@ import type { ZdrEndpoint } from "../src/privacy/policy.js";
 import { JobRegistry } from "../src/registry.js";
 import { BatchService } from "../src/service.js";
 import { BatchWebServer } from "../src/web/server.js";
+import { webWordingPayload } from "../src/web/wording.js";
 import { FAKE_KEY, FakeOpenRouter, accepted, makeConfig } from "./fixtures/fake-openrouter.js";
 import { rm, tempWorkspace } from "./helpers.js";
 import { batchEndpointsMatchingZdr } from "./fixtures/catalog.js";
@@ -213,7 +214,7 @@ test(
   withWeb(async ({ cfg, chat, get, catalog }) => {
     cfg.privacy.level = "zdr";
     const proj = (await (await get("/api/models")).json()) as { entries: unknown[]; catalog: { state: string } };
-    assert.deepEqual(proj.entries, pickerEntries(catalog.snapshot(), ["y/model", "x/other"], "zdr", false));
+    assert.deepEqual(proj.entries, webWordingPayload(pickerEntries(catalog.snapshot(), ["y/model", "x/other"], "zdr", false), "entries"));
     assert.equal(proj.catalog.state, "fresh");
 
     cfg.privacy.level = "standard";
@@ -221,7 +222,7 @@ test(
     chat.raisePrivacy(t.id, "no-training");
     const thread = (await (await get(`/api/models?threadId=${t.id}`)).json()) as { entries: unknown[]; level: string };
     assert.equal(thread.level, "no-training");
-    assert.deepEqual(thread.entries, pickerEntries(catalog.snapshot(), ["y/model", "x/other"], "no-training", false));
+    assert.deepEqual(thread.entries, webWordingPayload(pickerEntries(catalog.snapshot(), ["y/model", "x/other"], "no-training", false), "entries"));
     assert.equal((await get("/api/models?threadId=nope")).status, 400);
   }),
 );

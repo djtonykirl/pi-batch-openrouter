@@ -2537,7 +2537,8 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         (isActive ? '<button class="btn btn-sm" ' + act("pollSingleJob", j.localId) + '>🔄 Poll Now</button>' : "") +
         (isActive || isPreviewed ? '<button class="btn btn-sm btn-danger" ' + act("cancelBatchJob", j.localId) + '>Cancel</button>' : "") +
         (isTerminal && !isChat ? '<button class="btn btn-sm" ' + act("retryBatchJob", j.localId, false) + '>🔁 Retry All</button>' : "") +
-        (isTerminal && !isChat && j.requestCount > 1 ? '<button class="btn btn-sm" ' + act("retryBatchJob", j.localId, true) + '>🔁 Retry Failed Items</button>' : "") +
+        // Also for a one-request job with an unusable item, which refusals point at ("Retry Failed Items button").
+        (isTerminal && !isChat && (j.requestCount > 1 || (j.items || []).some((it) => ["failed", "corrupt", "missing"].includes(it.status))) ? '<button class="btn btn-sm" ' + act("retryBatchJob", j.localId, true) + '>🔁 Retry Failed Items</button>' : "") +
         ((j.localStatus === "ready" || j.localStatus === "partial") && !isChat && j.requestCount > 1 && j.kind !== "synthesis"
           ? '<button class="btn btn-sm btn-primary" ' + act("synthesizeBatchJob", j.localId) + '>✨ Synthesize</button>'
           : "") +
