@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { OpenRouterBatchClient, parseModels, parseZdrEndpoints } from "../src/openrouter/client.js";
 import { ModelCatalog, type CatalogModel } from "../src/models/catalog.js";
+import { pickerEntries } from "../src/privacy/commands.js";
 import type { ZdrEndpoint } from "../src/privacy/policy.js";
 import { MODELS_RESPONSE, ZDR_RESPONSE } from "./fixtures/catalog.js";
 
@@ -90,6 +91,28 @@ test("failed load falls back to last-known with fresh=false", async () => {
   assert.match(snap.error ?? "", /offline/);
   assert.deepEqual(snap.models, MODELS);
   assert.deepEqual(cat.snapshot(), snap);
+});
+
+test("a corrupt disk copy: malformed models and zdr elements are dropped, so pickerEntries can't throw", async () => {
+  const file = tmpFile();
+  fs.writeFileSync(
+    file,
+    JSON.stringify({
+      models: [null, 42, "x", { id: 7, name: "bad", free: true }, { name: "no id", free: true }, { id: "e/f:free", name: "E", free: "yes" }, ...MODELS],
+      zdr: [null, { model: 1, provider: "p" }, { model: "a/b" }, [], ...ZDR],
+      loadedAt: "2026-10-27T09:00:00.000Z",
+    }),
+  );
+  const cat = new ModelCatalog({ file, fetch: async () => { throw new Error("offline"); } });
+  const snap = await cat.load();
+  assert.equal(snap.fresh, false);
+  assert.deepEqual(snap.models, MODELS);
+  assert.deepEqual(snap.zdr, ZDR);
+  for (const level of ["standard", "no-training", "zdr"] as const) {
+    const entries = pickerEntries(snap, ["a/b", "x/y"], level, false);
+    assert.ok(entries.some((e) => e.id === "c/d:free"));
+  }
+  assert.deepEqual(cat.labels("a/b"), { free: false, zdr: true });
 });
 
 test("failed load with no disk copy yields an empty non-fresh snapshot", async () => {

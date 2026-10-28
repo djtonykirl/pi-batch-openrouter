@@ -94,11 +94,30 @@ export class ModelCatalog {
     try {
       const j = JSON.parse(fs.readFileSync(this.deps.file, "utf8")) as Record<string, unknown>;
       if (!Array.isArray(j.models) || !Array.isArray(j.zdr)) return undefined;
-      return { models: j.models as CatalogModel[], zdr: j.zdr as ZdrEndpoint[], loadedAt: typeof j.loadedAt === "string" ? j.loadedAt : undefined };
+      // The file is outside this process's control: malformed elements are dropped, so callers can rely on the types.
+      return { models: j.models.filter(isCatalogModel), zdr: j.zdr.filter(isZdrEndpoint), loadedAt: typeof j.loadedAt === "string" ? j.loadedAt : undefined };
     } catch {
       return undefined;
     }
   }
+}
+
+function isCatalogModel(v: unknown): v is CatalogModel {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
+  const m = v as Record<string, unknown>;
+  return (
+    typeof m.id === "string" &&
+    m.id.length > 0 &&
+    typeof m.name === "string" &&
+    typeof m.free === "boolean" &&
+    (m.contextLength === undefined || (typeof m.contextLength === "number" && Number.isFinite(m.contextLength)))
+  );
+}
+
+function isZdrEndpoint(v: unknown): v is ZdrEndpoint {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
+  const e = v as Record<string, unknown>;
+  return typeof e.model === "string" && e.model.length > 0 && typeof e.provider === "string" && e.provider.length > 0;
 }
 
 function errorText(err: unknown): string {
