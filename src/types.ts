@@ -222,7 +222,17 @@ export interface JobManifest {
    */
   privacy?: { level: PrivacyLevel; route: Route; enforcement: string };
   /** Deletion of the finished batch at OpenRouter (strict levels only). Absent when not applicable. */
-  remoteDeletion?: { state: "pending" | "done" | "failed"; attempts: number; lastError?: string; at?: string };
+  remoteDeletion?: {
+    state: "pending" | "done" | "failed";
+    /** DELETE calls made (a missing API key is not an attempt). */
+    attempts: number;
+    lastError?: string;
+    at?: string;
+    /** When the first DELETE was made; the 24-hour limit runs from here. */
+    firstAttemptAt?: string;
+    /** Earliest time of the next attempt (exponential backoff). */
+    nextAttemptAt?: string;
+  };
   endpoint: "/v1/chat/completions";
   format: "markdown" | "json";
 

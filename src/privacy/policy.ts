@@ -81,6 +81,10 @@ export function resolveBatchProvider(input: {
   return { ok: true, provider: { only, allow_fallbacks: false }, enforcement: `pinned to ZDR providers: ${only.join(", ")}` };
 }
 
+/** Retention lines (`/batch show`, `/batch chat context`, web job detail). */
+export const RETENTION_DELETED = "Batch jobs are held at OpenRouter until finished; deleted after retrieval, or once they fail, expire or are cancelled";
+export const RETENTION_KEPT = "Batch jobs are kept up to 30 days";
+
 export function immediateProviderFields(level: PrivacyLevel): { data_collection?: "deny"; zdr?: true } {
   if (level === "no-training") return { data_collection: "deny" };
   if (level === "zdr") return { zdr: true };

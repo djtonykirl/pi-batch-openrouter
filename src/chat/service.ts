@@ -11,6 +11,8 @@ import {
   normaliseModelSlug,
   PRIVACY_LEVELS,
   resolveBatchProvider,
+  RETENTION_DELETED,
+  RETENTION_KEPT,
   routeForModel,
   type PrivacyLevel,
   type Route,
@@ -291,9 +293,7 @@ export class ChatService {
   /** The batch-retention line for `/batch chat context`. */
   public batchRetentionLine(threadId: string): string {
     const strict = this.effectiveLevel(threadId) !== "standard";
-    return strict && this.privacy().deleteRemoteBatches
-      ? "Batch jobs are held at OpenRouter until finished; deleted after retrieval"
-      : "Batch jobs are kept up to 30 days";
+    return strict && this.privacy().deleteRemoteBatches ? RETENTION_DELETED : RETENTION_KEPT;
   }
 
   /**

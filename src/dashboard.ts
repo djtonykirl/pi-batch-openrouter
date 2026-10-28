@@ -1,6 +1,7 @@
 import type { Component } from "@earendil-works/pi-tui";
 import { matchesKey, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { ACTIVE_STATUSES, TERMINAL_STATUSES as TERMINAL, type LocalStatus } from "./state.js";
+import { RETENTION_DELETED, RETENTION_KEPT } from "./privacy/policy.js";
 import { formatIsoShort } from "./time.js";
 import { sourceLabel } from "./items.js";
 import { isDatasetWorkflow, isMetadataWorkflow, type JobManifest } from "./types.js";
@@ -231,7 +232,20 @@ function remoteDeletionCell(job: JobManifest): string | undefined {
   if (!d) return undefined;
   const at = d.at ? ` ${formatIsoShort(d.at)}` : "";
   const err = d.lastError ? `, last error: ${d.lastError}` : "";
-  return `${d.state}${at} (${d.attempts} attempt${d.attempts === 1 ? "" : "s"}${err})`;
+  const next = d.state === "pending" && d.nextAttemptAt ? `, next attempt ${formatIsoShort(d.nextAttemptAt)}` : "";
+  const cell = `${d.state}${at} (${d.attempts} attempt${d.attempts === 1 ? "" : "s"}${next}${err})`;
+  return d.state === "failed" ? `${cell}; NEEDS ATTENTION: the batch is still at OpenRouter (kept up to 30 days); delete it there` : cell;
+}
+
+/**
+ * Where a batch job's data stays at OpenRouter, for a job not (yet) marked for deletion; undefined for an immediate
+ * job or one marked for deletion (its "Remote deletion" row says what happened). A strict-level job that is still
+ * running will be deleted when it ends; any other job is kept up to 30 days.
+ */
+export function retentionLine(job: JobManifest, deleteRemoteBatches: boolean): string | undefined {
+  if ((job.route ?? "batch") !== "batch" || job.remoteDeletion) return undefined;
+  const strict = job.privacy?.level === "no-training" || job.privacy?.level === "zdr";
+  return strict && deleteRemoteBatches && !TERMINAL.has(job.localStatus) ? RETENTION_DELETED : RETENTION_KEPT;
 }
 
 function workflowCell(job: JobManifest): string | undefined {

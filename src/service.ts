@@ -300,8 +300,11 @@ const RECONCILE_STATUSES: ReadonlySet<LocalStatus> = new Set<LocalStatus>([...PO
 const INTERRUPTED_AFTER_MS = 30_000;
 /** Poll interval while an explicit user check waits for another check's lock. */
 const LOCK_RETRY_MS = 250;
-/** Remote batch deletion is abandoned (state "failed") after this many attempts. */
-const MAX_DELETION_ATTEMPTS = 10;
+/** Remote batch deletion backoff: 30 s x 2^(attempt-1), capped at 1 h. */
+const DELETION_BACKOFF_BASE_MS = 30_000;
+const DELETION_BACKOFF_MAX_MS = 60 * 60_000;
+/** Remote batch deletion is abandoned (state "failed", needs attention) this long after the first attempt. */
+export const DELETION_TIME_LIMIT_MS = 24 * 60 * 60_000;
 /** Added to the request timeout: how long an immediate call recorded as started may still be in flight elsewhere. */
 const IMMEDIATE_IN_FLIGHT_MARGIN_MS = 30_000;
 /** How long `/batch check <id>` waits for an in-flight check before reporting "busy". */
@@ -1324,11 +1327,14 @@ export class BatchService {
       } else if (s === "failed") {
         m.error = { code: "provider_failed", message: fetched.errorMessage ?? "OpenRouter reported the batch as failed" };
         u.transition("failed", { providerStatus: s });
+        this.markRemoteDeletion(u);
       } else if (s === "expired") {
         m.error = { code: "provider_expired", message: "OpenRouter did not complete the batch within its 24h window" };
         u.transition("expired", { providerStatus: s });
+        this.markRemoteDeletion(u);
       } else if (s === "cancelled") {
         u.transition("cancelled", { providerStatus: s });
+        this.markRemoteDeletion(u);
       } else if (providerChanged) {
         // validating / in_progress / finalizing / cancelling / unknown future values
         u.transition(m.localStatus === "cancel_requested" ? "cancel_requested" : "polling", { providerStatus: s });
@@ -1600,18 +1606,8 @@ export class BatchService {
         delete m.error;
       }
       u.transition(next, { finalResponse: path.basename(finalPath), ...counts, issues: normalised.issues.length ? normalised.issues : undefined, ...details });
-      // The raw final response is on disk. Whether to delete depends only on this job's OWN recorded level.
-      const ownLevel = m.privacy?.level;
-      if (
-        (ownLevel === "no-training" || ownLevel === "zdr") &&
-        this.privacyConfig().deleteRemoteBatches &&
-        m.route !== "immediate" &&
-        m.providerBatchId &&
-        !m.remoteDeletion
-      ) {
-        m.remoteDeletion = { state: "pending", attempts: 0 };
-        u.note("remote_deletion_pending", { level: ownLevel });
-      }
+      // The raw final response is on disk.
+      this.markRemoteDeletion(u);
       return m;
     });
     this.logger.log(next === "ready" ? "info" : "warn", "retrieved", { localId, providerBatchId: job.providerBatchId, outcome: next, ...counts });
@@ -1619,18 +1615,52 @@ export class BatchService {
   }
 
   /**
-   * Deletes finished batches at OpenRouter for jobs marked pending (strict levels only).
-   * Never changes localStatus; each attempt is an event. Gives up as `failed` after 10 attempts.
+   * Marks a batch that has ended at OpenRouter (retrieved, failed, expired or cancelled) for deletion there, when this
+   * job's OWN recorded level is no-training or zdr and `deleteRemoteBatches` is on. Never on the current config level,
+   * and never for a batch OpenRouter already reported gone (410), which does not come through here.
+   */
+  private markRemoteDeletion(u: JobUpdate): void {
+    const m = u.manifest;
+    const ownLevel = m.privacy?.level;
+    if ((ownLevel !== "no-training" && ownLevel !== "zdr") || m.route === "immediate" || !m.providerBatchId || m.remoteDeletion) return;
+    if (!this.privacyConfig().deleteRemoteBatches) return;
+    m.remoteDeletion = { state: "pending", attempts: 0 };
+    u.note("remote_deletion_pending", { level: ownLevel, localStatus: m.localStatus });
+  }
+
+  /**
+   * Deletes ended batches at OpenRouter for jobs marked pending (strict levels only). Never changes localStatus; each
+   * attempt is an event. A failed attempt is retried with exponential backoff (`nextAttemptAt`: 30 s x 2^n, capped at
+   * 1 h); 24 hours after the first attempt the deletion is given up as `failed`, which needs the user's attention. A
+   * missing API key is not an attempt: it neither counts nor starts the 24-hour limit.
    */
   public async runRemoteDeletions(): Promise<void> {
-    const pending = this.registry.list().jobs.filter((j) => j.remoteDeletion?.state === "pending" && j.route !== "immediate" && j.providerBatchId);
+    const now = Date.now();
+    const pending = this.registry
+      .list()
+      .jobs.filter((j) => j.remoteDeletion?.state === "pending" && j.route !== "immediate" && j.providerBatchId && !(j.remoteDeletion.nextAttemptAt && isoToEpochMs(j.remoteDeletion.nextAttemptAt) > now));
     for (const job of pending) {
       const localId = job.localId;
+      let apiKey = "";
+      let keyError: string | undefined;
+      try {
+        apiKey = await this.deps.resolveApiKey(job.account);
+      } catch (err) {
+        keyError = (err as Error).message;
+      }
+      if (!apiKey) {
+        const lastError = `no API key available for account "${job.account}"${keyError ? ` (${keyError})` : ""}; not counted as an attempt`;
+        this.registry.update(localId, (u) => {
+          const prev = u.manifest.remoteDeletion;
+          if (prev?.state === "pending" && prev.lastError !== lastError) u.manifest.remoteDeletion = { ...prev, lastError };
+          return u.manifest;
+        });
+        this.logger.log("warn", "remote_delete_no_key", { localId, account: job.account });
+        continue;
+      }
       let deleted = false;
       let error: string | undefined;
       try {
-        const apiKey = await this.deps.resolveApiKey(job.account);
-        if (!apiKey) throw new Error(`no API key available for account "${job.account}"`);
         const res = await this.client(apiKey).deleteBatch(job.providerBatchId!);
         deleted = res.deleted;
         if (!deleted) error = res.detail ? `not finished yet: ${res.detail}` : "not finished yet (HTTP 409)";
@@ -1642,14 +1672,22 @@ export class BatchService {
         if (prev?.state !== "pending") return u.manifest;
         const attempts = prev.attempts + 1;
         const at = nowIso();
+        const firstAttemptAt = prev.firstAttemptAt ?? at;
         if (deleted) {
-          u.manifest.remoteDeletion = { state: "done", attempts, at };
+          u.manifest.remoteDeletion = { state: "done", attempts, at, firstAttemptAt };
           u.note("remote_deletion_done", { attempts });
-        } else {
-          const failed = attempts >= MAX_DELETION_ATTEMPTS;
-          u.manifest.remoteDeletion = { state: failed ? "failed" : "pending", attempts, lastError: error ?? "unknown error", at };
-          u.note(failed ? "remote_deletion_failed" : "remote_deletion_retry", { attempts, error });
+          return u.manifest;
         }
+        const lastError = error ?? "unknown error";
+        if (Date.now() - isoToEpochMs(firstAttemptAt) >= DELETION_TIME_LIMIT_MS) {
+          u.manifest.remoteDeletion = { state: "failed", attempts, lastError, at, firstAttemptAt };
+          u.note("remote_deletion_failed", { attempts, error });
+          return u.manifest;
+        }
+        const backoffMs = Math.min(DELETION_BACKOFF_MAX_MS, DELETION_BACKOFF_BASE_MS * 2 ** (attempts - 1));
+        const nextAttemptAt = new Date(Date.now() + backoffMs).toISOString();
+        u.manifest.remoteDeletion = { state: "pending", attempts, lastError, at, firstAttemptAt, nextAttemptAt };
+        u.note("remote_deletion_retry", { attempts, error, nextAttemptAt });
         return u.manifest;
       });
       this.logger.log(deleted ? "info" : "warn", deleted ? "remote_deleted" : "remote_delete_failed", { localId, providerBatchId: job.providerBatchId, ...(error ? { error } : {}) });

@@ -2626,10 +2626,14 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
       const d = j.remoteDeletion;
       if (d) {
         if (d.state === "done") return "deleted at OpenRouter " + (d.at || "");
-        if (d.state === "pending") return "deletion pending (attempt " + d.attempts + ")" + (d.lastError ? ": " + d.lastError : "");
-        return "deletion failed after " + d.attempts + " attempt(s)" + (d.lastError ? ": " + d.lastError : "") + "; kept up to 30 days";
+        if (d.state === "pending") return "deletion pending (attempt " + d.attempts + (d.nextAttemptAt ? ", next " + d.nextAttemptAt : "") + ")" + (d.lastError ? ": " + d.lastError : "");
+        return "NEEDS ATTENTION: deletion failed after " + d.attempts + " attempt(s)" + (d.lastError ? ": " + d.lastError : "") + "; the batch is kept at OpenRouter up to 30 days, delete it there";
       }
       if ((j.route || "batch") === "immediate") return "not applicable (no provider batch)";
+      const strict = !!j.privacy && (j.privacy.level === "no-training" || j.privacy.level === "zdr");
+      const ended = ["ready", "partial", "failed", "cancelled", "expired", "corrupt"].includes(j.localStatus);
+      const deleting = !state.privacy || state.privacy.deleteRemoteBatches !== false;
+      if (strict && deleting && !ended) return "held at OpenRouter until finished; deleted when it ends";
       return "kept up to 30 days";
     }
 

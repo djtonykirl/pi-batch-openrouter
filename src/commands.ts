@@ -2,7 +2,7 @@ import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { parseArgs, tokenize, type ParsedArgs } from "./args.js";
 import { saveConfigUpdate } from "./config.js";
-import { BatchDashboardComponent, TextViewerComponent, describeJob, itemsCell } from "./dashboard.js";
+import { BatchDashboardComponent, TextViewerComponent, describeJob, itemsCell, retentionLine } from "./dashboard.js";
 import { discoverBatchModels } from "./models.js";
 import { INJECTED_MESSAGE_TYPE, type BatchRuntime } from "./runtime.js";
 import { jobItems, sourceLabel } from "./items.js";
@@ -439,10 +439,8 @@ async function cmdShow(rt: BatchRuntime, rest: string[], ctx: ExtensionCommandCo
     ),
   ];
   if (job.usage) lines.push("", `  Usage: ${formatUsage(job.usage)}`);
-  if ((job.route ?? "batch") === "batch" && !job.remoteDeletion) {
-    const strict = job.privacy?.level === "no-training" || job.privacy?.level === "zdr";
-    lines.push("", `  ${strict && rt.loaded.config.privacy.deleteRemoteBatches ? "Batch jobs are held at OpenRouter until finished; deleted after retrieval" : "Batch jobs are kept up to 30 days"}`);
-  }
+  const retention = retentionLine(job, service.privacyConfig().deleteRemoteBatches);
+  if (retention) lines.push("", `  ${retention}`);
   const items = jobItems(service.registry, job);
   if (items.length > 1 || job.workflow || job.kind === "synthesis") {
     const c = itemCounts(items.map((i) => i.status));
