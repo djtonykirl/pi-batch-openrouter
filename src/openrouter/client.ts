@@ -170,6 +170,17 @@ export class OpenRouterBatchClient {
     return { raw, endpoints: parseZdrEndpoints(raw.bodyText) };
   }
 
+  /**
+   * GET /models/{author}/{slug}:batch/endpoints (public): the endpoint tags a batch job for `model` can run on. These
+   * differ from the sync endpoints that /endpoints/zdr lists, and the Batch API checks `provider.only` against them.
+   */
+  public async listBatchEndpoints(model: string): Promise<{ raw: RawExchange; tags: string[] }> {
+    const id = `${normaliseModelSlug(model)}:batch`;
+    const pathName = `/models/${id.split("/").map((seg) => encodeURIComponent(seg).replace(/%3A/gi, ":")).join("/")}/endpoints`;
+    const raw = await this.request("GET", pathName, "batch_endpoints");
+    return { raw, tags: parseBatchEndpointTags(raw.bodyText) };
+  }
+
   private async request(method: string, pathName: string, operation: string, body?: string): Promise<RawExchange> {
     const headers: Record<string, string> = {
       Authorization: `Bearer ${this.opts.apiKey}`,
@@ -287,6 +298,25 @@ export function parseZdrEndpoints(text: string): ZdrEndpoint[] {
     out.push({ model, provider: e.tag });
   }
   return out;
+}
+
+/** Parses GET /models/{id}:batch/endpoints: `{ data: { endpoints: [{ tag, ... }] } }`. Unique non-empty tags, in order. */
+export function parseBatchEndpointTags(text: string): string[] {
+  let json: unknown;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new OpenRouterError("protocol", undefined, "response is not valid JSON", "batch_endpoints");
+  }
+  const data = json && typeof json === "object" ? (json as Record<string, unknown>).data : undefined;
+  const endpoints = data && typeof data === "object" ? (data as Record<string, unknown>).endpoints : undefined;
+  if (!Array.isArray(endpoints)) throw new OpenRouterError("protocol", undefined, "response has no data.endpoints array", "batch_endpoints");
+  const tags: string[] = [];
+  for (const e of endpoints) {
+    const tag = e && typeof e === "object" ? (e as Record<string, unknown>).tag : undefined;
+    if (typeof tag === "string" && tag && !tags.includes(tag)) tags.push(tag);
+  }
+  return tags;
 }
 
 /** Minimal structural validation of a batch object. Unknown fields are tolerated (and preserved in raw). */

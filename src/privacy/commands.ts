@@ -1,10 +1,10 @@
 import * as fs from "node:fs";
 import { GLOBAL_CONFIG_FILE, projectConfigPath, saveConfigUpdate } from "../config.js";
 import type { CatalogSnapshot } from "../models/catalog.js";
-import { formatRoutingPolicy, providerAllowed } from "../openrouter/routing.js";
+import { formatRoutingPolicy } from "../openrouter/routing.js";
 import type { BatchRuntime } from "../runtime.js";
 import { formatIsoShort } from "../time.js";
-import { isPrivacyLevel, normaliseModelSlug, PRIVACY_LEVELS, routeForModel, type PrivacyLevel, type Route } from "./policy.js";
+import { batchZdrView, isPrivacyLevel, normaliseModelSlug, resolveBatchProvider, PRIVACY_LEVELS, routeForModel, type PrivacyLevel, type Route } from "./policy.js";
 
 export const PRIVACY_SETTINGS_URL = "https://openrouter.ai/settings/privacy";
 
@@ -31,7 +31,7 @@ export function pickerEntries(
   batchModels: string[],
   level: PrivacyLevel,
   accountNoTraining: boolean,
-  /** routing.allowedProviders: at zdr, a batch model with no ZDR endpoint in the list is blocked (as decidePrivacy would). */
+  /** routing.allowedProviders: at zdr, a batch model is checked with resolveBatchProvider, so it is blocked exactly as a submit would be. */
   allowedProviders: readonly string[] = [],
 ): PickerEntry[] {
   const candidates = new Map<string, Route>();
@@ -42,15 +42,17 @@ export function pickerEntries(
   const out: PickerEntry[] = [];
   for (const [id, route] of candidates) {
     const base = normaliseModelSlug(id);
-    const hasZdr = !!catalog?.zdr.some((e) => e.model === base);
+    // Batch route: ZDR only when a batch endpoint is on the ZDR list. Immediate route: the sync ZDR endpoints, since its
+    // requests carry `zdr: true`.
+    const hasZdr = route === "batch" ? batchZdrView(catalog, base).pinnable.length > 0 : !!catalog?.zdr.some((e) => e.model === base);
     const labels = [route === "batch" ? "batch" : "free", ...(hasZdr ? ["ZDR"] : [])];
     const entry: PickerEntry = { id, route, labels };
     if (level === "zdr") {
-      if (!catalog?.fresh) entry.blocked = "Privacy level zdr: model catalog not loaded this session, so ZDR providers can't be verified (run /batch privacy refresh)";
+      if (route === "batch") {
+        const d = resolveBatchProvider({ level, model: id, catalog, accountNoTraining, allowedProviders });
+        if (!d.ok) entry.blocked = d.reason;
+      } else if (!catalog?.fresh) entry.blocked = "Privacy level zdr: model catalog not loaded this session, so ZDR providers can't be verified (run /batch privacy refresh)";
       else if (!hasZdr) entry.blocked = `Privacy level zdr: no ZDR provider for ${base}`;
-      else if (route === "batch" && allowedProviders.length && !catalog.zdr.some((e) => e.model === base && providerAllowed(allowedProviders, e.provider))) {
-        entry.blocked = `Privacy level zdr: no ZDR provider for ${base} within routing.allowedProviders (${allowedProviders.join(", ")})`;
-      }
     } else if (level === "no-training" && route === "batch" && !accountNoTraining) {
       entry.blocked = "Privacy level no-training: batch models need your account's no-training attestation (/batch privacy attest)";
     }

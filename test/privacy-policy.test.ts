@@ -19,6 +19,8 @@ const catalog: CatalogView = {
     { model: "a/b", provider: "p1" },
     { model: "c/d", provider: "p3" },
   ],
+  // Every ZDR endpoint is also a batch endpoint; e/f has a batch endpoint but no ZDR one.
+  batchEndpoints: { "a/b": ["p1", "p2"], "c/d": ["p3"], "e/f": ["p4"] },
 };
 
 test("levels order and stricter", () => {
@@ -92,7 +94,7 @@ test("zdr refuses when the model has no ZDR provider", () => {
   assert.equal(d.ok, false);
   if (!d.ok) {
     assert.ok(d.reason.startsWith("Privacy level zdr: "));
-    assert.match(d.reason, /no ZDR provider/);
+    assert.equal(d.reason, "Privacy level zdr: e/f has no batch endpoint on OpenRouter's ZDR list (its batch endpoints: p4; ZDR endpoints: none)");
   }
 });
 

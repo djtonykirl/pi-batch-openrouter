@@ -133,3 +133,33 @@ export const ZDR_RESPONSE = {
     }
   ]
 };
+
+/** Trimmed sample captured on 2026-10-28 with `curl -s https://openrouter.ai/api/v1/models/google/gemini-3.8-flash:batch/endpoints` (public, unauthenticated). */
+export const BATCH_ENDPOINTS_RESPONSE = {
+  "data": {
+    "id": "google/gemini-3.8-flash:batch",
+    "name": "Google: Gemini 3.8 Flash (batch)",
+    "endpoints": [
+      {
+        "name": "Google | google/gemini-3.8-flash-20260902:batch",
+        "model_id": "google/gemini-3.8-flash:batch",
+        "model_name": "Google: Gemini 3.8 Flash",
+        "context_length": 1048576,
+        "provider_name": "Google",
+        "tag": "google-vertex/global",
+        "quantization": "unknown",
+        "status": 0
+      }
+    ]
+  }
+};
+
+/**
+ * Batch endpoints for stubs written before batch endpoints were loaded: every ZDR endpoint of a model is also one of
+ * its batch endpoints, so the zdr pin is exactly the model's ZDR tags (what those tests expect).
+ */
+export function batchEndpointsMatchingZdr(zdr: readonly { model: string; provider: string }[]): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  for (const e of zdr) (out[e.model] ??= []).push(e.provider);
+  return out;
+}

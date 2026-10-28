@@ -20,7 +20,7 @@ const MODELS: CatalogModel[] = [
 const ZDR: ZdrEndpoint[] = [{ model: "a/b", provider: "azure" }];
 
 test("an explicit immediate route needs a :free ID or a catalog loaded this session that lists the model as free", () => {
-  const snap = (fresh: boolean) => ({ fresh, zdr: [], models: [{ id: "z/zero-priced", name: "Z", free: true }], loadedAt: "2026-10-28T09:00:00.000Z" });
+  const snap = (fresh: boolean) => ({ fresh, zdr: [], batchEndpoints: {}, models: [{ id: "z/zero-priced", name: "Z", free: true }], loadedAt: "2026-10-28T09:00:00.000Z" });
   assert.equal(immediateRouteAllowed("c/one:free", undefined), true);
   assert.equal(immediateRouteAllowed("z/zero-priced", snap(true)), true);
   assert.equal(immediateRouteAllowed("z/zero-priced", snap(false)), false, "a copy read from disk may be out of date: never decides a route");
@@ -78,7 +78,7 @@ test("load is deduplicated", async () => {
 
 test("a successful load is fresh and saved to disk", async () => {
   const file = tmpFile();
-  const cat = new ModelCatalog({ file, fetch: async () => ({ models: MODELS, zdr: ZDR }), now: () => new Date("2026-10-27T00:00:00Z") });
+  const cat = new ModelCatalog({ file, fetch: async () => ({ models: MODELS, zdr: ZDR, batchEndpoints: { "a/b": ["azure"] } }), now: () => new Date("2026-10-27T00:00:00Z") });
   const snap = await cat.load();
   assert.equal(snap.fresh, true);
   assert.equal(snap.error, undefined);
@@ -87,6 +87,7 @@ test("a successful load is fresh and saved to disk", async () => {
   const onDisk = JSON.parse(fs.readFileSync(file, "utf8"));
   assert.deepEqual(onDisk.models, MODELS);
   assert.deepEqual(onDisk.zdr, ZDR);
+  assert.deepEqual(onDisk.batchEndpoints, { "a/b": ["azure"] });
   assert.deepEqual(cat.labels("c/d:free"), { free: true, zdr: false });
   assert.deepEqual(cat.labels("a/b:batch"), { free: false, zdr: true });
   assert.deepEqual(cat.labels("unknown/x"), { free: false, zdr: false });
@@ -110,6 +111,7 @@ test("a corrupt disk copy: malformed models and zdr elements are dropped, so pic
     JSON.stringify({
       models: [null, 42, "x", { id: 7, name: "bad", free: true }, { name: "no id", free: true }, { id: "e/f:free", name: "E", free: "yes" }, ...MODELS],
       zdr: [null, { model: 1, provider: "p" }, { model: "a/b" }, [], ...ZDR],
+      batchEndpoints: { "a/b": ["azure", 5], "x/y": "bad" },
       loadedAt: "2026-10-27T09:00:00.000Z",
     }),
   );
@@ -118,6 +120,7 @@ test("a corrupt disk copy: malformed models and zdr elements are dropped, so pic
   assert.equal(snap.fresh, false);
   assert.deepEqual(snap.models, MODELS);
   assert.deepEqual(snap.zdr, ZDR);
+  assert.deepEqual(snap.batchEndpoints, { "a/b": ["azure"] });
   for (const level of ["standard", "no-training", "zdr"] as const) {
     const entries = pickerEntries(snap, ["a/b", "x/y"], level, false);
     assert.ok(entries.some((e) => e.id === "c/d:free"));
@@ -131,6 +134,7 @@ test("failed load with no disk copy yields an empty non-fresh snapshot", async (
   assert.equal(snap.fresh, false);
   assert.deepEqual(snap.models, []);
   assert.deepEqual(snap.zdr, []);
+  assert.deepEqual(snap.batchEndpoints, {});
   assert.ok(snap.error);
 });
 

@@ -7,9 +7,8 @@ import { BatchPoller } from "./poller.js";
 import { JobRegistry } from "./registry.js";
 import { ArtifactService } from "./artifacts/service.js";
 import { ArtifactStore } from "./artifacts/store.js";
-import { ModelCatalog, type CatalogModel } from "./models/catalog.js";
+import { fetchCatalogData, ModelCatalog, type CatalogData } from "./models/catalog.js";
 import { OpenRouterBatchClient } from "./openrouter/client.js";
-import type { ZdrEndpoint } from "./privacy/policy.js";
 import { BatchService } from "./service.js";
 import { isChatJob, type JobManifest } from "./types.js";
 import { ChatService } from "./chat/service.js";
@@ -132,11 +131,10 @@ export class BatchRuntime {
   }
 
   /** Both endpoints are public; the key is only sent as the client requires one. Without a key the load fails and the catalog stays stale (fail-safe). */
-  private async fetchCatalog(): Promise<{ models: CatalogModel[]; zdr: ZdrEndpoint[] }> {
+  private async fetchCatalog(): Promise<CatalogData> {
     const apiKey = await this.resolveApiKey(this.loaded.config.defaultAccount);
     const client = new OpenRouterBatchClient({ apiKey, timeoutMs: this.loaded.config.polling.requestTimeoutSeconds * 1000 });
-    const [models, zdr] = await Promise.all([client.listModels(), client.listZdrEndpoints()]);
-    return { models: models.models, zdr: zdr.endpoints };
+    return fetchCatalogData(client, this.logger ?? undefined);
   }
 
   public requireArtifacts(): ArtifactService {

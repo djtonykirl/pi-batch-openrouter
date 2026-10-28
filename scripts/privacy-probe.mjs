@@ -6,9 +6,11 @@
 // Submits up to three single-request batches (max_tokens 1, content "ping") for <model>:
 //   1. provider: { data_collection: "deny" }
 //   2. provider: { zdr: true }
-//   3. provider: { only: [<first ZDR endpoint tag for the model>], allow_fallbacks: false }
+//   3. provider: { only: [<first batch endpoint tag of the model that is also on the ZDR list>], allow_fallbacks: false }
 // and reports ACCEPTED or REJECTED for each. The third confirms that the Batch API takes the full endpoint tags
-// (for example "azure/eu") that the extension pins at privacy level zdr. It is skipped when the model has no ZDR endpoint.
+// (for example "google-vertex/global") that the extension pins at privacy level zdr. Batch jobs run only on the model's
+// :batch endpoints (GET /models/{id}:batch/endpoints), which differ from the sync endpoints /endpoints/zdr lists, so the
+// third probe is skipped when none of the model's batch endpoints is on the ZDR list.
 //
 // THIS BILLS YOUR ACCOUNT (a few tokens per accepted batch). It never runs unless you type "yes".
 // Exit codes: 0 done, 1 usage error or no API key, 2 not confirmed.
@@ -113,16 +115,32 @@ async function probe(key, model, label, provider, accepted) {
   }
 }
 
-async function firstZdrTag(key, model) {
-  const r = await call(key, "GET", "/endpoints/zdr");
-  if (r.status < 200 || r.status >= 300) {
-    console.log(`Could not load the ZDR endpoint list (${r.status}: ${errorDetail(r)}); skipping the endpoint-tag probe.`);
+/** The first of the model's :batch endpoint tags that is also one of its ZDR endpoint tags, or undefined (with the reason printed). */
+async function firstBatchZdrTag(key, model) {
+  const want = normalise(model);
+  const z = await call(key, "GET", "/endpoints/zdr");
+  if (z.status < 200 || z.status >= 300) {
+    console.log(`Could not load the ZDR endpoint list (${z.status}: ${errorDetail(z)}); skipping the endpoint-tag probe.`);
     return undefined;
   }
-  const list = Array.isArray(r.json?.data) ? r.json.data : Array.isArray(r.json) ? r.json : [];
-  const want = normalise(model);
-  const hit = list.find((e) => typeof e?.model_id === "string" && typeof e?.tag === "string" && normalise(e.model_id) === want);
-  return hit?.tag;
+  const list = Array.isArray(z.json?.data) ? z.json.data : Array.isArray(z.json) ? z.json : [];
+  const zdrTags = [...new Set(list.filter((e) => typeof e?.model_id === "string" && typeof e?.tag === "string" && normalise(e.model_id) === want).map((e) => e.tag))];
+
+  const batchPath = `/models/${`${want}:batch`.split("/").map((seg) => encodeURIComponent(seg).replace(/%3A/gi, ":")).join("/")}/endpoints`;
+  const b = await call(key, "GET", batchPath);
+  if (b.status < 200 || b.status >= 300 || !Array.isArray(b.json?.data?.endpoints)) {
+    console.log(`Could not load the batch endpoints of ${want} (${b.status}: ${errorDetail(b)}); skipping the endpoint-tag probe.`);
+    return undefined;
+  }
+  const batchTags = [...new Set(b.json.data.endpoints.map((e) => e?.tag).filter((t) => typeof t === "string" && t))];
+  const hit = batchTags.find((t) => zdrTags.includes(t));
+  if (!hit) {
+    console.log(
+      `No batch endpoint of ${want} is on the ZDR list (batch endpoints: ${batchTags.join(", ") || "none"}; ZDR endpoints: ${zdrTags.join(", ") || "none"}); skipping.`,
+    );
+    console.log("To run this probe, pick a model the chat model picker labels [ZDR] (a batch model with a batch endpoint on the ZDR list).");
+  }
+  return hit;
 }
 
 async function cleanup(key, ids) {
@@ -173,11 +191,9 @@ async function main() {
     await probe(key, model, 'provider { data_collection: "deny" }', { data_collection: "deny" }, accepted);
     await probe(key, model, "provider { zdr: true }", { zdr: true }, accepted);
 
-    const tag = await firstZdrTag(key, model);
+    const tag = await firstBatchZdrTag(key, model);
     if (tag) {
       await probe(key, model, `provider { only: ["${tag}"], allow_fallbacks: false }`, { only: [tag], allow_fallbacks: false }, accepted);
-    } else {
-      console.log(`No ZDR endpoint found for ${normalise(model)}; endpoint-tag probe skipped.`);
     }
   } finally {
     await cleanup(key, accepted);

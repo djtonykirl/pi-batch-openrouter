@@ -123,7 +123,7 @@ OpenRouter account settings.
 |---|---|---|---|
 | `standard` (default) | No extra restriction. Batch request bodies are byte-identical to earlier versions. | No privacy fields added. | No privacy fields added. |
 | `no-training` | Providers must not train on your data. | Allowed only after you attest (below). | `provider: { data_collection: "deny" }` |
-| `zdr` | Zero data retention providers only. | Pinned to the model's ZDR endpoints (see below). | `provider: { zdr: true }` |
+| `zdr` | Zero data retention providers only. | Pinned to the model's batch endpoints that are on the ZDR list (see below). | `provider: { zdr: true }` |
 
 ```
 /batch privacy                      show the level, attestation and catalog state
@@ -143,10 +143,21 @@ most private value from what could be read, the last clean read and the settings
 - **Batch route.** The Batch API accepts only `provider.only` and `provider.allow_fallbacks`, so the extension never
   adds `data_collection` or `zdr` to a batch body.
   - At `no-training`, batch jobs are refused unless `privacy.accountNoTraining` is true.
-  - At `zdr`, the job is pinned with `provider.only` set to the **full ZDR endpoint tags** from
-    `/api/v1/endpoints/zdr` for that model (for example `azure/eu`), not base provider slugs, plus
-    `allow_fallbacks: false`. It is refused when the model has no ZDR endpoint, when your own `--provider` pin has none
-    in the ZDR list, or when the catalog was not loaded successfully this session.
+  - At `zdr`, the job is pinned with `provider.only` set to **full endpoint tags** (for example
+    `google-vertex/global`), not base provider slugs, plus `allow_fallbacks: false`.
+  - Batch jobs run only on a model's **`:batch` endpoints**, which are a different set from its ordinary endpoints. For
+    example, `/api/v1/endpoints/zdr` lists Amazon Bedrock and Google Vertex endpoints for
+    `anthropic/claude-opus-5.5`, but its only batch endpoint is `anthropic`. The Batch API checks `provider.only`
+    against the batch endpoints. So the pin is the model's ZDR endpoint tags (from `/api/v1/endpoints/zdr`) that are
+    **also** its batch endpoint tags (from `/api/v1/models/{model}:batch/endpoints`), matched exactly.
+  - **Assumption:** a batch endpoint is treated as ZDR when its tag appears on OpenRouter's ZDR list.
+  - **Which models qualify.** As of 2026-10-28 this rules out every Anthropic and OpenAI batch model: none has a batch
+    endpoint on the ZDR list. Gemini batch models (on Google Vertex) and some open models (for example on DeepInfra)
+    qualify. The model picker labels the ones that do `ZDR`.
+  - It is refused when the model has no batch endpoint on the ZDR list (`Privacy level zdr: <model> has no batch
+    endpoint on OpenRouter's ZDR list (its batch endpoints: …; ZDR endpoints: …)`), when its batch endpoints could not
+    be loaded this session, when your own `--provider` pin or `routing.allowedProviders` leaves none, or when the
+    catalog was not loaded successfully this session.
 - **Immediate route.** Models with the `:free` suffix run through `POST /chat/completions` and carry the
   `data_collection` or `zdr` field above. Items sent later (after a per-minute 429 or a crash) go out at the stricter
   of the job's recorded level, the current project level and the thread's own level; an escalation is recorded as a
@@ -192,10 +203,15 @@ expired or cancelled) is deleted too; one OpenRouter reports gone (HTTP 410) is 
 ### Model catalog
 
 The extension loads `/api/v1/models` and `/api/v1/endpoints/zdr` once on every Pi `session_start`, web server start
-and web workspace switch. Loads are deduplicated. A last-known copy is kept on disk **for display only**: a catalog read
+and web workspace switch. `/api/v1/models` also lists the batch models (IDs ending in `:batch`); for each of them the
+extension then loads `/api/v1/models/{model}:batch/endpoints` (all public), at most 8 at a time. A model whose batch
+endpoints fail to load is treated as unknown: `zdr` refuses it ("the batch endpoints of <model> could not be loaded
+this session") until a refresh loads them, while the rest of the catalog still counts as loaded. Loads are deduplicated. A last-known copy is kept on disk **for display only**: a catalog read
 from disk is never used to authorise a `zdr` send. If the load fails, `zdr` batch sends are refused until
 `/batch privacy refresh` (or `/batch chat model --refresh`, or the web "Refresh models" button) succeeds; no restart is
-needed. The model picker labels models `batch`, `free` and `ZDR`, and hides the ones the level rules out.
+needed. The model picker labels models `batch`, `free` and `ZDR`, and hides the ones the level rules out. A batch
+model is labelled `ZDR` only when one of its batch endpoints is on the ZDR list; a free (immediate-route) model is
+labelled `ZDR` when it has any ZDR endpoint, since its requests carry `zdr: true`.
 
 ### Free models
 
@@ -220,8 +236,9 @@ node scripts/privacy-probe.mjs <model> [--account <alias>]
 It reads the key like the standalone web server (the account's entry in `~/.pi/agent/auth.json`, or
 `OPENROUTER_API_KEY` for the default account), prints a cost note, and requires typing `yes`. It submits up to three
 one-request batches (`max_tokens: 1`, content "ping") and reports `ACCEPTED` or `REJECTED (<status>: <detail>)` for
-`provider: { data_collection: "deny" }`, `provider: { zdr: true }`, and `provider: { only: [<first ZDR endpoint tag>],
-allow_fallbacks: false }` (skipped if the model has no ZDR endpoint). Accepted batches cannot be cancelled, so their
+`provider: { data_collection: "deny" }`, `provider: { zdr: true }`, and `provider: { only: [<tag>], allow_fallbacks:
+false }`, where `<tag>` is the first of the model's batch endpoint tags that is on the ZDR list. The third is skipped,
+with the batch and ZDR endpoint tags printed, when there is no such tag. Accepted batches cannot be cancelled, so their
 IDs are printed and the script polls for up to 10 minutes, then deletes them. Exit codes: 0 done, 1 usage error or no
 key, 2 not confirmed.
 
@@ -1086,7 +1103,7 @@ The metadata preview shows the effective pin, the privacy level and the account-
   `provider.only`, in list order, in the same `provider` object as the privacy fields: for example
   `{ "only": ["azure"], "zdr": true }`. `allow_fallbacks: false` is added when `routing.allowFallbacks` is false.
   A chat thread's own provider pin must be within the list on either route.
-- **At `zdr`**, the job is pinned to the model's ZDR endpoints that the allow-list admits, always without fallbacks.
+- **At `zdr`**, the job is pinned to the model's batch endpoints on the ZDR list that the allow-list admits, always without fallbacks.
   - An entry admits a ZDR endpoint tag equal to it, or one whose base provider it names (`azure` admits `azure/eu`).
   - `routing.allowFallbacks` is ignored at this level.
   - If no ZDR endpoint is left, the job is refused: `Privacy level zdr: no ZDR provider for <model> within routing.allowedProviders (…)`.

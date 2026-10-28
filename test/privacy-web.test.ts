@@ -16,6 +16,7 @@ import { BatchService } from "../src/service.js";
 import { BatchWebServer } from "../src/web/server.js";
 import { FAKE_KEY, FakeOpenRouter, accepted, makeConfig } from "./fixtures/fake-openrouter.js";
 import { rm, tempWorkspace } from "./helpers.js";
+import { batchEndpointsMatchingZdr } from "./fixtures/catalog.js";
 
 const ZDR: ZdrEndpoint[] = [{ model: "y/model", provider: "azure/eu" }];
 const MODELS = [
@@ -53,7 +54,7 @@ function withWeb(fn: (e: Env) => Promise<void>): () => Promise<void> {
       const catalog = new ModelCatalog({
         fetch: async () => {
           loadCount++;
-          return { models: MODELS, zdr: ZDR };
+          return { models: MODELS, zdr: ZDR, batchEndpoints: { ...batchEndpointsMatchingZdr(ZDR), "x/other": ["anthropic"] } };
         },
         file: join(root, "catalog.json"),
       });
@@ -309,7 +310,7 @@ test(
     assert.equal(r.status, 200);
     assert.equal(((await r.json()) as any).jobId, undefined);
     const failure = store.read(t.id).lastFailure;
-    assert.match(failure?.message ?? "", /Privacy level zdr: no ZDR provider/);
+    assert.match(failure?.message ?? "", /Privacy level zdr: x\/other has no batch endpoint on OpenRouter's ZDR list \(its batch endpoints: anthropic; ZDR endpoints: none\)/);
     assert.equal(store.read(t.id).pending, undefined);
     assert.equal(batch.registry.list().jobs.length, 0);
   }),

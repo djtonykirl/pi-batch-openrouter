@@ -13,6 +13,7 @@ import { CLASSIFY_YAML, TICKETS_CSV } from "./fixtures/datasets.js";
 import { FAKE_KEY, FakeOpenRouter, accepted, makeConfig } from "./fixtures/fake-openrouter.js";
 import { chatCompletion, completed, successItem } from "./fixtures/openrouter.js";
 import { rm, tempWorkspace, writeFiles } from "./helpers.js";
+import { batchEndpointsMatchingZdr } from "./fixtures/catalog.js";
 
 const ASK: AskOptions = { objective: "Review the authentication design", files: ["src/auth.ts"], contexts: [], format: "markdown", includeInstructions: true };
 
@@ -38,7 +39,7 @@ async function stubCatalog(zdr: ZdrEndpoint[] | Error, file: string): Promise<Mo
   const catalog = new ModelCatalog({
     fetch: async () => {
       if (zdr instanceof Error) throw zdr;
-      return { models: [], zdr };
+      return { models: [], zdr, batchEndpoints: batchEndpointsMatchingZdr(zdr) };
     },
     file,
   });
@@ -179,7 +180,8 @@ test(
     const prepared = await service.prepare(ASK);
     await assert.rejects(service.createJob(prepared, { previewOnly: false }), (err: unknown) => {
       assert.ok(err instanceof SubmissionBlockedError);
-      assert.match(err.message, /^Privacy level zdr: no ZDR provider/);
+      // No ZDR endpoint, so no batch endpoint either (the stub's batch endpoints mirror the ZDR list): unknown.
+      assert.equal(err.message, "Privacy level zdr: the batch endpoints of anthropic/claude-opus-5.5 could not be loaded this session (run /batch privacy refresh)");
       return true;
     });
     assert.deepEqual(jobDirs(jobsDir), []);

@@ -14,6 +14,7 @@ import { BatchService, DELETION_TIME_LIMIT_MS, type AskOptions } from "../src/se
 import { FAKE_KEY, FakeOpenRouter, accepted, makeConfig } from "./fixtures/fake-openrouter.js";
 import { batchObject, completed, successItem } from "./fixtures/openrouter.js";
 import { rm, tempWorkspace, writeFiles } from "./helpers.js";
+import { batchEndpointsMatchingZdr } from "./fixtures/catalog.js";
 
 const ASK: AskOptions = { objective: "Review the authentication design", files: ["src/auth.ts"], contexts: [], format: "markdown", includeInstructions: true };
 const ZDR: ZdrEndpoint[] = [{ model: "anthropic/claude-opus-5.5", provider: "anthropic" }];
@@ -31,7 +32,7 @@ function env(
         c.privacy.level = level;
         c.privacy.accountNoTraining = true;
       });
-      const catalog = new ModelCatalog({ fetch: async () => ({ models: [], zdr: ZDR }), file: path.join(root, "catalog.json") });
+      const catalog = new ModelCatalog({ fetch: async () => ({ models: [], zdr: ZDR, batchEndpoints: batchEndpointsMatchingZdr(ZDR) }), file: path.join(root, "catalog.json") });
       await catalog.load();
       const key = { value: FAKE_KEY };
       const service = new BatchService({

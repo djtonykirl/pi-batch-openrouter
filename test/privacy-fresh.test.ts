@@ -13,6 +13,7 @@ import { BatchService, type AskOptions } from "../src/service.js";
 import { FAKE_KEY, FakeOpenRouter, accepted, makeConfig, makeService } from "./fixtures/fake-openrouter.js";
 import { chatCompletion } from "./fixtures/openrouter.js";
 import { rm, tempWorkspace, writeFiles } from "./helpers.js";
+import { batchEndpointsMatchingZdr } from "./fixtures/catalog.js";
 
 const ASK: AskOptions = { objective: "Review the authentication design", files: ["src/auth.ts"], contexts: [], format: "markdown", includeInstructions: true };
 const ZDR: ZdrEndpoint[] = [{ model: "anthropic/claude-opus-5.5", provider: "anthropic" }];
@@ -26,7 +27,7 @@ const lastProvider = (fake: FakeOpenRouter) => (JSON.parse(chatPosts(fake).at(-1
 async function processFor(root: string, globalFile: string, fake: FakeOpenRouter): Promise<{ batch: BatchService; chat: ChatService }> {
   const snapshot = loadConfig(root, globalFile).config;
   const getPrivacy = () => readPrivacyConfig(root, globalFile);
-  const catalog = new ModelCatalog({ fetch: async () => ({ models: [], zdr: ZDR }), file: path.join(root, "catalog.json") });
+  const catalog = new ModelCatalog({ fetch: async () => ({ models: [], zdr: ZDR, batchEndpoints: batchEndpointsMatchingZdr(ZDR) }), file: path.join(root, "catalog.json") });
   await catalog.load();
   const batch = new BatchService({
     registry: new JobRegistry(path.join(root, ".pi", "batches")),
