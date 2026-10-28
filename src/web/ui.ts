@@ -3,6 +3,92 @@
  * Served locally from 127.0.0.1 with an injected per-session CSRF token.
  */
 
+import { neverReachedOpenRouter } from "../privacy/policy.js";
+
+/*
+ * Page helpers written as plain, self-contained functions: the page embeds their source (Function.prototype.toString),
+ * so the tests run the same code the browser runs.
+ */
+
+/**
+ * How each failure entry of a transcript is shown. A turn failure offers Retry only while it is the thread's current
+ * failure (the last turn failure, with `lastFailure` set); once a retry or a later turn supersedes it, it is a muted
+ * note. A compaction failure is current until a later compaction (or compaction failure) follows it; it has no Retry.
+ */
+export function failureStates(
+  entries: ReadonlyArray<{ type: string; purpose?: string }>,
+  lastFailure: unknown,
+): Record<number, "retry" | "current" | "superseded"> {
+  const out: Record<number, "retry" | "current" | "superseded"> = {};
+  let lastTurn = -1;
+  entries.forEach((e, i) => {
+    if (e.type === "failure" && e.purpose !== "compact") lastTurn = i;
+  });
+  entries.forEach((e, i) => {
+    if (e.type !== "failure") return;
+    if (e.purpose === "compact") {
+      const later = entries.slice(i + 1).some((x) => x.type === "compaction" || (x.type === "failure" && x.purpose === "compact"));
+      out[i] = later ? "superseded" : "current";
+    } else {
+      out[i] = i === lastTurn && lastFailure ? "retry" : "superseded";
+    }
+  });
+  return out;
+}
+
+/**
+ * Coalesces refreshes. request() (a live update) runs `run` once after `delayMs`, however many requests arrive
+ * meanwhile; now() (after a user action) runs at once and cancels a pending request. A call while a run is in flight
+ * schedules exactly one more run after it.
+ */
+export function createCoalescer(
+  run: () => Promise<void>,
+  delayMs: number,
+  setT: (f: () => void, ms: number) => unknown = (f, ms) => setTimeout(f, ms),
+  clearT: (t: unknown) => void = (t) => clearTimeout(t as ReturnType<typeof setTimeout>),
+): { request: () => void; now: () => Promise<void> } {
+  let timer: unknown = null;
+  let running: Promise<void> | null = null;
+  let again = false;
+  const loop = async () => {
+    try {
+      do {
+        again = false;
+        await run();
+      } while (again);
+    } finally {
+      running = null;
+    }
+  };
+  const now = (): Promise<void> => {
+    if (timer !== null) {
+      clearT(timer);
+      timer = null;
+    }
+    if (running) {
+      again = true;
+      return running;
+    }
+    running = loop();
+    return running;
+  };
+  const request = (): void => {
+    if (timer !== null) return;
+    timer = setT(() => {
+      timer = null;
+      void now();
+    }, delayMs);
+  };
+  return { request, now };
+}
+
+/** The privacy notice as HTML: the settings URL in the text becomes the one link (it is never shown twice). */
+export function privacyNoticeHtml(text: string, url: string, esc: (s: string) => string): string {
+  const link = '<a href="' + esc(url) + '" target="_blank" rel="noopener noreferrer" style="color:#fde68a;">' + esc(url.replace(/^https?:\/\//, "")) + "</a>";
+  const parts = String(text).split(url);
+  return parts.length > 1 ? parts.map(esc).join(link) : esc(text) + " " + link;
+}
+
 export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string; nonce?: string }): string {
   const nonceAttr = (opts.nonce ?? "").replace(/[^A-Za-z0-9+/=_-]/g, "");
   // JSON inside <script>: "<" is escaped so a value can never close the script element (e.g. a folder named
@@ -21,6 +107,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Pi Batch OpenRouter — Local Studio</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%236366f1'/%3E%3C/svg%3E">
   <style>
     :root {
       --bg: #0f1117;
@@ -191,6 +278,9 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
       gap: 4px;
     }
     .list-item:hover { background: var(--bg-hover); }
+    .list-item:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+    .failure-note { align-self: stretch; font-size: 12px; color: var(--text-muted); }
+    .failure-note summary { cursor: pointer; }
     .list-item.selected {
       background: var(--bg-elevated);
       border-color: var(--accent);
@@ -462,6 +552,9 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
       padding: 20px;
     }
     .modal-backdrop.open { display: flex; }
+    /* A modal opened from another one stacks above it: openModal() raises each newly opened modal, and the file
+       picker (opened from the studio) is above the studio even without it. */
+    #workspacePickerModal { z-index: 110; }
     .modal {
       background: var(--bg-panel);
       border: 1px solid var(--border);
@@ -561,7 +654,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         <button class="btn btn-sm btn-primary" id="newThreadBtn">＋ New Thread</button>
       </div>
       <div style="padding: 8px 12px 0;">
-        <input type="text" id="threadSearchInput" placeholder="Filter threads…" style="width: 100%;">
+        <input type="text" id="threadSearchInput" aria-label="Filter threads" placeholder="Filter threads…" style="width: 100%;">
       </div>
       <div class="sidebar-list" id="threadList"></div>
     </aside>
@@ -574,11 +667,11 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
           <span style="font-family:var(--mono); font-size:11px; color:var(--text-muted);" id="chatThreadId"></span>
         </div>
         <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
-          <label style="font-size:12px; color:var(--text-muted);">Model:</label>
+          <label for="chatModelInput" style="font-size:12px; color:var(--text-muted);">Model:</label>
           <input type="text" id="chatModelInput" list="knownModelsList" style="width:220px; font-family:var(--mono); font-size:12px;">
           <button class="btn btn-sm" id="setChatModelBtn">Set</button>
           <span class="badge-pill" id="chatPrivacyBadge" style="display:none;"></span>
-          <select id="threadPrivacyLevel" title="Raise this thread's privacy level. Lowering is disabled: a thread cannot go below the project level or its own raised level." style="font-size:12px; padding:3px 6px;">
+          <select id="threadPrivacyLevel" aria-label="Thread privacy level" title="Raise this thread's privacy level. Lowering is disabled: a thread cannot go below the project level or its own raised level." style="font-size:12px; padding:3px 6px;">
             <option value="standard">standard</option>
             <option value="no-training">no-training</option>
             <option value="zdr">zdr</option>
@@ -593,7 +686,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
       </div>
 
       <div id="chatModelPickerBar" style="display:none; padding:6px 16px; gap:10px; align-items:center; flex-wrap:wrap; border-bottom:1px solid var(--border); font-size:12px;">
-        <label style="color:var(--text-muted);">Pick a model:</label>
+        <label for="chatModelPicker" style="color:var(--text-muted);">Pick a model:</label>
         <select id="chatModelPicker" style="max-width:320px; font-family:var(--mono); font-size:12px;"></select>
         <label style="color:var(--text-muted); display:flex; align-items:center; gap:4px;"><input type="checkbox" id="show-blocked-toggle"> Show blocked</label>
         <button class="btn btn-sm" id="refresh-models-chat" title="Reload the model list and ZDR providers from OpenRouter">Refresh models</button>
@@ -617,7 +710,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
               📎 Upload File / PDF / Image
               <input type="file" id="chatUploadInput" multiple style="display:none;">
             </label>
-            <select id="chatPdfModeSelect" title="How attached PDFs are sent to OpenRouter" style="font-size:12px; padding:3px 6px;">
+            <select id="chatPdfModeSelect" aria-label="PDF mode" title="How attached PDFs are sent to OpenRouter" style="font-size:12px; padding:3px 6px;">
               <option value="text">PDF Mode: Extract Text Locally (all models)</option>
               <option value="multimodal">PDF Mode: Multimodal File Part (vision/PDF models)</option>
             </select>
@@ -628,7 +721,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         <div class="att-list" id="chatPendingAttachments"></div>
         <div id="chatPreflightAlert"></div>
         <div class="composer-row">
-          <textarea id="chatMessageInput" placeholder="Type a message for the batch model… (Ctrl+Enter to send. If a turn is already pending, your message queues automatically)"></textarea>
+          <textarea id="chatMessageInput" aria-label="Message" placeholder="Type a message for the batch model… (Ctrl+Enter to send. If a turn is already pending, your message queues automatically)"></textarea>
           <button class="btn btn-primary" id="sendChatBtn" style="height:42px; padding:0 18px;">Send Batch Turn</button>
         </div>
       </div>
@@ -640,7 +733,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
     <aside class="sidebar" style="width: 350px;">
       <div class="sidebar-header">
         <strong>Batch Jobs (.pi/batches)</strong>
-        <select id="jobStatusFilter" style="font-size:12px; padding:3px 6px;">
+        <select id="jobStatusFilter" aria-label="Filter jobs by status" style="font-size:12px; padding:3px 6px;">
           <option value="all">All Jobs</option>
           <option value="active">Active</option>
           <option value="ready">Ready</option>
@@ -705,6 +798,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
             <button class="btn btn-sm" id="refresh-models-settings">Refresh models</button>
             <span style="font-size:12px; color:var(--text-muted);" id="settingsCatalogState"></span>
           </div>
+          <div style="font-size:12px; color:var(--text-muted); margin-top:8px;">Routing policy: <span id="routingPolicyLine" style="font-family:var(--mono);"></span></div>
           <div id="privacyAlert" style="margin-top:10px;"></div>
         </div>
 
@@ -712,16 +806,17 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
           <h3 style="margin-top:0;">⚙️ Default Batch Settings & Project Instructions</h3>
           <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:14px;">
             <div>
-              <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">Default Batch Model</label>
+              <label for="settingsDefaultModel" style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">Default Batch Model</label>
               <input type="text" id="settingsDefaultModel" list="knownModelsList" style="width:100%; font-family:var(--mono);">
+              <div id="defaultModelWarning" style="margin-top:6px;"></div>
             </div>
             <div>
-              <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">Default OpenRouter Account Alias</label>
+              <label for="settingsDefaultAccount" style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">Default OpenRouter Account Alias</label>
               <input type="text" id="settingsDefaultAccount" style="width:100%; font-family:var(--mono);">
             </div>
           </div>
           <div>
-            <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">Project Chat Instructions (<code>.pi/BATCH_CHAT.md</code> — included in system prompt, secret-scanned)</label>
+            <label for="settingsProjectInstructions" style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">Project Chat Instructions (<code>.pi/BATCH_CHAT.md</code> — included in system prompt, secret-scanned)</label>
             <textarea id="settingsProjectInstructions" class="form-control" style="width:100%; min-height:110px; font-family:var(--mono);"></textarea>
           </div>
           <div id="settingsAlert" style="margin-top:10px;"></div>
@@ -733,7 +828,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         <div class="msg-card">
           <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:12px;">
             <h3 style="margin:0;">📁 Workspace Context & Ignore Rules Inspector</h3>
-            <input type="text" id="workspaceInspectorFilter" placeholder="Filter workspace paths…" style="width:240px;">
+            <input type="text" id="workspaceInspectorFilter" aria-label="Filter workspace paths" placeholder="Filter workspace paths…" style="width:240px;">
           </div>
           <p style="font-size:12px; color:var(--text-muted); margin-top:0;">
             Shows how <code>buildContextPackage</code> evaluates workspace files against <code>hard-deny</code>, <code>.pi/batchignore</code>, <code>.gitignore</code>, and size limits.
@@ -766,7 +861,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
       </div>
       <div class="modal-body">
         <div style="display:flex; gap:8px;">
-          <input type="text" id="pickerSearchInput" placeholder="Search files or directories (e.g. src/service.ts)…" style="flex:1;">
+          <input type="text" id="pickerSearchInput" aria-label="Search workspace files" placeholder="Search files or directories (e.g. src/service.ts)…" style="flex:1;">
           <label style="display:flex; align-items:center; gap:4px; font-size:12px; color:var(--text-muted);">
             <input type="checkbox" id="pickerShowExcluded"> Show excluded files
           </label>
@@ -812,18 +907,18 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         </div>
 
         <div id="jobFormAsk" class="job-form-section">
-          <label style="font-size:12px; color:var(--text-muted);">Objective / Prompt</label>
-          <textarea id="askObjectiveInput" class="form-control" style="min-height:90px;" placeholder="Describe the analysis or task to run at 50% batch discount…"></textarea>
+          <label for="askObjectiveInput" style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">Objective / Prompt</label>
+          <textarea id="askObjectiveInput" class="form-control" style="display:block; width:100%; min-height:110px; resize:vertical;" placeholder="Describe the analysis or task to run at 50% batch discount…"></textarea>
         </div>
 
         <div id="jobFormDataset" class="job-form-section" style="display:none;">
           <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
             <div>
-              <label style="font-size:12px; color:var(--text-muted);">Project Workflow (.pi/batch-workflows/*.yaml)</label>
+              <label for="datasetWorkflowSelect" style="font-size:12px; color:var(--text-muted);">Project Workflow (.pi/batch-workflows/*.yaml)</label>
               <select id="datasetWorkflowSelect" style="width:100%;"></select>
             </div>
             <div>
-              <label style="font-size:12px; color:var(--text-muted);">Dataset Path (CSV / JSONL)</label>
+              <label for="datasetInputPath" style="font-size:12px; color:var(--text-muted);">Dataset Path (CSV / JSONL)</label>
               <input type="text" id="datasetInputPath" placeholder="data/items.csv" style="width:100%; font-family:var(--mono);">
             </div>
           </div>
@@ -832,19 +927,19 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         <div id="jobFormMetadata" class="job-form-section" style="display:none;">
           <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
             <div>
-              <label style="font-size:12px; color:var(--text-muted);">Context file (reviewed &lt;Domain&gt;_context.md)</label>
+              <label for="metadataContextInput" style="font-size:12px; color:var(--text-muted);">Context file (reviewed &lt;Domain&gt;_context.md)</label>
               <input type="text" id="metadataContextInput" placeholder="metadata/pinpoint/context.md" style="width:100%; font-family:var(--mono);">
             </div>
             <div>
-              <label style="font-size:12px; color:var(--text-muted);">Tables file (tables.jsonl)</label>
+              <label for="metadataTablesInput" style="font-size:12px; color:var(--text-muted);">Tables file (tables.jsonl)</label>
               <input type="text" id="metadataTablesInput" placeholder="metadata/pinpoint/tables.jsonl" style="width:100%; font-family:var(--mono);">
             </div>
             <div>
-              <label style="font-size:12px; color:var(--text-muted);">Domain (optional, lowercase slug)</label>
+              <label for="metadataDomainInput" style="font-size:12px; color:var(--text-muted);">Domain (optional, lowercase slug)</label>
               <input type="text" id="metadataDomainInput" placeholder="pinpoint" style="width:100%; font-family:var(--mono);">
             </div>
             <div>
-              <label style="font-size:12px; color:var(--text-muted);">UC prefix (optional, e.g. PNPT_)</label>
+              <label for="metadataPrefixInput" style="font-size:12px; color:var(--text-muted);">UC prefix (optional, e.g. PNPT_)</label>
               <input type="text" id="metadataPrefixInput" placeholder="PNPT_" style="width:100%; font-family:var(--mono);">
             </div>
           </div>
@@ -861,7 +956,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
               </label>
             </div>
             <div id="mapFilesGroupWrap" style="display:none;">
-              <label style="font-size:12px; color:var(--text-muted);">Files per request (group size):</label>
+              <label for="mapFilesGroupSize" style="font-size:12px; color:var(--text-muted);">Files per request (group size):</label>
               <input type="number" id="mapFilesGroupSize" value="1" min="1" style="width:65px;">
             </div>
           </div>
@@ -870,18 +965,18 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
 
         <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px;">
           <div>
-            <label style="font-size:12px; color:var(--text-muted);">Model Slug</label>
+            <label for="jobModelInput" style="font-size:12px; color:var(--text-muted);">Model Slug</label>
             <input type="text" id="jobModelInput" list="knownModelsList" style="width:100%; font-family:var(--mono);">
           </div>
           <div>
-            <label style="font-size:12px; color:var(--text-muted);">Output Format</label>
+            <label for="jobFormatSelect" style="font-size:12px; color:var(--text-muted);">Output Format</label>
             <select id="jobFormatSelect" style="width:100%;">
               <option value="markdown">Markdown</option>
               <option value="json">JSON</option>
             </select>
           </div>
           <div>
-            <label style="font-size:12px; color:var(--text-muted);">Provider Pin (optional)</label>
+            <label for="jobProviderPinInput" style="font-size:12px; color:var(--text-muted);">Provider Pin (optional)</label>
             <input type="text" id="jobProviderPinInput" placeholder="e.g. anthropic" style="width:100%; font-family:var(--mono);">
           </div>
         </div>
@@ -905,7 +1000,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
       </div>
       <div class="modal-body">
         <div>
-          <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">Direct Folder Path</label>
+          <label for="switchWorkspaceInput" style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">Direct Folder Path</label>
           <div style="display:flex; gap:8px;">
             <input type="text" id="switchWorkspaceInput" placeholder="C:/Users/.../my-project" style="flex:1; font-family:var(--mono);">
             <button class="btn" id="browseWorkspaceInputBtn" title="Browse subdirectories of this path">🔍 Browse</button>
@@ -950,7 +1045,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
       </div>
       <div class="modal-body">
         <div>
-          <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">Relative Path inside Workspace (<code id="saveModalWorkspaceRoot"></code>)</label>
+          <label for="saveToWorkspacePathInput" style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">Relative Path inside Workspace (<code id="saveModalWorkspaceRoot"></code>)</label>
           <input type="text" id="saveToWorkspacePathInput" placeholder="src/generated.ts" style="width:100%; font-family:var(--mono);">
         </div>
         <label style="display:flex; align-items:center; gap:6px; font-size:12px; color:var(--text-muted); cursor:pointer;">
@@ -973,6 +1068,11 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
   <div class="toast-container" id="toastContainer"></div>
 
   <script nonce="${nonceAttr}">
+    ${failureStates.toString()}
+    ${createCoalescer.toString()}
+    ${privacyNoticeHtml.toString()}
+    ${neverReachedOpenRouter.toString()}
+
     const CSRF_TOKEN = ${tokenJson};
     let WORKSPACE_ROOT = ${rootJson};
 
@@ -1226,6 +1326,14 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
       });
     });
 
+    // A modal opened while another is open stacks above it.
+    let modalZ = 120;
+    function openModal(id) {
+      const el = document.getElementById(id);
+      el.style.zIndex = String(++modalZ);
+      el.classList.add("open");
+    }
+
     document.querySelectorAll("[data-close]").forEach((btn) => {
       btn.addEventListener("click", () => {
         document.getElementById(btn.dataset.close).classList.remove("open");
@@ -1285,11 +1393,22 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
       pill.textContent = text || "📦 Batch: Idle";
     }
 
+    // One EventSource and one handler. Each event asks for a refresh; refreshes arriving within 250 ms coalesce into
+    // one (a poll pass sends "tick" and "badge" together, and fs.watch fires several times per write).
+    let sseConnectedOnce = false;
     function connectSse() {
+      if (window.__batchEvents) return;
       const es = new EventSource("/api/events");
+      window.__batchEvents = es;
       es.onmessage = async (ev) => {
         try {
           const payload = JSON.parse(ev.data);
+          if (payload.type === "connected") {
+            // The page has just bootstrapped; only a reconnect needs a refresh.
+            if (sseConnectedOnce) liveRefresh.request();
+            sseConnectedOnce = true;
+            return;
+          }
           if (payload.type === "settled") {
             showToast("📦 Batch " + payload.localId + " settled (" + payload.status + ")");
           }
@@ -1304,7 +1423,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
             state.picker.key = "";
             await loadPrivacy();
           }
-          await refreshStateQuiet();
+          liveRefresh.request();
         } catch {}
       };
     }
@@ -1313,7 +1432,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
     async function openSwitchWorkspaceModal() {
       document.getElementById("switchWorkspaceAlert").innerHTML = "";
       document.getElementById("switchWorkspaceInput").value = state.workspaceRoot;
-      document.getElementById("switchWorkspaceModal").classList.add("open");
+      openModal("switchWorkspaceModal");
       await browseWorkspaceDirs(state.workspaceRoot);
     }
 
@@ -1444,7 +1563,12 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
       switchWorkspaceTo(state.browsedDir);
     });
 
-    async function refreshStateQuiet() {
+    const liveRefresh = createCoalescer(refreshStateNow, 250);
+    // A user action refreshes at once; a live update that arrives meanwhile does not add a second refresh.
+    function refreshStateQuiet() {
+      return liveRefresh.now();
+    }
+    async function refreshStateNow() {
       try {
         const data = await api("/api/bootstrap");
         state.threads = data.threads || [];
@@ -1455,6 +1579,16 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         if (state.activeThreadId) await selectThread(state.activeThreadId, true);
         if (state.selectedJobId) await selectJob(state.selectedJobId, true);
       } catch {}
+    }
+
+    // Enter or Space on a focused row does what a click does.
+    function onActivateKey(el, fn) {
+      el.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter" || ev.key === " ") {
+          ev.preventDefault();
+          fn();
+        }
+      });
     }
 
     // ---------------- Chat Threads ----------------
@@ -1477,7 +1611,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
                 ? '<span class="status-dot status-failed">failed</span>'
                 : "";
           return (
-            '<div class="list-item ' + sel + '" data-thread-id="' + escapeHtml(t.id) + '">' +
+            '<div class="list-item ' + sel + '" role="button" tabindex="0" data-thread-id="' + escapeHtml(t.id) + '">' +
             '<div class="list-item-title">' + escapeHtml(t.title) + "</div>" +
             '<div class="list-item-meta">' +
             statusBadge +
@@ -1489,6 +1623,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         .join("");
       el.querySelectorAll("[data-thread-id]").forEach((row) => {
         row.addEventListener("click", () => selectThread(row.dataset.threadId));
+        onActivateKey(row, () => selectThread(row.dataset.threadId));
       });
     }
 
@@ -1527,8 +1662,9 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
           "<p>Send a message below or attach workspace files, code, CSV/JSON datasets, PDFs, or images. Each turn is submitted as a 50%-discounted OpenRouter batch job.</p>" +
           "</div>";
       } else {
+        const failures = failureStates(entries, detail.thread.lastFailure);
         stream.innerHTML = entries
-          .map((e) => {
+          .map((e, i) => {
             if (e.type === "user") {
               const atts = (e.attachments || [])
                 .map(
@@ -1587,6 +1723,13 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
             }
             if (e.type === "failure") {
               const unknown = e.code === "submission_unknown";
+              const view = failures[i];
+              if (view === "superseded") {
+                return '<details class="failure-note"><summary>Earlier ' + (e.purpose === "compact" ? "compaction" : "turn") + " failure (superseded)</summary>" + escapeHtml(e.message) + "</details>";
+              }
+              if (view === "current") {
+                return '<div class="alert-box alert-danger">⚠️ ' + (e.purpose === "compact" ? "Compaction failed: " : "Turn failed: ") + escapeHtml(e.message) + "</div>";
+              }
               return (
                 '<div class="alert-box alert-danger" style="display:flex; align-items:center; justify-content:space-between; gap:12px;">' +
                 "<span>⚠️ Turn failed: " + escapeHtml(e.message) + "</span>" +
@@ -1700,7 +1843,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         document.getElementById("saveToWorkspaceMeta").textContent = blk.lang + " · " + blk.lines + " line(s)";
         document.getElementById("saveToWorkspacePreview").textContent = (blk.content || "").slice(0, 8000);
       }
-      document.getElementById("saveToWorkspaceModal").classList.add("open");
+      openModal("saveToWorkspaceModal");
     };
 
     document.getElementById("confirmSaveToWorkspaceBtn").addEventListener("click", async () => {
@@ -1751,9 +1894,18 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
     };
 
     document.getElementById("newThreadBtn").addEventListener("click", async () => {
-      const res = await api("/api/threads", { method: "POST", body: {} });
-      await refreshStateQuiet();
-      await selectThread(res.thread.id);
+      try {
+        const res = await api("/api/threads", { method: "POST", body: {} });
+        await refreshStateQuiet();
+        await selectThread(res.thread.id);
+        // The server picks a selectable model when the default is refused at the level; say which and why.
+        const alertEl = document.getElementById("chatModelAlert");
+        if (res.notice) alertEl.innerHTML = '<div class="alert-box alert-warning">' + escapeHtml(res.notice) + "</div>";
+        else if (res.warning) alertEl.innerHTML = '<div class="alert-box alert-danger">' + escapeHtml(res.warning) + "</div>";
+        else alertEl.innerHTML = "";
+      } catch (err) {
+        showToast(err.message, "error");
+      }
     });
 
     document.getElementById("renameThreadBtn").addEventListener("click", async () => {
@@ -1953,7 +2105,9 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         input.value = "";
         state.chatAttachments = { files: [], contexts: [], uploads: [] };
         renderPendingAttachments("chat");
-        showToast(res.queued ? "Message queued for next turn" : "Submitted batch turn " + res.jobId);
+        if (res.queued) showToast("Message queued for next turn");
+        else if (res.jobId) showToast("Submitted batch turn " + res.jobId);
+        else showToast("Turn not submitted: " + (res.error || "see the failure in the thread"), "error");
         if (res.warnings && res.warnings.length) showToast("⚠ " + res.warnings.join(" "), "error");
         await refreshStateQuiet();
       } catch (err) {
@@ -1975,7 +2129,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
     async function openWorkspacePicker(target) {
       state.pickerTarget = target;
       document.getElementById("pickerFilePreview").style.display = "none";
-      document.getElementById("workspacePickerModal").classList.add("open");
+      openModal("workspacePickerModal");
       await loadWorkspaceFiles();
       renderPickerTable();
     }
@@ -2115,7 +2269,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         .map((j) => {
           const sel = j.localId === state.selectedJobId ? "selected" : "";
           return (
-            '<div class="list-item ' + sel + '" data-job-id="' + escapeHtml(j.localId) + '">' +
+            '<div class="list-item ' + sel + '" role="button" tabindex="0" data-job-id="' + escapeHtml(j.localId) + '">' +
             '<div style="display:flex; justify-content:space-between; align-items:center; gap:6px;">' +
             '<span style="font-family:var(--mono); font-size:12px; font-weight:600;">' + escapeHtml(j.localId) + "</span>" +
             '<span class="status-dot status-' + escapeHtml(j.localStatus) + '">' + escapeHtml(j.localStatus) + "</span>" +
@@ -2132,6 +2286,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
 
       el.querySelectorAll("[data-job-id]").forEach((row) => {
         row.addEventListener("click", () => selectJob(row.dataset.jobId));
+        onActivateKey(row, () => selectJob(row.dataset.jobId));
       });
     }
 
@@ -2476,12 +2631,14 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
     // ---------------- New Batch Job Studio Modal ----------------
     document.getElementById("newJobTopBtn").addEventListener("click", () => {
       document.getElementById("jobDryRunOutput").innerHTML = "";
-      document.getElementById("newJobModal").classList.add("open");
+      openModal("newJobModal");
     });
 
     document.querySelectorAll(".job-kind-btn").forEach((btn) => {
       btn.addEventListener("click", () => {
         state.jobStudioKind = btn.dataset.kind;
+        // The previous tab's dry-run result or error does not belong to this one.
+        document.getElementById("jobDryRunOutput").innerHTML = "";
         document.querySelectorAll(".job-kind-btn").forEach((b) => b.classList.toggle("btn-primary", b.dataset.kind === state.jobStudioKind));
         const kind = state.jobStudioKind;
         document.getElementById("jobFormAsk").style.display = kind === "dataset" || kind === "metadata" ? "none" : "block";
@@ -2551,18 +2708,22 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
 
         const res = await api(endpoint, { method: "POST", body: payload });
         if (mode === "dryrun") {
-          if (res.blockers && res.blockers.length > 0) {
-            outBox.innerHTML = '<div class="alert-box alert-danger"><strong>Blocked:</strong>\\n' + escapeHtml(res.blockers.join("\\n")) + "</div>";
+          // The server's privacy preview: a job the level would refuse is a blocker, never "Validated".
+          const privacyBlock = res.privacy && !res.privacy.ok ? [res.privacy.reason] : [];
+          const blockers = (res.blockers || []).concat(privacyBlock);
+          const privacyLine = res.privacy && res.privacy.ok ? "\\nPrivacy: " + res.privacy.enforcement : "";
+          if (blockers.length > 0) {
+            outBox.innerHTML = '<div class="alert-box alert-danger"><strong>Blocked:</strong>\\n' + escapeHtml(blockers.join("\\n")) + "</div>";
           } else if (state.jobStudioKind === "metadata") {
             outBox.innerHTML =
               '<pre style="max-height:320px; overflow:auto; white-space:pre-wrap; background:#0b0d13; padding:10px; border-radius:6px; border:1px solid var(--border); font-size:11px;">' +
-              escapeHtml(res.preview) +
+              escapeHtml(res.preview + privacyLine) +
               "</pre>" +
               (res.warnings?.length ? '<div class="alert-box alert-danger">Warnings: ' + escapeHtml(res.warnings.join("; ")) + "</div>" : "");
           } else {
             outBox.innerHTML =
               '<div class="alert-box alert-success">✅ Dry-Run Validated:\\n' +
-              escapeHtml(res.summary) +
+              escapeHtml(res.summary + privacyLine) +
               (res.warnings?.length ? "\\nWarnings: " + escapeHtml(res.warnings.join("; ")) : "") +
               "</div>";
           }
@@ -2631,6 +2792,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         return "NEEDS ATTENTION: deletion failed after " + d.attempts + " attempt(s)" + (d.lastError ? ": " + d.lastError : "") + "; the batch is kept at OpenRouter up to 30 days, delete it there";
       }
       if ((j.route || "batch") === "immediate") return "not applicable (no provider batch)";
+      if (neverReachedOpenRouter(j)) return "not applicable (never reached OpenRouter)";
       const strict = !!j.privacy && (j.privacy.level === "no-training" || j.privacy.level === "zdr");
       const ended = ["ready", "partial", "failed", "cancelled", "expired", "corrupt"].includes(j.localStatus);
       const deleting = !state.privacy || state.privacy.deleteRemoteBatches !== false;
@@ -2654,6 +2816,10 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
       document.getElementById("attest-privacy-chk").checked = p.accountNoTraining;
       document.getElementById("attest-privacy-confirm").disabled = p.accountNoTraining || !document.getElementById("attest-privacy-chk").checked;
       document.getElementById("settingsCatalogState").textContent = catalogText(p.catalog);
+      document.getElementById("routingPolicyLine").textContent = p.routing ? p.routing.policy : "";
+      document.getElementById("defaultModelWarning").innerHTML = p.defaultModelRefusal
+        ? '<div class="alert-box alert-warning">The default model is refused at the project level: ' + escapeHtml(p.defaultModelRefusal) + "</div>"
+        : "";
     }
 
     async function loadPrivacy() {
@@ -2667,8 +2833,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
     function showPrivacyNotice(text) {
       const box = document.getElementById("privacyNotice");
       box.style.display = "";
-      box.innerHTML = '<div class="alert-box alert-warning">' + escapeHtml(text) +
-        ' <a href="https://openrouter.ai/settings/privacy" target="_blank" rel="noopener noreferrer" style="color:#fde68a;">openrouter.ai/settings/privacy</a>' +
+      box.innerHTML = '<div class="alert-box alert-warning">' + privacyNoticeHtml(text, (state.privacy && state.privacy.settingsUrl) || "https://openrouter.ai/settings/privacy", escapeHtml) +
         ' <button class="btn btn-sm" id="privacyNoticeDismiss">Dismiss</button></div>';
       document.getElementById("privacyNoticeDismiss").addEventListener("click", () => {
         box.style.display = "none";
