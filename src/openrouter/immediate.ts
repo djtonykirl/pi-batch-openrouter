@@ -1,4 +1,4 @@
-import { immediateProviderFields, type PrivacyLevel } from "../privacy/policy.js";
+import { immediateProviderFields, type ImmediateAllowList, type PrivacyLevel } from "../privacy/policy.js";
 import type { JobManifest } from "../types.js";
 import { OpenRouterError, type OpenRouterBatchClient } from "./client.js";
 import type { BatchRequestItem } from "./types.js";
@@ -49,6 +49,8 @@ export interface ImmediateOptions {
   progress?: ImmediateProgress;
   /** How long a `started` call may still be in flight (the request timeout plus a margin). Default 120 s. */
   inFlightMs?: number;
+  /** routing.allowedProviders (read when sent); non-empty adds `provider.only` to every call. */
+  allowList?: ImmediateAllowList;
 }
 
 export const DAILY_LIMIT_MESSAGE = "Free-model daily limit reached; try later or switch model";
@@ -66,8 +68,8 @@ export function immediateResultId(localId: string): string {
 }
 
 /** The exact bytes POSTed for one item: `{ model, ...item.body, provider }`, with `provider` omitted when empty. */
-export function immediateRequestBody(model: string, item: BatchRequestItem, level: PrivacyLevel): string {
-  const fields = immediateProviderFields(level);
+export function immediateRequestBody(model: string, item: BatchRequestItem, level: PrivacyLevel, allowList?: ImmediateAllowList): string {
+  const fields = immediateProviderFields(level, allowList);
   return JSON.stringify({ model, ...item.body, ...(Object.keys(fields).length > 0 ? { provider: fields } : {}) });
 }
 
@@ -138,7 +140,7 @@ export async function runImmediateJob(
       // Recorded BEFORE the call: from here on, this item is never sent again without an outcome.
       state[id] = { state: "started", at: iso() };
       progress.write(state);
-      const result = await callOnce(job, req, client, level, now);
+      const result = await callOnce(job, req, client, level, now, opts.allowList);
       if ("retry" in result) {
         delete state[id]; // a 429 means it was not processed: safe to send again later
         progress.write(state);
@@ -158,10 +160,11 @@ async function callOnce(
   client: OpenRouterBatchClient,
   level: PrivacyLevel,
   now: () => Date,
+  allowList?: ImmediateAllowList,
 ): Promise<{ item: ImmediateItemState } | { retry: Extract<ImmediateOutcome, { kind: "retry" }> }> {
   const at = () => now().toISOString();
   try {
-    const raw = await client.chatCompletion(immediateRequestBody(job.model, req, level));
+    const raw = await client.chatCompletion(immediateRequestBody(job.model, req, level, allowList));
     // A 200 can still carry only an error (e.g. "no endpoints" for a provider filter).
     const body = asObject(parseJson(raw.bodyText));
     const err = asObject(body?.error);

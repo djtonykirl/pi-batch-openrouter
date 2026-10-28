@@ -11,6 +11,7 @@ import { conversationOrder, estimateTokens } from "../chat/request.js";
 import { ChatService, PROJECT_INSTRUCTIONS_FILE } from "../chat/service.js";
 import { ThreadStore } from "../chat/store.js";
 import { loadConfig, readPrivacyConfig, saveConfigUpdate, type BatchConfig } from "../config.js";
+import { allowListPin, allowedProviders, formatPin, formatPrivacyPolicy, formatRoutingPolicy } from "../openrouter/routing.js";
 import { IgnoreMatcher, hardDenyMatcher } from "../context/ignore.js";
 import { buildContextPackage, gitCheckIgnore, toPosix } from "../context/package.js";
 import { formatSecretFindings, scanForSecrets } from "../context/secrets.js";
@@ -549,6 +550,7 @@ export class BatchWebServer {
 
   private privacyState(): Record<string, unknown> {
     const p = this.deps.service.privacyConfig();
+    const config = this.deps.getConfig();
     return {
       level: p.level,
       source: levelSource(this.deps.workspaceRoot),
@@ -559,6 +561,7 @@ export class BatchWebServer {
       noticeShown: p.noticeShown,
       settingsUrl: PRIVACY_SETTINGS_URL,
       catalog: this.catalogInfo(),
+      routing: { allowedProviders: allowedProviders(config), allowFallbacks: config.routing.allowFallbacks, pin: formatPin(allowListPin(config)), policy: formatPrivacyPolicy(config, p), summary: formatRoutingPolicy(config, p) },
     };
   }
 
@@ -1075,7 +1078,7 @@ export class BatchWebServer {
         const batchModels = known.length > 0 ? known : [config.defaultModel, ...DEFAULT_FALLBACK_MODELS];
         this.sendJson(res, 200, {
           level,
-          entries: pickerEntries(this.deps.catalog?.snapshot(), batchModels, level, privacy.accountNoTraining),
+          entries: pickerEntries(this.deps.catalog?.snapshot(), batchModels, level, privacy.accountNoTraining, allowedProviders(config)),
           catalog: this.catalogInfo(),
         });
         return;
@@ -1228,7 +1231,8 @@ export class BatchWebServer {
           ucPrefix: body.ucPrefix || undefined,
         });
         const previewOnly = body.mode !== "submit";
-        const preview = formatMetadataPreview(prepared, previewOnly);
+        const privacyNow = this.deps.service.privacyConfig();
+        const preview = formatMetadataPreview(prepared, previewOnly, formatPrivacyPolicy(this.deps.getConfig(), privacyNow), privacyNow.level);
         if (prepared.blockers.length > 0) {
           const blocked = prepared.blockers.join("\n\n");
           this.sendJson(res, 400, { error: `${preview}\n\nPLAN BLOCKED: nothing was saved or sent:\n\n${blocked}`, blockers: prepared.blockers, warnings: prepared.warnings, preview });

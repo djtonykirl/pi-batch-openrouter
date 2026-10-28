@@ -8,6 +8,7 @@ import { ChatService } from "../src/chat/service.js";
 import { ThreadStore } from "../src/chat/store.js";
 import { formatMetadataPreview } from "../src/metadata-commands.js";
 import { OpenRouterBatchClient } from "../src/openrouter/client.js";
+import { formatPrivacyPolicy } from "../src/openrouter/routing.js";
 import { BatchPoller } from "../src/poller.js";
 import { JobRegistry } from "../src/registry.js";
 import { BatchService } from "../src/service.js";
@@ -106,7 +107,9 @@ test(
   withWeb(async ({ post, batch }) => {
     const dry = await json(await post("/api/jobs/metadata", { context: CTX, input: TABLES, mode: "dryrun" }));
     assert.deepEqual(dry.blockers, []);
-    const expected = formatMetadataPreview(await batch.planMetadata({ context: CTX, input: TABLES }), true);
+    // Same arguments as the TUI: the privacy level and the routing policy (master's routing.*).
+    const privacy = batch.privacyConfig();
+    const expected = formatMetadataPreview(await batch.planMetadata({ context: CTX, input: TABLES }), true, formatPrivacyPolicy(makeConfig(), privacy), privacy.level);
     assert.equal(dry.preview, expected);
     assert.equal(batch.registry.list().jobs.length, 0);
 

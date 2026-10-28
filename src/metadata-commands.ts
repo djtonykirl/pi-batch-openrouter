@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { parseArgs } from "./args.js";
-import { formatPin, formatPrivacyPolicy } from "./openrouter/routing.js";
+import { formatPrivacyPolicy, previewPin } from "./openrouter/routing.js";
 import type { PrivacyLevel } from "./privacy/policy.js";
 import { ArtifactError } from "./artifacts/service.js";
 import { TextViewerComponent } from "./dashboard.js";
@@ -68,8 +68,8 @@ export async function cmdMetadata(rt: BatchRuntime, rest: string[], ctx: Extensi
         ucPrefix: parsed.values["uc-prefix"],
       });
       const previewOnly = parsed.booleans.has("preview");
-      const level = service.privacyConfig().level;
-      const preview = formatMetadataPreview(prepared, previewOnly, formatPrivacyPolicy(rt.loaded.config, level), level);
+      const privacy = service.privacyConfig();
+      const preview = formatMetadataPreview(prepared, previewOnly, formatPrivacyPolicy(rt.loaded.config, privacy), privacy.level);
       if (prepared.blockers.length > 0) throw new SubmissionBlockedError(`${preview}\n\nPLAN BLOCKED — nothing was saved or sent:\n\n${prepared.blockers.join("\n\n")}`);
       const job = await service.createMetadataJob(prepared, { previewOnly });
       if (previewOnly) {
@@ -158,8 +158,8 @@ export function formatMetadataPreview(p: PreparedMetadataRun, previewOnly: boole
       `Characters:        ${plan.totalCharacters} provider-bound (not a token count; no cost estimate)`,
       `Largest request:   ${plan.largest ? `${plan.largest.characters} characters (${plan.largest.table})` : "-"}`,
       `Model:             ${p.model}`,
-      `Provider pin:      ${formatPin(p.pin)}`,
-      ...(level ? [`Privacy level:     ${level}${level === "zdr" ? "  (pinned to ZDR endpoints when the job is created)" : ""}`] : []),
+      `Provider pin:      ${previewPin(p.pin, level)}`,
+      ...(level ? [`Privacy level:     ${level}`] : []),
       ...(privacy ? [`Account privacy:   ${privacy}  (batch requests cannot carry ZDR/data-collection preferences)`] : []),
       `Secrets:           ${plan.secretFindings.length ? `${plan.secretFindings.length} potential finding(s)` : "none detected"} (context and each table's evidence)`,
       `Plan SHA-256:      ${plan.planSha256}`,

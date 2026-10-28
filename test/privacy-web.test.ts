@@ -330,3 +330,21 @@ test("ThreadStore.remove only removes an untouched thread", async () => {
     rm(root);
   }
 });
+
+test(
+  "GET /api/privacy shows the routing policy; GET /api/models blocks a zdr batch model with no ZDR endpoint in the allow-list",
+  withWeb(async ({ get, cfg }) => {
+    Object.assign(cfg.routing, { allowedProviders: ["groq"], allowFallbacks: false, requireZdr: true });
+    const p = (await (await get("/api/privacy")).json()) as Record<string, any>;
+    assert.deepEqual(p.routing.allowedProviders, ["groq"]);
+    assert.equal(p.routing.pin, "groq (no fallbacks)");
+    assert.equal(p.routing.policy, "ZDR required (NOT attested); no data collection not required");
+    assert.match(p.routing.summary, /^Provider allow-list: groq \(no fallbacks\); ZDR required/);
+    cfg.privacy.level = "zdr";
+    const m = (await (await get("/api/models")).json()) as { entries: Array<{ id: string; blocked?: string }> };
+    assert.equal(m.entries.find((e) => e.id === "y/model")!.blocked, "Privacy level zdr: no ZDR provider for y/model within routing.allowedProviders (groq)");
+    cfg.routing.allowedProviders = ["azure"];
+    const ok = (await (await get("/api/models")).json()) as { entries: Array<{ id: string; blocked?: string }> };
+    assert.equal(ok.entries.find((e) => e.id === "y/model")!.blocked, undefined);
+  }),
+);

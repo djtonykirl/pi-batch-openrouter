@@ -7,12 +7,15 @@ import { promptEvidence, type TableEvidence } from "../src/metadata/contract.js"
 import { METADATA_STANDARDS_INSTRUCTIONS, METADATA_V2_INSTRUCTIONS, planMetadataRun, renderMetadataPrompt } from "../src/metadata/plan.js";
 import { ModelCatalog } from "../src/models/catalog.js";
 import { OpenRouterBatchClient } from "../src/openrouter/client.js";
-import { formatPrivacyPolicy, providerAllowed } from "../src/openrouter/routing.js";
-import { resolveBatchProvider, type ZdrEndpoint } from "../src/privacy/policy.js";
+import { formatMetadataPreview } from "../src/metadata-commands.js";
+import { ZDR_PIN_PREVIEW, formatPrivacyPolicy, formatRoutingPolicy, previewPin, providerAllowed } from "../src/openrouter/routing.js";
+import { formatPrivacyStatus, pickerEntries } from "../src/privacy/commands.js";
+import { immediateProviderFields, resolveBatchProvider, type ZdrEndpoint } from "../src/privacy/policy.js";
 import { JobRegistry } from "../src/registry.js";
 import { BatchService, SubmissionBlockedError, type AskOptions } from "../src/service.js";
-import { FAKE_KEY, FakeOpenRouter, accepted, makeConfig } from "./fixtures/fake-openrouter.js";
-import { chatCompletion } from "./fixtures/openrouter.js";
+import { FAKE_KEY, FakeOpenRouter, accepted, makeConfig, makeService } from "./fixtures/fake-openrouter.js";
+import { metadataWorkspace } from "./fixtures/metadata.js";
+import { chatCompletion, completed, successItem } from "./fixtures/openrouter.js";
 import { rm, tempWorkspace, writeFiles } from "./helpers.js";
 
 /**
@@ -235,11 +238,13 @@ test(
   },
 );
 
-test("formatPrivacyPolicy names a requirement the level satisfies", () => {
+test("formatPrivacyPolicy names a requirement the level satisfies (no-training only with the attestation)", () => {
   const cfg = makeConfig((c) => Object.assign(c.routing, { requireZdr: true, requireNoDataCollection: true }));
   assert.equal(formatPrivacyPolicy(cfg), "ZDR required (NOT attested); no data collection required (NOT attested)");
-  assert.equal(formatPrivacyPolicy(cfg, "zdr"), "ZDR required (satisfied by privacy level zdr); no data collection required (satisfied by privacy level zdr)");
-  assert.equal(formatPrivacyPolicy(cfg, "no-training"), "ZDR required (NOT attested); no data collection required (satisfied by privacy level no-training)");
+  assert.equal(formatPrivacyPolicy(cfg, { level: "zdr", accountNoTraining: false }), "ZDR required (satisfied by privacy level zdr); no data collection required (satisfied by privacy level zdr)");
+  assert.equal(formatPrivacyPolicy(cfg, { level: "no-training", accountNoTraining: true }), "ZDR required (NOT attested); no data collection required (satisfied by privacy level no-training)");
+  // On a batch, no-training meets requireNoDataCollection only with the no-training attestation.
+  assert.equal(formatPrivacyPolicy(cfg, { level: "no-training", accountNoTraining: false }), "ZDR required (NOT attested); no data collection required (NOT attested) (needs /batch privacy attest)");
 });
 
 // ------------------------------------------------------------ standards mode x contract v2
@@ -333,3 +338,148 @@ test("standards mode drops audit columns, and their profiles, from the prompt; e
   const prompt = renderMetadataPrompt("# Pinpoint", withAudit, STANDARDS);
   assert.doesNotMatch(prompt, /fw_ingestdate|audit timestamp/);
 });
+
+// ------------------------------------------------------------ post-review fixes
+
+test("immediate provider fields: allow-list as provider.only (list order) with the privacy fields", () => {
+  const list = { only: ["groq", "azure"], allowFallbacks: true };
+  assert.deepEqual(immediateProviderFields("standard", list), { only: ["groq", "azure"] });
+  assert.deepEqual(immediateProviderFields("no-training", list), { only: ["groq", "azure"], data_collection: "deny" });
+  assert.deepEqual(immediateProviderFields("zdr", list), { only: ["groq", "azure"], zdr: true });
+  assert.deepEqual(immediateProviderFields("zdr", { only: ["groq"], allowFallbacks: false }), { only: ["groq"], allow_fallbacks: false, zdr: true });
+  assert.deepEqual(immediateProviderFields("standard", { only: [], allowFallbacks: false }), {});
+});
+
+test("immediate route: a non-empty allow-list is sent as provider.only; without one the body is unchanged", async () => {
+  const cases: Array<{ level: BatchConfig["privacy"]["level"]; routing: Partial<BatchConfig["routing"]>; provider: unknown }> = [
+    { level: "standard", routing: { allowedProviders: ["groq", "azure"] }, provider: { only: ["groq", "azure"] } },
+    { level: "no-training", routing: { allowedProviders: ["groq", "azure"] }, provider: { only: ["groq", "azure"], data_collection: "deny" } },
+    { level: "zdr", routing: { allowedProviders: ["groq", "azure"] }, provider: { only: ["groq", "azure"], zdr: true } },
+    { level: "zdr", routing: { allowedProviders: ["azure"], allowFallbacks: false }, provider: { only: ["azure"], allow_fallbacks: false, zdr: true } },
+    { level: "zdr", routing: {}, provider: { zdr: true } },
+    { level: "standard", routing: {}, provider: undefined },
+  ];
+  for (const c of cases) {
+    await withEnv({ level: c.level, routing: c.routing }, async ({ service, fake }) => {
+      fake.chatReplies = [{ status: 200, body: chatCompletion() }];
+      const job = await service.createChatJob(chatDraft("meta/llama-free:free"));
+      assert.equal(job.route, "immediate");
+      const body = fake.chatBodies()[0]!;
+      assert.deepEqual(body.provider, c.provider, JSON.stringify(c));
+      if (c.provider === undefined) assert.ok(!("provider" in body));
+    })();
+  }
+});
+
+test(
+  "immediate route: a requirement refusal does not mention a batch submission",
+  withEnv({ level: "standard", routing: { requireZdr: true } }, async ({ service }) => {
+    await assert.rejects(service.createChatJob(chatDraft("meta/llama-free:free")), (err: unknown) => {
+      assert.ok(err instanceof SubmissionBlockedError);
+      assert.doesNotMatch(err.message, /batch submission/);
+      assert.match(err.message, /^routing\.requireZdr is set, but it cannot be guaranteed for this request at privacy level standard without the account attestation/);
+      return true;
+    });
+  }),
+);
+
+test("model picker at zdr: a batch model with no ZDR endpoint in the allow-list is blocked with decidePrivacy's reason", () => {
+  const snap = { fresh: true, loadedAt: new Date().toISOString(), models: [{ id: "meta/llama-free:free", free: true }], zdr: ZDR } as never;
+  const blocked = pickerEntries(snap, [MODEL], "zdr", false, ["groq"]).find((e) => e.id === MODEL)!;
+  assert.equal(blocked.blocked, `Privacy level zdr: no ZDR provider for ${MODEL} within routing.allowedProviders (groq)`);
+  assert.equal(pickerEntries(snap, [MODEL], "zdr", false, ["azure"]).find((e) => e.id === MODEL)!.blocked, undefined);
+  assert.equal(pickerEntries(snap, [MODEL], "zdr", false).find((e) => e.id === MODEL)!.blocked, undefined);
+  assert.equal(pickerEntries(snap, [MODEL], "standard", false, ["groq"]).find((e) => e.id === MODEL)!.blocked, undefined);
+});
+
+test("/batch privacy status shows the routing policy", () => {
+  const cfg = makeConfig((c) => Object.assign(c.routing, { allowedProviders: ["azure"], allowFallbacks: false, requireZdr: true }));
+  const routing = formatRoutingPolicy(cfg, { level: "zdr", accountNoTraining: false });
+  assert.equal(routing, "Provider allow-list: azure (no fallbacks); ZDR required (satisfied by privacy level zdr); no data collection not required");
+  const text = formatPrivacyStatus({ level: "zdr", source: "project", accountNoTraining: false, snapshot: undefined, routing });
+  assert.match(text, /^Routing: Provider allow-list: azure \(no fallbacks\); ZDR required/m);
+});
+
+test("previews at zdr show the ZDR pin note instead of the allow-list pin", async () => {
+  assert.equal(previewPin({ only: ["azure"], allow_fallbacks: true }, "zdr"), ZDR_PIN_PREVIEW);
+  assert.equal(previewPin({ only: ["azure"], allow_fallbacks: true }, "standard"), "azure (fallbacks within the list)");
+  const root = metadataWorkspace();
+  try {
+    const cfg = makeConfig((c) => {
+      c.privacy.level = "zdr";
+      c.routing.allowedProviders = ["azure"];
+    });
+    const service = makeService(root, new FakeOpenRouter(), cfg);
+    const p = await service.planMetadata({ context: "metadata/beverage/context.md", input: "metadata/beverage/tables.jsonl" });
+    assert.deepEqual(p.pin, { only: ["azure"], allow_fallbacks: true });
+    const privacy = service.privacyConfig();
+    const text = formatMetadataPreview(p, true, formatPrivacyPolicy(cfg, privacy), privacy.level);
+    assert.match(text, new RegExp(`Provider pin:\\s+${ZDR_PIN_PREVIEW}`));
+    assert.match(text, /Privacy level:\s+zdr/);
+    assert.doesNotMatch(formatMetadataPreview(p, true), new RegExp(ZDR_PIN_PREVIEW));
+  } finally {
+    rm(root);
+  }
+});
+test(
+  "synthesis keeps its source's stricter level: source at zdr, project at standard",
+  withEnv({ level: "zdr", routing: { requireZdr: true } }, async ({ service, fake, cfg }) => {
+    fake.submitReplies = [accepted("batch_src")];
+    const src = await service.createJob(await service.prepare(ASK), { previewOnly: false });
+    assert.equal(src.privacy?.level, "zdr");
+    fake.getReplies = [{ status: 200, body: completed([successItem(src.customIds[0]!, "a finding")], { id: "batch_src" }) }];
+    await service.reconcile(src.localId, { force: true });
+    cfg.privacy.level = "standard";
+    const prep = await service.prepareSynthesis(src.localId, { allowPartial: false });
+    assert.deepEqual(prep.blockers, [], "requireZdr is met by the source's zdr level at prepare too");
+    fake.submitReplies = [accepted("batch_syn")];
+    const syn = await service.createSynthesisJob(prep, { previewOnly: false });
+    assert.equal(syn.privacy?.level, "zdr");
+    assert.deepEqual(posted(fake).at(-1)!.provider, { only: ["anthropic", "azure/eu"], allow_fallbacks: false });
+  }),
+);
+
+test(
+  "submit re-checks routing: a requirement set after the preview refuses it, and it stays previewed",
+  withEnv({ level: "standard" }, async ({ service, fake, cfg }) => {
+    const preview = await service.createJob(await service.prepare(ASK), { previewOnly: true });
+    cfg.routing.requireZdr = true;
+    fake.submitReplies = [accepted()];
+    await assert.rejects(service.submit(preview.localId), (err: unknown) => {
+      assert.ok(err instanceof SubmissionBlockedError);
+      assert.match(err.message, new RegExp(`^Privacy level standard: ${preview.localId} cannot be sent: routing\\.requireZdr is set`));
+      return true;
+    });
+    assert.equal(posted(fake).length, 0);
+    assert.equal(service.registry.read(preview.localId).localStatus, "previewed");
+    cfg.routing.accountZdrEnforced = true;
+    assert.equal((await service.submit(preview.localId)).localStatus, "submitted");
+  }),
+);
+
+test(
+  "submit re-checks routing: a stored pin outside the current allow-list is refused, and it stays previewed",
+  withEnv({ level: "standard", routing: { allowedProviders: ["deepinfra"] } }, async ({ service, fake, cfg }) => {
+    const pinned = await service.createJob(await service.prepare(ASK), { previewOnly: true });
+    cfg.routing.allowedProviders = ["groq"];
+    fake.submitReplies = [accepted()];
+    await assert.rejects(service.submit(pinned.localId), (err: unknown) => {
+      assert.ok(err instanceof SubmissionBlockedError);
+      assert.match(err.message, new RegExp(`^Privacy level standard: ${pinned.localId} cannot be sent: provider pin "deepinfra" is not in routing.allowedProviders \\(groq\\)`));
+      return true;
+    });
+    assert.equal(service.registry.read(pinned.localId).localStatus, "previewed");
+    assert.equal(posted(fake).length, 0);
+  }),
+);
+
+test(
+  "submit re-checks routing: an unpinned preview is refused once an allow-list is set",
+  withEnv({ level: "standard" }, async ({ service, fake, cfg }) => {
+    const preview = await service.createJob(await service.prepare(ASK), { previewOnly: true });
+    cfg.routing.allowedProviders = ["groq"];
+    await assert.rejects(service.submit(preview.localId), /^SubmissionBlockedError: Privacy level standard: .* the stored request has no provider pin/);
+    assert.equal(service.registry.read(preview.localId).localStatus, "previewed");
+    assert.equal(posted(fake).length, 0);
+  }),
+);

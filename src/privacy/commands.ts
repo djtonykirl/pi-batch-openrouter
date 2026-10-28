@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import { GLOBAL_CONFIG_FILE, projectConfigPath, saveConfigUpdate } from "../config.js";
 import type { CatalogSnapshot } from "../models/catalog.js";
+import { formatRoutingPolicy, providerAllowed } from "../openrouter/routing.js";
 import type { BatchRuntime } from "../runtime.js";
 import { formatIsoShort } from "../time.js";
 import { isPrivacyLevel, normaliseModelSlug, PRIVACY_LEVELS, routeForModel, type PrivacyLevel, type Route } from "./policy.js";
@@ -25,7 +26,14 @@ export interface PickerEntry {
  * The chat model picker's list: the batch models Pi knows plus the catalog's free models, labelled and checked against
  * the level. Blocked entries are returned (with the reason) so a caller can hide or show them.
  */
-export function pickerEntries(catalog: CatalogSnapshot | undefined, batchModels: string[], level: PrivacyLevel, accountNoTraining: boolean): PickerEntry[] {
+export function pickerEntries(
+  catalog: CatalogSnapshot | undefined,
+  batchModels: string[],
+  level: PrivacyLevel,
+  accountNoTraining: boolean,
+  /** routing.allowedProviders: at zdr, a batch model with no ZDR endpoint in the list is blocked (as decidePrivacy would). */
+  allowedProviders: readonly string[] = [],
+): PickerEntry[] {
   const candidates = new Map<string, Route>();
   for (const id of batchModels) candidates.set(id, routeForModel(id));
   for (const m of catalog?.models ?? []) {
@@ -40,6 +48,9 @@ export function pickerEntries(catalog: CatalogSnapshot | undefined, batchModels:
     if (level === "zdr") {
       if (!catalog?.fresh) entry.blocked = "Privacy level zdr: model catalog not loaded this session, so ZDR providers can't be verified (run /batch privacy refresh)";
       else if (!hasZdr) entry.blocked = `Privacy level zdr: no ZDR provider for ${base}`;
+      else if (route === "batch" && allowedProviders.length && !catalog.zdr.some((e) => e.model === base && providerAllowed(allowedProviders, e.provider))) {
+        entry.blocked = `Privacy level zdr: no ZDR provider for ${base} within routing.allowedProviders (${allowedProviders.join(", ")})`;
+      }
     } else if (level === "no-training" && route === "batch" && !accountNoTraining) {
       entry.blocked = "Privacy level no-training: batch models need your account's no-training attestation (/batch privacy attest)";
     }
@@ -68,11 +79,12 @@ export function levelUpdate(current: { noticeShown: boolean }, level: PrivacyLev
   return { update: showNotice ? { level, noticeShown: true } : { level }, showNotice };
 }
 
-export function formatPrivacyStatus(input: { level: PrivacyLevel; source: string; accountNoTraining: boolean; attestedAt?: string; snapshot: CatalogSnapshot | undefined }): string {
+export function formatPrivacyStatus(input: { level: PrivacyLevel; source: string; accountNoTraining: boolean; attestedAt?: string; snapshot: CatalogSnapshot | undefined; routing?: string }): string {
   return [
     `Privacy level: ${input.level} (${input.source})`,
     `No-training attestation: ${input.accountNoTraining ? `attested${input.attestedAt ? ` ${formatIsoShort(input.attestedAt)}` : ""} (you confirmed your OpenRouter account disables training; the extension cannot verify this)` : "not attested"}`,
     `Model catalog: ${catalogStateLine(input.snapshot)}`,
+    ...(input.routing ? [`Routing: ${input.routing}`] : []),
     `Account privacy settings (not checked by this extension): ${PRIVACY_SETTINGS_URL}`,
     `Usage: /batch [--global] privacy ${PRIVACY_LEVELS.join("|")}|attest|unattest|refresh`,
   ].join("\n");
@@ -106,7 +118,7 @@ export async function cmdPrivacy(rt: BatchRuntime, rest: string[], isGlobal: boo
   };
 
   if (!arg) {
-    rt.notify(formatPrivacyStatus({ level: config().level, source: levelSource(rt.cwd), accountNoTraining: config().accountNoTraining, attestedAt: config().attestedAt, snapshot: rt.catalog?.snapshot() }), "info");
+    rt.notify(formatPrivacyStatus({ level: config().level, source: levelSource(rt.cwd), accountNoTraining: config().accountNoTraining, attestedAt: config().attestedAt, snapshot: rt.catalog?.snapshot(), routing: formatRoutingPolicy(rt.loaded.config, config()) }), "info");
     return;
   }
   if (arg === "refresh") {

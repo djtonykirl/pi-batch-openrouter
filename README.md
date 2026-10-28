@@ -1080,8 +1080,12 @@ checked 2026-10-21). So:
 
 The metadata preview shows the effective pin, the privacy level and the account-privacy policy.
 
-**How `routing.*` relates to [privacy levels](#privacy-levels-and-free-models).** Both apply to every job.
-- **At `standard` and `no-training`**, `routing.allowedProviders` is the pin as described above.
+**How `routing.*` relates to [privacy levels](#privacy-levels-and-free-models).** Both apply to every job, on both routes.
+- **At `standard` and `no-training`**, `routing.allowedProviders` is the batch pin as described above.
+- **On the immediate route** (free models in batch chat), a non-empty allow-list is sent with each request as
+  `provider.only`, in list order, in the same `provider` object as the privacy fields: for example
+  `{ "only": ["azure"], "zdr": true }`. `allow_fallbacks: false` is added when `routing.allowFallbacks` is false.
+  A chat thread's own provider pin must be within the list on either route.
 - **At `zdr`**, the job is pinned to the model's ZDR endpoints that the allow-list admits, always without fallbacks.
   - An entry admits a ZDR endpoint tag equal to it, or one whose base provider it names (`azure` admits `azure/eu`).
   - `routing.allowFallbacks` is ignored at this level.
@@ -1091,7 +1095,12 @@ The metadata preview shows the effective pin, the privacy level and the account-
   - `routing.requireNoDataCollection` is met by `routing.accountDataCollectionDenied`, or by `no-training` or `zdr`.
     On the batch route, `no-training` already needs the no-training attestation.
   - On the immediate route (free models in batch chat), `no-training` and `zdr` send `data_collection: "deny"` / `zdr: true` per request.
-  - Planning checks this with the project level. Job creation checks it again with the effective level, including a chat thread's own level.
+  - Planning checks this with the project level. Job creation checks it again with the effective level, including a
+    chat thread's own level or a synthesis' source level.
+  - `/batch submit` re-checks a saved preview against the current `routing.*`. A requirement that is no longer met,
+    or a stored pin outside the current allow-list, is refused, and the job stays previewed.
+- `/batch privacy`, the web privacy panel and the model pickers show the routing policy. At `zdr`, previews show the
+  pin as "pinned to ZDR endpoints when the job is created".
 
 ## What happens to your data
 

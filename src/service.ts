@@ -607,7 +607,7 @@ export class BatchService {
     const route = routeForModel(draft.model, draft.route);
     // routing.require* checked here, where the effective level (a chat thread's included) is known: zdr and
     // no-training satisfy them (per request on the immediate route; by the ZDR pin or the attested account on batch).
-    const unmet = accountRequirementBlockers(config, level);
+    const unmet = accountRequirementBlockers(config, level, route);
     if (unmet.length) {
       this.logger.log("warn", "routing_refused", { kind: draft.kind, level, model: draft.model });
       throw new SubmissionBlockedError(unmet.join("\n\n"));
@@ -615,6 +615,9 @@ export class BatchService {
     if (route === "immediate") {
       // Spec non-goal (v1): immediate requests outside batch chat need a rate-paced queue.
       if (draft.kind !== "chat") throw new SubmissionBlockedError(IMMEDIATE_CHAT_ONLY);
+      // The allow-list is sent as provider.only with each call (immediateStep); a user pin must still be within it.
+      const outsideList = pinOutsideAllowList(config, draft.pin);
+      if (outsideList) throw new SubmissionBlockedError(outsideList);
       const enforcement = level === "zdr" ? "immediate: zdr=true" : level === "no-training" ? "immediate: data_collection=deny" : "none";
       // The immediate body carries only the privacy fields, so a pin is never recorded as if it were sent.
       return { route, privacy: { level, route, enforcement } };
@@ -1109,11 +1112,20 @@ export class BatchService {
           `Privacy level no-training: ${localId} was prepared on your account's no-training attestation, but the attestation was removed; attest again (/batch privacy attest) or cancel it`,
         );
       }
+      // routing.* may have been tightened since the preview: its requirements are re-checked at the recorded level.
+      const routingConfig = this.deps.getConfig();
+      const unmet = accountRequirementBlockers(routingConfig, recorded, job.route === "immediate" ? "immediate" : "batch");
+      if (unmet.length) throw new SubmissionBlockedError(`Privacy level ${recorded}: ${localId} cannot be sent: ${unmet.join(" ")} It stays previewed.`);
       if (!opts.skipDuplicateCheck && job.contentSha256) {
         const dup = this.findActiveDuplicate(job.contentSha256, localId);
         if (dup) throw new DuplicateActiveRequestError(dup.localId);
       }
       const { bodyText, body } = this.storedRequest(job);
+      if (job.route !== "immediate" && allowedProviders(routingConfig).length) {
+        // The stored pin must still be within the current allow-list (a body with no pin is outside it).
+        const outside = body.provider ? pinOutsideAllowList(routingConfig, body.provider) : "the stored request has no provider pin, but routing.allowedProviders is now set";
+        if (outside) throw new SubmissionBlockedError(`Privacy level ${recorded}: ${localId} cannot be sent: ${outside}. Cancel it and create it again; it stays previewed.`);
+      }
       // Re-validated at submit time too: previews made by earlier versions may predate a rule.
       const problems = [...customIdProblems(body.requests.map((r) => r.custom_id)), ...submitBodyProblems(body)];
       if (problems.length > 0) {
@@ -1444,6 +1456,8 @@ export class BatchService {
     const outcome = await runImmediateJob(job, body.requests, this.client(apiKey), level, undefined, {
       progress: this.immediateProgress(localId),
       inFlightMs: config.polling.requestTimeoutSeconds * 1000 + IMMEDIATE_IN_FLIGHT_MARGIN_MS,
+      // routing.allowedProviders applies to the immediate route too (read at send time, like the level).
+      allowList: { only: allowedProviders(config), allowFallbacks: config.routing.allowFallbacks },
     });
 
     if (outcome.kind === "in_flight") {
@@ -2052,7 +2066,7 @@ export class BatchService {
     }
     const model = normalizeBatchModelSlug(opts.model ?? config.defaultModel);
     const account = opts.account ?? source.account;
-    const routing = resolveRouting(config, opts.providerPin, this.privacyConfig().level);
+    const routing = resolveRouting(config, opts.providerPin, effectiveLevel(this.privacyConfig().level, source.privacy?.level));
     const pin = routing.pin;
     const coverage = this.coverage(sourceJobId);
 
@@ -2125,6 +2139,8 @@ export class BatchService {
       model: prepared.model,
       account: prepared.account,
       pin: prepared.pin,
+      // Like a retry: a synthesis carries its source's results, so the stricter of the source's and the project's level applies.
+      ...(source.privacy ? { privacyLevel: source.privacy.level } : {}),
       format: "markdown",
       items: [
         {

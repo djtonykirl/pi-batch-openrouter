@@ -4,6 +4,7 @@ import { parseArgs } from "../args.js";
 import { showText } from "../commands.js";
 import { isInside, writeFileAtomicExclusive } from "../fsutil.js";
 import { discoverBatchModels } from "../models.js";
+import { allowedProviders } from "../openrouter/routing.js";
 import { pickerEntries } from "../privacy/commands.js";
 import { isPrivacyLevel, PRIVACY_LEVELS, type Route } from "../privacy/policy.js";
 import type { BatchRuntime } from "../runtime.js";
@@ -166,7 +167,7 @@ async function pickModel(rt: BatchRuntime, ctx: ExtensionCommandContext, threadI
   for (;;) {
     const snapshot = catalog?.snapshot();
     const level = rt.requireChat().effectiveLevel(threadId);
-    const entries = pickerEntries(snapshot, [...slugs], level, rt.privacy().accountNoTraining);
+    const entries = pickerEntries(snapshot, [...slugs], level, rt.privacy().accountNoTraining, allowedProviders(rt.loaded.config));
     const shown = entries.filter((e) => !e.blocked);
     const options = new Map<string, { slug: string; route: Route }>();
     for (const e of shown) options.set(`${e.id} ${e.labels.map((l) => `[${l}]`).join(" ")}`, { slug: e.id, route: e.route });

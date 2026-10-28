@@ -61,14 +61,19 @@ export function pinOutsideAllowList(config: BatchConfig, pin: ProviderPin | unde
  * or by the job's effective privacy level (zdr pins ZDR endpoints per request; no-training and
  * zdr deny data collection). `level` absent means the level isn't known: master's attestation-only rule.
  */
-export function accountRequirementBlockers(config: BatchConfig, level?: PrivacyLevel): string[] {
+export function accountRequirementBlockers(config: BatchConfig, level?: PrivacyLevel, route: "batch" | "immediate" = "batch"): string[] {
   const r = config.routing;
   const blockers: string[] = [];
+  // The batch texts are master's; an immediate-route refusal is worded without "batch submission".
+  const immediate = (what: string, attestation: string) =>
+    `${what} is set, but it cannot be guaranteed for this request at privacy level ${level ?? "standard"} without the account attestation. Raise the privacy level, or confirm the OpenRouter account enforces it and set ${attestation} to true.`;
   if (r.requireZdr && !r.accountZdrEnforced && level !== "zdr") {
-    blockers.push("routing.requireZdr is set, but zero data retention cannot be requested on a batch submission. Enable ZDR in the OpenRouter account's privacy settings (or a guardrail on this key), then set routing.accountZdrEnforced to true.");
+    if (route === "immediate") blockers.push(immediate("routing.requireZdr", "routing.accountZdrEnforced"));
+    else blockers.push("routing.requireZdr is set, but zero data retention cannot be requested on a batch submission. Enable ZDR in the OpenRouter account's privacy settings (or a guardrail on this key), then set routing.accountZdrEnforced to true.");
   }
   if (r.requireNoDataCollection && !r.accountDataCollectionDenied && level !== "no-training" && level !== "zdr") {
-    blockers.push("routing.requireNoDataCollection is set, but data-collection preferences cannot be sent on a batch submission. Deny prompt training/data collection in the OpenRouter account's privacy settings, then set routing.accountDataCollectionDenied to true.");
+    if (route === "immediate") blockers.push(immediate("routing.requireNoDataCollection", "routing.accountDataCollectionDenied"));
+    else blockers.push("routing.requireNoDataCollection is set, but data-collection preferences cannot be sent on a batch submission. Deny prompt training/data collection in the OpenRouter account's privacy settings, then set routing.accountDataCollectionDenied to true.");
   }
   return blockers;
 }
@@ -98,10 +103,32 @@ export function formatPin(pin: ProviderPin | undefined): string {
   return `${pin.only.join(",")} (${pin.allow_fallbacks === false ? "no fallbacks" : "fallbacks within the list"})`;
 }
 
-/** The account-level privacy requirements, for previews. With `level`, a requirement the level satisfies says so. */
-export function formatPrivacyPolicy(config: BatchConfig, level?: PrivacyLevel): string {
+/** A preview's pin: at an effective level of zdr the job is pinned to ZDR endpoints when it is created, not to this pin. */
+export const ZDR_PIN_PREVIEW = "pinned to ZDR endpoints when the job is created";
+export function previewPin(pin: ProviderPin | undefined, level?: PrivacyLevel): string {
+  return level === "zdr" ? ZDR_PIN_PREVIEW : formatPin(pin);
+}
+
+/**
+ * The account-level privacy requirements, for previews (batch route). With `privacy`, a requirement the level
+ * satisfies says so; no-training satisfies requireNoDataCollection on a batch only with the no-training attestation.
+ */
+export function formatPrivacyPolicy(config: BatchConfig, privacy?: { level: PrivacyLevel; accountNoTraining: boolean }): string {
   const r = config.routing;
-  const part = (required: boolean, attested: boolean, byLevel: boolean, what: string) =>
-    required ? `${what} required (${attested ? "account-enforced, attested" : byLevel ? `satisfied by privacy level ${level}` : "NOT attested"})` : `${what} not required`;
-  return `${part(r.requireZdr, r.accountZdrEnforced, level === "zdr", "ZDR")}; ${part(r.requireNoDataCollection, r.accountDataCollectionDenied, level === "no-training" || level === "zdr", "no data collection")}`;
+  const level = privacy?.level;
+  const part = (required: boolean, attested: boolean, byLevel: boolean, what: string, note = "") =>
+    required ? `${what} required (${attested ? "account-enforced, attested" : byLevel ? `satisfied by privacy level ${level}` : "NOT attested"})${note}` : `${what} not required`;
+  const ntUnattested = level === "no-training" && !privacy?.accountNoTraining;
+  return `${part(r.requireZdr, r.accountZdrEnforced, level === "zdr", "ZDR")}; ${part(
+    r.requireNoDataCollection,
+    r.accountDataCollectionDenied,
+    level === "zdr" || (level === "no-training" && !ntUnattested),
+    "no data collection",
+    ntUnattested && !r.accountDataCollectionDenied ? " (needs /batch privacy attest)" : "",
+  )}`;
+}
+
+/** The routing policy in one line, for `/batch privacy` and the web privacy panel. */
+export function formatRoutingPolicy(config: BatchConfig, privacy?: { level: PrivacyLevel; accountNoTraining: boolean }): string {
+  return `Provider allow-list: ${formatPin(allowListPin(config))}; ${formatPrivacyPolicy(config, privacy)}`;
 }

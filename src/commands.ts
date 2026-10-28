@@ -2,7 +2,8 @@ import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { parseArgs, tokenize, type ParsedArgs } from "./args.js";
 import { saveConfigUpdate } from "./config.js";
-import { formatPin } from "./openrouter/routing.js";
+import { previewPin } from "./openrouter/routing.js";
+import type { PrivacyLevel } from "./privacy/policy.js";
 import { BatchDashboardComponent, TextViewerComponent, describeJob, itemsCell, retentionLine } from "./dashboard.js";
 import { discoverBatchModels } from "./models.js";
 import { INJECTED_MESSAGE_TYPE, type BatchRuntime } from "./runtime.js";
@@ -324,7 +325,7 @@ async function cmdAsk(rt: BatchRuntime, rest: string[], ctx: ExtensionCommandCon
   });
   const previewOnly = parsed.booleans.has("preview");
   const config = rt.loaded.config;
-  const preview = formatPreview(prepared, previewOnly);
+  const preview = formatPreview(prepared, previewOnly, service.privacyConfig().level);
 
   if (prepared.blockers.length > 0) {
     // Nothing is persisted or sent when blocked.
@@ -359,13 +360,13 @@ async function cmdAsk(rt: BatchRuntime, rest: string[], ctx: ExtensionCommandCon
   }
 }
 
-function formatPreview(p: PreparedAsk, previewOnly: boolean): string {
+function formatPreview(p: PreparedAsk, previewOnly: boolean, level?: PrivacyLevel): string {
   const lines = [
     previewOnly ? "Batch goal preview (not submitted)" : "Submitting batch goal",
     "",
     `Objective:    ${p.options.objective.replace(/\s+/g, " ").slice(0, 100)}`,
     `Model:        ${p.model}`,
-    `Account:      ${p.account}${p.pin ? `   Provider pin: ${formatPin(p.pin)}` : ""}`,
+    `Account:      ${p.account}${p.pin || level === "zdr" ? `   Provider pin: ${previewPin(p.pin, level)}` : ""}`,
     `Files:        ${p.pkg.files.length}${p.pkg.files.length ? `  (${p.pkg.files.slice(0, 5).map((f) => f.relPath).join(", ")}${p.pkg.files.length > 5 ? ", …" : ""})` : ""}`,
     `Characters:   ${p.pkg.characters}  (context package; not a token count)`,
     `Excluded:     ${p.pkg.excluded.length}${p.pkg.excluded.length ? `  (${p.pkg.excluded.slice(0, 4).map((e) => `${e.relPath} [${e.layer}]`).join(", ")}${p.pkg.excluded.length > 4 ? ", …" : ""})` : ""}`,
@@ -618,7 +619,7 @@ async function cmdRun(rt: BatchRuntime, rest: string[], ctx: ExtensionCommandCon
     includeInstructions: !parsed.booleans.has("no-instructions"),
   });
   const previewOnly = forcePreview || parsed.booleans.has("preview");
-  const preview = formatPlanPreview(plan, previewOnly);
+  const preview = formatPlanPreview(plan, previewOnly, service.privacyConfig().level);
   if (plan.blockers.length > 0) {
     // Nothing is persisted or sent when blocked.
     throw new SubmissionBlockedError(`${preview}\n\nPLAN BLOCKED — nothing was saved or sent:\n\n${plan.blockers.join("\n\n")}`);
@@ -668,7 +669,7 @@ async function runDataset(rt: BatchRuntime, workflow: string, parsed: ParsedArgs
     providerPin: parsed.values.provider,
   });
   const previewOnly = forcePreview || parsed.booleans.has("preview");
-  const preview = formatDatasetPreview(prepared, previewOnly);
+  const preview = formatDatasetPreview(prepared, previewOnly, service.privacyConfig().level);
   if (prepared.blockers.length > 0) {
     throw new SubmissionBlockedError(`${preview}\n\nPLAN BLOCKED — nothing was saved or sent:\n\n${prepared.blockers.join("\n\n")}`);
   }
@@ -691,7 +692,7 @@ async function runDataset(rt: BatchRuntime, workflow: string, parsed: ParsedArgs
   notifySubmitted(rt, job, `${job.requestCount} request(s) in one batch`);
 }
 
-export function formatDatasetPreview(p: PreparedDatasetRun, previewOnly: boolean): string {
+export function formatDatasetPreview(p: PreparedDatasetRun, previewOnly: boolean, level?: PrivacyLevel): string {
   const def = p.definition;
   const plan = p.plan;
   const c = plan?.counts;
@@ -716,7 +717,7 @@ export function formatDatasetPreview(p: PreparedDatasetRun, previewOnly: boolean
       `Fields sent:       ${def.input.fields.join(", ")}  (only these reach the model; other columns are not read into prompts)`,
       `Model:             ${p.model}`,
       `Account:           ${p.account}`,
-      `Provider pin:      ${formatPin(p.pin)}`,
+      `Provider pin:      ${previewPin(p.pin, level)}`,
       `Output:            ${def.output.type === "json" ? "json — validated locally against the workflow's JSON Schema; invalid output makes the item corrupt" : "markdown"}`,
       `Characters:        ${plan.totalCharacters} provider-bound (not a token count; no cost estimate is made)`,
       `Largest item:      ${plan.largest ? `${plan.largest.characters} characters (${plan.largest.label})` : "-"}`,
@@ -825,7 +826,7 @@ async function cmdImportLegacy(rt: BatchRuntime, rest: string[], ctx: ExtensionC
   await showText(rt, ctx, "Legacy jobs (preview)", formatLegacyInventory(inventory));
 }
 
-function formatPlanPreview(p: PreparedPlan, previewOnly: boolean): string {
+function formatPlanPreview(p: PreparedPlan, previewOnly: boolean, level?: PrivacyLevel): string {
   const groups = p.workflow.options.groupSize > 1;
   const excluded = p.pkg.excluded;
   const lines = [
@@ -835,7 +836,7 @@ function formatPlanPreview(p: PreparedPlan, previewOnly: boolean): string {
     `Objective:         ${p.options.objective.replace(/\s+/g, " ").slice(0, 100)}`,
     `Model:             ${p.model}`,
     `Account:           ${p.account}`,
-    `Provider pin:      ${formatPin(p.pin)}`,
+    `Provider pin:      ${previewPin(p.pin, level)}`,
     `Requests:          ${p.items.length}`,
     `Selected files:    ${p.pkg.files.length}`,
     `Total characters:  ${p.totalCharacters}  (prompt characters; not a token count)`,
@@ -915,7 +916,7 @@ async function cmdSynthesize(rt: BatchRuntime, rest: string[], ctx: ExtensionCom
     providerPin: parsed.values.provider,
   });
   const previewOnly = parsed.booleans.has("preview");
-  const preview = formatSynthesisPreview(prepared, previewOnly);
+  const preview = formatSynthesisPreview(prepared, previewOnly, service.privacyConfig().level);
   if (prepared.blockers.length > 0) {
     throw new SubmissionBlockedError(`${preview}\n\nSYNTHESIS BLOCKED — nothing was saved or sent:\n\n${prepared.blockers.join("\n\n")}`);
   }
@@ -938,14 +939,14 @@ async function cmdSynthesize(rt: BatchRuntime, rest: string[], ctx: ExtensionCom
   notifySubmitted(rt, job, `synthesis of ${id}`);
 }
 
-function formatSynthesisPreview(p: PreparedSynthesis, previewOnly: boolean): string {
+function formatSynthesisPreview(p: PreparedSynthesis, previewOnly: boolean, level?: PrivacyLevel): string {
   const c = p.coverage;
   return [
     p.blockers.length > 0 ? "Synthesis plan (BLOCKED)" : previewOnly ? "Synthesis plan (not submitted)" : "Submitting synthesis",
     "",
     `Source job:        ${p.sourceJobId}`,
     `Model:             ${p.model}`,
-    `Provider pin:      ${formatPin(p.pin)}`,
+    `Provider pin:      ${previewPin(p.pin, level)}`,
     `Expected items:    ${c.expected}`,
     `Included items:    ${c.included}`,
     `Unusable items:    ${c.unusable.length}  (failed ${c.failed}, corrupt ${c.corrupt}, missing ${c.missing}${c.noResult ? `, no result ${c.noResult}` : ""})`,

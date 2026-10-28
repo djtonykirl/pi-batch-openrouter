@@ -94,8 +94,22 @@ export function resolveBatchProvider(input: {
 export const RETENTION_DELETED = "Batch jobs are held at OpenRouter until finished; deleted after retrieval, or once they fail, expire or are cancelled";
 export const RETENTION_KEPT = "Batch jobs are kept up to 30 days";
 
-export function immediateProviderFields(level: PrivacyLevel): { data_collection?: "deny"; zdr?: true } {
-  if (level === "no-training") return { data_collection: "deny" };
-  if (level === "zdr") return { zdr: true };
-  return {};
+/** routing.allowedProviders as the immediate route sends it. */
+export interface ImmediateAllowList {
+  only: string[];
+  allowFallbacks: boolean;
+}
+
+/**
+ * The immediate (chat/completions) `provider` object: the privacy fields for the level and, with a non-empty
+ * allow-list, `only` (in list order) plus `allow_fallbacks: false` when fallbacks are off. Empty: nothing to send.
+ */
+export function immediateProviderFields(
+  level: PrivacyLevel,
+  allowList?: ImmediateAllowList,
+): { only?: string[]; allow_fallbacks?: false; data_collection?: "deny"; zdr?: true } {
+  const routing = allowList && allowList.only.length ? { only: [...allowList.only], ...(allowList.allowFallbacks ? {} : { allow_fallbacks: false as const }) } : {};
+  if (level === "no-training") return { ...routing, data_collection: "deny" };
+  if (level === "zdr") return { ...routing, zdr: true };
+  return routing;
 }
