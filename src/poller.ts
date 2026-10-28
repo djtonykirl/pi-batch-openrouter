@@ -1,5 +1,5 @@
 import type { BatchService, ReconcileOutcome } from "./service.js";
-import type { JobManifest } from "./types.js";
+import { isChatJob, type JobManifest } from "./types.js";
 import { ACTIVE_STATUSES } from "./state.js";
 
 export type BadgeCallback = (badgeText: string | undefined) => void;
@@ -118,9 +118,12 @@ export class BatchPoller {
 /** e.g. "📦 Batch: 2 active | 1 partial | 3 ready" — only non-zero parts, cleared when nothing to show. No costs. */
 export function badgeText(jobs: readonly JobManifest[]): string | undefined {
   const active = jobs.filter((j) => ACTIVE_STATUSES.has(j.localStatus)).length;
-  const partial = jobs.filter((j) => j.localStatus === "partial" && !j.injectedAt).length;
-  const ready = jobs.filter((j) => j.localStatus === "ready" && !j.injectedAt).length;
-  const attention = jobs.filter((j) => (j.localStatus === "corrupt" || (ACTIVE_STATUSES.has(j.localStatus) && j.lastPollError)) && !j.injectedAt).length;
+  // Chat turns and compactions are applied to their thread when they settle (and a stuck one shows in the thread), so
+  // they never wait for the user here: only other jobs count as partial, ready or needing attention.
+  const own = jobs.filter((j) => !isChatJob(j) && !j.injectedAt);
+  const partial = own.filter((j) => j.localStatus === "partial").length;
+  const ready = own.filter((j) => j.localStatus === "ready").length;
+  const attention = own.filter((j) => j.localStatus === "corrupt" || (ACTIVE_STATUSES.has(j.localStatus) && j.lastPollError)).length;
   // A batch that could not be deleted at OpenRouter stays there (up to 30 days): the user has to act.
   const deletionFailed = jobs.filter((j) => j.remoteDeletion?.state === "failed").length;
   const deletionNoKey = jobs.filter((j) => j.remoteDeletion?.state === "pending" && j.remoteDeletion.waitingForKey).length;
