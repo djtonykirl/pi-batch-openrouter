@@ -64,7 +64,10 @@ export function pickerEntries(
 export function catalogStateLine(snapshot: CatalogSnapshot | undefined): string {
   if (!snapshot) return "loading";
   const at = formatIsoShort(snapshot.loadedAt);
-  return snapshot.fresh ? `fresh at ${at}` : `from ${at}, refresh failed${snapshot.error ? ` (${snapshot.error})` : ""}`;
+  const state = snapshot.fresh ? `fresh at ${at}` : `from ${at}, refresh failed${snapshot.error ? ` (${snapshot.error})` : ""}`;
+  // Batch models whose :batch endpoints could not be loaded are refused at zdr until a refresh succeeds for them.
+  const unknown = new Set(snapshot.models.filter((m) => m.id.endsWith(":batch")).map((m) => normaliseModelSlug(m.id)).filter((id) => !Object.hasOwn(snapshot.batchEndpoints ?? {}, id))).size;
+  return unknown ? `${state} (batch endpoints unknown for ${unknown} model${unknown === 1 ? "" : "s"}; /batch privacy refresh retries)` : state;
 }
 
 /** Recorded with the attestation: the extension only stores what the user says. */

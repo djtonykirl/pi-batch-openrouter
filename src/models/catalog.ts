@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import { atomicWriteJson } from "../fsutil.js";
 import type { Logger } from "../logger.js";
-import { batchZdrView, normaliseModelSlug, routeForModel, type CatalogView, type ZdrEndpoint } from "../privacy/policy.js";
+import { batchEndpointsPath, batchZdrView, normaliseModelSlug, routeForModel, type CatalogView, type ZdrEndpoint } from "../privacy/policy.js";
 
 export interface CatalogModel {
   id: string;
@@ -52,32 +52,49 @@ export function immediateRouteRefusal(modelId: string): string {
 /** How many per-model `:batch` endpoint requests run at once. */
 export const BATCH_ENDPOINT_CONCURRENCY = 8;
 
+/** Overall limit for loading the per-model `:batch` endpoints, so a slow API can't hold up the first zdr decision. */
+export const BATCH_ENDPOINTS_DEADLINE_MS = 20_000;
+
 /**
- * Loads the `:batch` endpoint tags of every `:batch` model in `models`, at most `concurrency` at a time. A model whose
- * request fails is listed in `failed` and has no entry (unknown); it never fails the whole load.
+ * Loads the `:batch` endpoint tags of every `:batch` model in `models`, at most `concurrency` at a time, within
+ * `deadlineMs`. A model whose request fails or is still pending at the deadline is listed in `failed` and has no entry
+ * (unknown); it never fails the whole load. IDs with an unsafe path segment are never requested (also `failed`).
  */
 export async function loadBatchEndpoints(
   models: CatalogModel[],
   fetchOne: (batchModelId: string) => Promise<string[]>,
   concurrency = BATCH_ENDPOINT_CONCURRENCY,
+  deadlineMs = BATCH_ENDPOINTS_DEADLINE_MS,
 ): Promise<{ endpoints: Record<string, string[]>; failed: string[] }> {
-  const ids = [...new Set(models.map((m) => m.id).filter((id) => id.endsWith(":batch") && normaliseModelSlug(id) !== "__proto__"))];
+  const all = [...new Set(models.map((m) => m.id).filter((id) => id.endsWith(":batch") && normaliseModelSlug(id) !== "__proto__"))];
+  const ids = all.filter((id) => batchEndpointsPath(id) !== undefined);
   const endpoints: Record<string, string[]> = {};
-  const failed: string[] = [];
+  let timer: NodeJS.Timeout | undefined;
+  const expired = new Promise<"expired">((resolve) => {
+    timer = setTimeout(() => resolve("expired"), deadlineMs);
+  });
   let next = 0;
   const worker = async (): Promise<void> => {
     while (next < ids.length) {
       const id = ids[next++]!;
       try {
-        endpoints[normaliseModelSlug(id)] = await fetchOne(id);
+        const tags = await Promise.race([fetchOne(id), expired]);
+        if (tags === "expired") return;
+        endpoints[normaliseModelSlug(id)] = tags;
       } catch {
-        failed.push(id);
+        // unknown: listed in `failed` below
       }
     }
   };
-  await Promise.all(Array.from({ length: Math.max(1, Math.min(concurrency, ids.length)) }, worker));
-  failed.sort();
-  return { endpoints, failed };
+  try {
+    await Promise.race([Promise.all(Array.from({ length: Math.max(1, Math.min(concurrency, ids.length)) }, worker)), expired]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  // Snapshot at return: a request that finishes after the deadline must not change the result.
+  const result = { ...endpoints };
+  const failed = all.filter((id) => !Object.hasOwn(result, normaliseModelSlug(id))).sort();
+  return { endpoints: result, failed };
 }
 
 /** The client calls the catalog needs (all public endpoints). */
@@ -113,6 +130,15 @@ export class ModelCatalog {
 
   public snapshot(): CatalogSnapshot | undefined {
     return this.current;
+  }
+
+  /**
+   * The current snapshot for a privacy decision, marked `loading` while a load is in flight, so a refusal can say
+   * "still loading" rather than "not loaded". A fresh snapshot stays usable while a refresh runs.
+   */
+  public view(): (CatalogSnapshot & { loading?: true }) | undefined {
+    if (!this.inFlight) return this.current;
+    return { ...(this.current ?? { fresh: false, zdr: [], models: [], batchEndpoints: {}, loadedAt: "" }), loading: true };
   }
 
   /** Waits for the in-flight load (if any) for up to `timeoutMs`; resolves `undefined` on timeout. */

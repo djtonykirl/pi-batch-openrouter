@@ -126,7 +126,12 @@ async function firstBatchZdrTag(key, model) {
   const list = Array.isArray(z.json?.data) ? z.json.data : Array.isArray(z.json) ? z.json : [];
   const zdrTags = [...new Set(list.filter((e) => typeof e?.model_id === "string" && typeof e?.tag === "string" && normalise(e.model_id) === want).map((e) => e.tag))];
 
-  const batchPath = `/models/${`${want}:batch`.split("/").map((seg) => encodeURIComponent(seg).replace(/%3A/gi, ":")).join("/")}/endpoints`;
+  const segments = want.split("/");
+  if (segments.some((s) => s === "" || s === "." || s === "..")) {
+    console.log(`Model ID ${JSON.stringify(want)} has an empty, "." or ".." path segment; skipping the endpoint-tag probe.`);
+    return undefined;
+  }
+  const batchPath = `/models/${segments.map((seg) => encodeURIComponent(seg).replace(/%3A/gi, ":")).join("/")}:batch/endpoints`;
   const b = await call(key, "GET", batchPath);
   if (b.status < 200 || b.status >= 300 || !Array.isArray(b.json?.data?.endpoints)) {
     console.log(`Could not load the batch endpoints of ${want} (${b.status}: ${errorDetail(b)}); skipping the endpoint-tag probe.`);

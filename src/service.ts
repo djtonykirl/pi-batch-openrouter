@@ -622,7 +622,9 @@ export class BatchService {
       // The immediate body carries only the privacy fields, so a pin is never recorded as if it were sent.
       return { route, privacy: { level, route, enforcement } };
     }
-    const catalog = level === "zdr" ? await this.deps.catalog?.whenLoaded(config.polling.requestTimeoutSeconds * 1000) : undefined;
+    // On a timeout the view says "still loading" (rather than "not loaded") while the load is in flight. A snapshot
+    // loaded successfully this session stays authoritative during a background refresh, exactly as when none runs.
+    const catalog = level === "zdr" ? ((await this.deps.catalog?.whenLoaded(config.polling.requestTimeoutSeconds * 1000)) ?? this.deps.catalog?.view()) : undefined;
     // routing.allowedProviders restricts every batch: a pin outside it is refused, and a job without a pin (chat) gets it.
     const outside = pinOutsideAllowList(config, draft.pin);
     if (outside) throw new SubmissionBlockedError(outside);
