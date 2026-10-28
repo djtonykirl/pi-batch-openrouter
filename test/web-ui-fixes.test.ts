@@ -17,11 +17,13 @@ import { BatchPoller } from "../src/poller.js";
 import { batchModelCandidates, fallbackPickerEntry, pickerEntries, PRIVACY_NOTICE, PRIVACY_SETTINGS_URL } from "../src/privacy/commands.js";
 import { neverReachedOpenRouter, RETENTION_KEPT, RETENTION_NOT_APPLICABLE } from "../src/privacy/policy.js";
 import { JobRegistry } from "../src/registry.js";
-import { BatchService, previewPrivacy } from "../src/service.js";
+import { BatchService, decidePrivacyFor, previewPrivacy } from "../src/service.js";
 import type { JobManifest } from "../src/types.js";
 import { BatchWebServer, inspectWorkspaceFiles } from "../src/web/server.js";
 import { createCoalescer, failureStates, privacyNoticeHtml, renderWebUiHtml } from "../src/web/ui.js";
 import { FAKE_KEY, FakeOpenRouter, accepted, makeConfig, makeService } from "./fixtures/fake-openrouter.js";
+import { CLASSIFY_YAML, TICKETS_CSV } from "./fixtures/datasets.js";
+import { CONTEXT_MD, TABLES_JSONL } from "./fixtures/metadata.js";
 import { config, rm, tempWorkspace, writeFiles } from "./helpers.js";
 
 const GEMINI = "google/gemini-3.8-flash";
@@ -56,7 +58,13 @@ interface Env {
 function withWeb(data: CatalogData, fn: (e: Env) => Promise<void>, over: (c: BatchConfig) => void = () => {}): () => Promise<void> {
   return async () => {
     const root = tempWorkspace();
-    writeFiles(root, { "src/a.ts": "export const a = 1;\n" });
+    writeFiles(root, {
+      "src/a.ts": "export const a = 1;\n",
+      ".pi/batch-workflows/classify-tickets.yaml": CLASSIFY_YAML,
+      "data/tickets.csv": TICKETS_CSV,
+      "metadata/beverage/context.md": CONTEXT_MD,
+      "metadata/beverage/tables.jsonl": TABLES_JSONL,
+    });
     let web: BatchWebServer | undefined;
     try {
       const fake = new FakeOpenRouter();
@@ -249,8 +257,18 @@ test(
 
     const map = (await (await post("/api/jobs/map-files", { objective: "Review", files: ["src/a.ts"], model: CLAUDE, mode: "dryrun" })).json()) as { privacy: { ok: boolean } };
     assert.equal(map.privacy.ok, false);
-    const ds = (await (await post("/api/jobs/dataset", { workflow: "none", input: "none.csv", model: CLAUDE, mode: "dryrun" })).json()) as { privacy?: { ok: boolean } };
-    if (ds.privacy) assert.equal(ds.privacy.ok, false);
+    const ds = await post("/api/jobs/dataset", { workflow: "classify-tickets", input: "data/tickets.csv", model: CLAUDE, mode: "dryrun" });
+    assert.equal(ds.status, 200);
+    const dsBody = (await ds.json()) as { blockers: string[]; privacy: { ok: boolean; reason?: string } };
+    assert.deepEqual(dsBody.blockers, [], "a valid dataset plan");
+    assert.equal(dsBody.privacy.ok, false);
+    assert.match(dsBody.privacy.reason ?? "", /^Privacy level zdr: anthropic\/claude-opus-5\.5 has no batch endpoint/);
+    const md = await post("/api/jobs/metadata", { context: "metadata/beverage/context.md", input: "metadata/beverage/tables.jsonl", model: CLAUDE, mode: "dryrun" });
+    assert.equal(md.status, 200);
+    const mdBody = (await md.json()) as { blockers: string[]; privacy: { ok: boolean; reason?: string } };
+    assert.deepEqual(mdBody.blockers, [], "a valid metadata plan");
+    assert.equal(mdBody.privacy.ok, false);
+    assert.match(mdBody.privacy.reason ?? "", /^Privacy level zdr: anthropic\/claude-opus-5\.5 has no batch endpoint/);
 
     assert.equal(batch.registry.list().jobs.length, 0);
     assert.deepEqual(fs.readdirSync(join(root, ".pi", "batches")).sort(), before, "nothing written");
@@ -473,4 +491,110 @@ test("10b: the project's batch config and chat instructions are not offered in t
 
 test("10c: the page has an inline favicon", () => {
   assert.match(html(), /<link rel="icon" href="data:image\/svg\+xml,/);
+});
+
+// ------------------------------------------------------------------ review follow-ups
+
+test("R1: while the first catalog load is pending, a zdr preview waits for it and agrees with createJob", async () => {
+  const root = tempWorkspace();
+  writeFiles(root, { "src/a.ts": "export const a = 1;\n" });
+  try {
+    let release: (d: CatalogData) => void = () => {};
+    const catalog = new ModelCatalog({ fetch: () => new Promise<CatalogData>((r) => (release = r)), file: join(root, "c.json") });
+    const fake = new FakeOpenRouter();
+    fake.submitReplies = [accepted("batch_1")];
+    const cfg = makeConfig(zdr);
+    const service = new BatchService({
+      registry: new JobRegistry(join(root, ".pi", "batches")),
+      workspaceRoot: root,
+      getConfig: () => cfg,
+      resolveApiKey: async () => FAKE_KEY,
+      createClient: (apiKey, timeoutMs) => new OpenRouterBatchClient({ apiKey, fetchImpl: fake.fetch, timeoutMs }),
+      gitIgnored: () => new Set(),
+      catalog,
+    });
+    void catalog.load();
+    assert.equal(catalog.snapshot(), undefined, "first load still pending");
+    const preview = service.previewPrivacy({ kind: "goal", model: GEMINI });
+    setTimeout(() => release(ZDR_CATALOG), 30);
+    assert.deepEqual(await preview, { ok: true, enforcement: "pinned to ZDR providers: google-vertex/global" });
+    assert.equal(service.registry.list().jobs.length, 0, "the preview writes nothing");
+    const job = await service.createJob(await service.prepare({ objective: "o", files: ["src/a.ts"], contexts: [], model: GEMINI, format: "markdown", includeInstructions: true }), { previewOnly: true });
+    assert.equal(job.privacy?.enforcement, "pinned to ZDR providers: google-vertex/global");
+  } finally {
+    rm(root);
+  }
+});
+
+test(
+  "R2: if setModel refuses the fallback, the new thread keeps the default and the response warns",
+  withWeb(ZDR_CATALOG, async ({ post, chat, store }) => {
+    chat.setModel = async () => {
+      throw new Error("Privacy level zdr: refused by the decision");
+    };
+    const r = await post("/api/threads", {});
+    assert.equal(r.status, 201);
+    const body = (await r.json()) as { thread: { id: string; model: string }; notice?: string; warning?: string };
+    assert.equal(body.thread.model, CLAUDE);
+    assert.equal(body.notice, undefined);
+    assert.match(body.warning ?? "", /switching to google\/gemini-3\.8-flash was refused too: Privacy level zdr: refused by the decision$/);
+    assert.equal(store.read(body.thread.id).model, CLAUDE, "the thread is kept");
+  }, zdr),
+);
+
+test("R3: pickerEntries blocks what routing.require* would refuse, with decidePrivacyFor's reason", async () => {
+  const root = tempWorkspace();
+  try {
+    const catalog = new ModelCatalog({ fetch: async () => ZDR_CATALOG, file: join(root, "c.json") });
+    await catalog.load();
+    const snap = catalog.snapshot();
+    type Level = "standard" | "no-training" | "zdr";
+    const reason = (cfg: BatchConfig, level: Level, model: string) => {
+      const d = decidePrivacyFor({ config: cfg, privacy: { level, accountNoTraining: true }, draft: { kind: "chat", model }, catalog: catalog.view() });
+      return d.ok ? undefined : d.reason;
+    };
+    const entry = (cfg: BatchConfig, level: Level, model: string) => pickerEntries(snap, [model], level, true, [], cfg).find((e) => e.id === model)!;
+
+    // requireNoDataCollection: refused at standard; at no-training the level satisfies it (attested account).
+    const noDc = makeConfig((c) => {
+      c.routing.requireNoDataCollection = true;
+    });
+    assert.match(entry(noDc, "standard", GEMINI).blocked ?? "", /^routing\.requireNoDataCollection is set/);
+    assert.equal(entry(noDc, "standard", GEMINI).blocked, reason(noDc, "standard", GEMINI));
+    assert.equal(entry(noDc, "no-training", GEMINI).blocked, undefined);
+    assert.equal(reason(noDc, "no-training", GEMINI), undefined);
+
+    // requireZdr at no-training: every batch model is refused, with the send's reason.
+    const zdrReq = makeConfig((c) => {
+      c.routing.requireZdr = true;
+    });
+    const b = entry(zdrReq, "no-training", GEMINI);
+    assert.match(b.blocked ?? "", /^routing\.requireZdr is set/);
+    assert.equal(b.blocked, reason(zdrReq, "no-training", GEMINI));
+    assert.equal(fallbackPickerEntry(pickerEntries(snap, [GEMINI, CLAUDE], "no-training", true, [], zdrReq), "no-training"), undefined, "the fallback never picks it");
+  } finally {
+    rm(root);
+  }
+});
+
+test(
+  "R3: the new-thread fallback skips models the routing requirements refuse",
+  withWeb(ZDR_CATALOG, async ({ post }) => {
+    const body = (await (await post("/api/threads", {})).json()) as { thread: { model: string }; notice?: string; warning?: string };
+    assert.equal(body.thread.model, CLAUDE);
+    assert.equal(body.notice, undefined);
+    assert.match(body.warning ?? "", /no other model is selectable: routing\.requireZdr is set/);
+  }, (c) => {
+    c.privacy.level = "no-training";
+    c.privacy.accountNoTraining = true;
+    c.routing.requireZdr = true;
+  }),
+);
+
+test("R4/R5: a thread switch clears the model notice; privacy/catalog events coalesce their /api/privacy fetch", () => {
+  const s = script();
+  assert.ok(s.includes('if (state.activeThreadId !== threadId) document.getElementById("chatModelAlert").innerHTML = "";'));
+  assert.ok(s.includes("const privacyRefresh = createCoalescer(loadPrivacy, 250);"));
+  assert.ok(s.includes("privacyRefresh.request();"));
+  assert.equal(/await loadPrivacy\(\);\s*\}\s*liveRefresh/.test(s), false);
 });

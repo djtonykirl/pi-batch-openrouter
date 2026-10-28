@@ -1421,7 +1421,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
           }
           if (payload.type === "privacy" || payload.type === "catalog") {
             state.picker.key = "";
-            await loadPrivacy();
+            privacyRefresh.request();
           }
           liveRefresh.request();
         } catch {}
@@ -1564,6 +1564,8 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
     });
 
     const liveRefresh = createCoalescer(refreshStateNow, 250);
+    // A burst of privacy/catalog events makes one /api/privacy fetch.
+    const privacyRefresh = createCoalescer(loadPrivacy, 250);
     // A user action refreshes at once; a live update that arrives meanwhile does not add a second refresh.
     function refreshStateQuiet() {
       return liveRefresh.now();
@@ -1630,6 +1632,8 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
     document.getElementById("threadSearchInput").addEventListener("input", renderThreadList);
 
     async function selectThread(threadId, preserveScroll = false) {
+      // A notice about another thread (e.g. the model a new thread started on) does not belong to this one.
+      if (state.activeThreadId !== threadId) document.getElementById("chatModelAlert").innerHTML = "";
       state.activeThreadId = threadId;
       renderThreadList();
       const detail = await api("/api/threads/" + encodeURIComponent(threadId));

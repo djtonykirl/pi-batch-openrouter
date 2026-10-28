@@ -167,7 +167,7 @@ async function pickModel(rt: BatchRuntime, ctx: ExtensionCommandContext, threadI
   for (;;) {
     const snapshot = catalog?.snapshot();
     const level = rt.requireChat().effectiveLevel(threadId);
-    const entries = pickerEntries(snapshot, batchModelCandidates(snapshot, slugs), level, rt.privacy().accountNoTraining, allowedProviders(rt.loaded.config));
+    const entries = pickerEntries(snapshot, batchModelCandidates(snapshot, slugs), level, rt.privacy().accountNoTraining, allowedProviders(rt.loaded.config), rt.loaded.config);
     const shown = entries.filter((e) => !e.blocked);
     const options = new Map<string, { slug: string; route: Route }>();
     for (const e of shown) options.set(`${e.id} ${e.labels.map((l) => `[${l}]`).join(" ")}`, { slug: e.id, route: e.route });

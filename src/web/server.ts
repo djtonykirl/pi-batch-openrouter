@@ -568,7 +568,8 @@ export class BatchWebServer {
   /** Why `level` refuses `model` in the picker (the same check a submit makes), or undefined when it is selectable. */
   private modelRefusal(model: string, level: PrivacyLevel): string | undefined {
     const privacy = this.deps.service.privacyConfig();
-    const entries = pickerEntries(this.deps.catalog?.snapshot(), [model], level, privacy.accountNoTraining, allowedProviders(this.deps.getConfig()));
+    const config = this.deps.getConfig();
+    const entries = pickerEntries(this.deps.catalog?.snapshot(), [model], level, privacy.accountNoTraining, allowedProviders(config), config);
     return entries.find((e) => e.id === model)?.blocked;
   }
 
@@ -581,10 +582,16 @@ export class BatchWebServer {
     const refusal = this.modelRefusal(model, level);
     if (!refusal) return {};
     const privacy = this.deps.service.privacyConfig();
-    const entries = pickerEntries(this.deps.catalog?.snapshot(), this.batchCandidates(), level, privacy.accountNoTraining, allowedProviders(this.deps.getConfig()));
+    const config = this.deps.getConfig();
+    const entries = pickerEntries(this.deps.catalog?.snapshot(), this.batchCandidates(), level, privacy.accountNoTraining, allowedProviders(config), config);
     const pick = fallbackPickerEntry(entries, level);
     if (!pick) return { warning: `The default model ${model} is refused at privacy level ${level} and no other model is selectable: ${refusal}` };
-    await this.deps.chat.setModel(threadId, pick.id, { route: pick.route });
+    try {
+      await this.deps.chat.setModel(threadId, pick.id, { route: pick.route });
+    } catch (err) {
+      // setModel decides again; if it refuses, the thread keeps the default and the reason is shown.
+      return { warning: `The default model ${model} is refused at privacy level ${level} (${refusal}); switching to ${pick.id} was refused too: ${err instanceof Error ? err.message : String(err)}` };
+    }
     return { notice: `Started on ${pick.id} [${pick.labels.join(", ")}]: the default model ${model} is refused at privacy level ${level} (${refusal}).` };
   }
 
@@ -1122,7 +1129,7 @@ export class BatchWebServer {
         const level: PrivacyLevel = threadParam ? this.deps.chat.effectiveLevel(this.deps.chatStore.resolve(threadParam)) : privacy.level;
         this.sendJson(res, 200, {
           level,
-          entries: pickerEntries(this.deps.catalog?.snapshot(), this.batchCandidates(), level, privacy.accountNoTraining, allowedProviders(config)),
+          entries: pickerEntries(this.deps.catalog?.snapshot(), this.batchCandidates(), level, privacy.accountNoTraining, allowedProviders(config), config),
           catalog: this.catalogInfo(),
         });
         return;
@@ -1174,7 +1181,7 @@ export class BatchWebServer {
             excludedCount: prepared.pkg.excluded.length,
             characters: prepared.pkg.characters,
             contentSha256: prepared.contentSha256,
-            privacy: this.deps.service.previewPrivacy({ kind: "goal", model: prepared.model, pin: prepared.pin }),
+            privacy: await this.deps.service.previewPrivacy({ kind: "goal", model: prepared.model, pin: prepared.pin }),
             summary: `Model: ${prepared.model} · Workspace files: ${prepared.pkg.files.length} · Uploads: ${(prepared.uploads ?? []).length} · Total characters: ${prepared.pkg.characters} (~${Math.ceil(prepared.pkg.characters / 4)} tokens)`,
           });
           return;
@@ -1213,7 +1220,7 @@ export class BatchWebServer {
           this.sendJson(res, 200, {
             blockers: plan.blockers,
             warnings: plan.pkg.warnings,
-            privacy: this.deps.service.previewPrivacy({ kind: "workflow", model: plan.model, pin: plan.pin }),
+            privacy: await this.deps.service.previewPrivacy({ kind: "workflow", model: plan.model, pin: plan.pin }),
             summary: `Model: ${plan.model} · Requests in batch: ${plan.items.length} · Files selected: ${plan.pkg.files.length} · Total characters: ${plan.totalCharacters}`,
           });
           return;
@@ -1245,7 +1252,7 @@ export class BatchWebServer {
           this.sendJson(res, 200, {
             blockers: prepared.blockers,
             warnings: prepared.warnings,
-            privacy: this.deps.service.previewPrivacy({ kind: "workflow", model: prepared.model, pin: prepared.pin }),
+            privacy: await this.deps.service.previewPrivacy({ kind: "workflow", model: prepared.model, pin: prepared.pin }),
             summary: `Workflow: ${body.workflow} · Model: ${prepared.model} · Rows selected: ${prepared.plan?.counts.selectedRows ?? 0} · Total characters: ${prepared.plan?.totalCharacters ?? 0}`,
           });
           return;
@@ -1286,7 +1293,7 @@ export class BatchWebServer {
           return;
         }
         if (body.mode === "dryrun") {
-          this.sendJson(res, 200, { blockers: prepared.blockers, warnings: prepared.warnings, preview, privacy: this.deps.service.previewPrivacy({ kind: "workflow", model: prepared.model, pin: prepared.pin }) });
+          this.sendJson(res, 200, { blockers: prepared.blockers, warnings: prepared.warnings, preview, privacy: await this.deps.service.previewPrivacy({ kind: "workflow", model: prepared.model, pin: prepared.pin }) });
           return;
         }
         const job = await this.deps.service.createMetadataJob(prepared, { previewOnly });

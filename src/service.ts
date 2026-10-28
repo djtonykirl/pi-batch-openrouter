@@ -667,11 +667,7 @@ export class BatchService {
     const config = this.deps.getConfig();
     const privacy = this.privacyConfig();
     const level = effectiveLevel(privacy.level, draft.privacyLevel);
-    const route = routeForModel(draft.model, draft.route);
-    // On a timeout the view says "still loading" (rather than "not loaded") while the load is in flight. A snapshot
-    // loaded successfully this session stays authoritative during a background refresh, exactly as when none runs.
-    const catalog =
-      level === "zdr" && route === "batch" ? ((await this.deps.catalog?.whenLoaded(config.polling.requestTimeoutSeconds * 1000)) ?? this.deps.catalog?.view()) : undefined;
+    const catalog = await this.privacyCatalog(level, routeForModel(draft.model, draft.route));
     const decision = decidePrivacyFor({ config, privacy, draft, catalog });
     if (!decision.ok) {
       if (decision.refusal !== "policy") this.logger.log("warn", `${decision.refusal}_refused`, { kind: draft.kind, level, model: draft.model });
@@ -681,12 +677,25 @@ export class BatchService {
   }
 
   /**
-   * The dry-run view of the privacy decision for a draft (read-only; the catalog as it is now, without waiting for a
-   * load). A job is still decided again, with the catalog awaited, when it is created.
+   * The catalog a privacy decision reads: only at zdr on the batch route. It waits for an in-flight load (up to the
+   * request timeout); on a timeout the view says "still loading" (rather than "not loaded"). A snapshot loaded
+   * successfully this session stays authoritative during a background refresh, exactly as when none runs.
    */
-  public previewPrivacy(draft: PrivacyDraft): PrivacyPreview {
+  private async privacyCatalog(level: PrivacyLevel, route: Route): Promise<CatalogView | undefined> {
+    if (level !== "zdr" || route !== "batch") return undefined;
     const config = this.deps.getConfig();
-    return previewPrivacy({ config, privacy: this.privacyConfig(), draft, catalog: this.deps.catalog?.view() });
+    return (await this.deps.catalog?.whenLoaded(config.polling.requestTimeoutSeconds * 1000)) ?? this.deps.catalog?.view();
+  }
+
+  /**
+   * The dry-run view of the privacy decision for a draft: read-only, with the catalog acquired exactly as
+   * `decidePrivacy` acquires it, so a dry run and the job it previews agree. The job is still decided when created.
+   */
+  public async previewPrivacy(draft: PrivacyDraft): Promise<PrivacyPreview> {
+    const config = this.deps.getConfig();
+    const privacy = this.privacyConfig();
+    const catalog = await this.privacyCatalog(effectiveLevel(privacy.level, draft.privacyLevel), routeForModel(draft.model, draft.route));
+    return previewPrivacy({ config, privacy, draft, catalog });
   }
 
   // ------------------------------------------------------------ map-files

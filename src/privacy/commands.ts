@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
-import { GLOBAL_CONFIG_FILE, projectConfigPath, saveConfigUpdate } from "../config.js";
+import { GLOBAL_CONFIG_FILE, projectConfigPath, saveConfigUpdate, type BatchConfig } from "../config.js";
 import type { CatalogSnapshot } from "../models/catalog.js";
-import { formatRoutingPolicy } from "../openrouter/routing.js";
+import { accountRequirementBlockers, formatRoutingPolicy } from "../openrouter/routing.js";
 import type { BatchRuntime } from "../runtime.js";
 import { formatIsoShort } from "../time.js";
 import { batchZdrView, isPrivacyLevel, normaliseModelSlug, resolveBatchProvider, PRIVACY_LEVELS, routeForModel, type PrivacyLevel, type Route } from "./policy.js";
@@ -33,6 +33,11 @@ export function pickerEntries(
   accountNoTraining: boolean,
   /** routing.allowedProviders: at zdr, a batch model is checked with resolveBatchProvider, so it is blocked exactly as a submit would be. */
   allowedProviders: readonly string[] = [],
+  /**
+   * The config, for routing.requireZdr / requireNoDataCollection: a model a send would refuse for them is blocked with
+   * the same reason (decidePrivacyFor checks them first, with accountRequirementBlockers).
+   */
+  config?: BatchConfig,
 ): PickerEntry[] {
   const candidates = new Map<string, Route>();
   for (const id of batchModels) candidates.set(id, routeForModel(id));
@@ -47,7 +52,9 @@ export function pickerEntries(
     const hasZdr = route === "batch" ? batchZdrView(catalog, base).pinnable.length > 0 : !!catalog?.zdr.some((e) => e.model === base);
     const labels = [route === "batch" ? "batch" : "free", ...(hasZdr ? ["ZDR"] : [])];
     const entry: PickerEntry = { id, route, labels };
-    if (level === "zdr") {
+    const unmet = config ? accountRequirementBlockers(config, level, route) : [];
+    if (unmet.length) entry.blocked = unmet.join("\n\n");
+    else if (level === "zdr") {
       if (route === "batch") {
         const d = resolveBatchProvider({ level, model: id, catalog, accountNoTraining, allowedProviders });
         if (!d.ok) entry.blocked = d.reason;
