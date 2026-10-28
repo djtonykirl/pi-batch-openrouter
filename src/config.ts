@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { atomicWriteJson } from "./fsutil.js";
-import { isPrivacyLevel, type PrivacyLevel } from "./privacy/policy.js";
+import { isPrivacyLevel, stricter, type PrivacyLevel } from "./privacy/policy.js";
 
 /**
  * Application defaults — NOT claims about OpenRouter limits.
@@ -256,10 +256,11 @@ const lastGoodPrivacy = new Map<string, BatchConfig["privacy"]>();
  * The `privacy` section, read fresh from the config files on every call. Every privacy decision uses this rather than
  * the per-process snapshot: the level may have been raised since by another Pi session, the standalone web UI or a
  * hand edit, and the extension never sends anything less strict than the effective level.
- * A layer that can't be read or parsed at this moment (a hand edit in progress) never relaxes the level: the last
- * section read without such a problem is used instead, when there is one.
+ * A problem never relaxes anything: when a layer can't be read or parsed (a hand edit in progress), or a `privacy`
+ * value is invalid (a typo such as "ZDR" would otherwise read as the default `standard`), each field takes its most
+ * private value across what was read, the last clean read and `fallback` (the caller's per-process snapshot).
  */
-export function readPrivacyConfig(cwd: string | undefined, globalFile = GLOBAL_CONFIG_FILE): BatchConfig["privacy"] {
+export function readPrivacyConfig(cwd: string | undefined, globalFile = GLOBAL_CONFIG_FILE, fallback?: BatchConfig["privacy"]): BatchConfig["privacy"] {
   const key = `${path.resolve(globalFile)}|${cwd ? path.resolve(cwd) : ""}`;
   const errors: string[] = [];
   let merged: Json = {};
@@ -268,10 +269,27 @@ export function readPrivacyConfig(cwd: string | undefined, globalFile = GLOBAL_C
     merged = deepMerge(merged, readLayer(legacyProjectConfigPath(cwd), errors));
     merged = deepMerge(merged, readLayer(projectConfigPath(cwd), errors));
   }
-  const privacy = validateConfig(merged).config.privacy;
-  if (errors.length > 0) return lastGoodPrivacy.get(key) ?? privacy;
-  lastGoodPrivacy.set(key, privacy);
-  return privacy;
+  const validated = validateConfig(merged);
+  const privacy = validated.config.privacy;
+  const problem = errors.length > 0 || validated.errors.some((e) => e.includes('"privacy'));
+  if (!problem) {
+    lastGoodPrivacy.set(key, privacy);
+    return privacy;
+  }
+  return [lastGoodPrivacy.get(key), fallback].reduce<BatchConfig["privacy"]>((a, b) => (b ? mostPrivate(a, b) : a), privacy);
+}
+
+/** Field by field, the more private of two privacy sections. An attestation survives only when both hold it. */
+function mostPrivate(a: BatchConfig["privacy"], b: BatchConfig["privacy"]): BatchConfig["privacy"] {
+  const accountNoTraining = a.accountNoTraining && b.accountNoTraining;
+  const attestedAt = accountNoTraining ? (a.attestedAt ?? b.attestedAt) : undefined;
+  return {
+    level: stricter(a.level, b.level),
+    accountNoTraining,
+    deleteRemoteBatches: a.deleteRemoteBatches || b.deleteRemoteBatches,
+    noticeShown: a.noticeShown || b.noticeShown,
+    ...(attestedAt ? { attestedAt } : {}),
+  };
 }
 
 /**

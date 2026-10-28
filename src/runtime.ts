@@ -94,7 +94,7 @@ export class BatchRuntime {
     }
     const cwd = this.cwd;
     // Privacy decisions read the config files fresh: another process may have raised the level since this snapshot.
-    const getPrivacy = () => readPrivacyConfig(cwd);
+    const getPrivacy = () => readPrivacyConfig(cwd, undefined, this.loaded.config.privacy);
     this.service = new BatchService({
       registry,
       catalog: this.catalog,

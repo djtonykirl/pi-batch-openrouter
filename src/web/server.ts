@@ -328,7 +328,7 @@ export class BatchWebServer {
       },
     });
     // Privacy decisions read the config files fresh: another process may have raised the level since this snapshot.
-    const getPrivacy = () => readPrivacyConfig(workspaceRoot);
+    const getPrivacy = () => readPrivacyConfig(workspaceRoot, undefined, loaded.config.privacy);
     const service = new BatchService({
       registry,
       catalog,
