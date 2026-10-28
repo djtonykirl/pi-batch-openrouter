@@ -133,6 +133,8 @@ OpenRouter account settings.
 
 The effective level of a job or thread is the **stricter** of the thread and the project. Lowering the project level
 later does not lower an existing thread. The extension never sends anything less strict than the effective level.
+Every privacy decision reads the `privacy` config section fresh from disk, so a level raised in another Pi session, the
+standalone web UI or by editing the config file applies to this process's next decision too.
 
 ### What is enforced per route
 
@@ -144,11 +146,15 @@ later does not lower an existing thread. The extension never sends anything less
     `allow_fallbacks: false`. It is refused when the model has no ZDR endpoint, when your own `--provider` pin has none
     in the ZDR list, or when the catalog was not loaded successfully this session.
 - **Immediate route.** Models with the `:free` suffix run through `POST /chat/completions` and carry the
-  `data_collection` or `zdr` field above.
+  `data_collection` or `zdr` field above. Items sent later (after a per-minute 429 or a crash) go out at the stricter
+  of the job's recorded level, the current project level and the thread's own level; an escalation is recorded as a
+  `privacy_escalated` event. An explicit `immediate` route (picker or web API) is accepted only for a `:free` model or
+  one the catalog lists as free.
 - Refusals read `Privacy level <level>: <reason>` and nothing is sent.
 - **Model names** are normalised before any catalog lookup by stripping `:batch` and `:free`.
 - **Stale previews.** Submitting a previewed job is refused if the project level has been raised above the level the job
-  was prepared at. Recreate the job.
+  was prepared at. Recreate the job. A previewed `no-training` batch job is also refused once the attestation has been
+  removed.
 - **Retries** keep their source job's level (the stricter of the source and the project).
 - Metadata, map-files, dataset and synthesis jobs go through the same enforcement point as any other job.
 
@@ -171,11 +177,13 @@ A one-time notice repeats this the first time you raise a project above `standar
 
 OpenRouter keeps batch results for 30 days unless you delete them. At `no-training` and `zdr`
 (`privacy.deleteRemoteBatches`, default `true`), a finished batch is deleted at OpenRouter with `DELETE /batches/{id}`
-**after** its raw final response is saved locally.
+**after** its raw final response is saved locally. A batch that ends without results (OpenRouter reports it failed,
+expired or cancelled) is deleted too; one OpenRouter reports gone (HTTP 410) is not.
 - The decision uses **each job's own recorded level**, never the current config. A job made at `standard` is never
   deleted remotely, even if the project is raised later.
-- Deletion is attempted after each poll. After 10 failed attempts the job's remote deletion is marked `failed` and
-  reported; delete the batch yourself.
+- Deletion is retried with exponential backoff (30 s, doubling, at most 1 hour apart). 24 hours after the first
+  attempt the job's remote deletion is marked `failed`, shown as needing attention in the status badge,
+  `/batch show` and the web UI; delete the batch yourself. A missing API key does not count as an attempt.
 - Local files are unaffected.
 
 ### Model catalog
@@ -929,7 +937,8 @@ the prose is right.
     review for the reviewer to adopt.
   - Empty values take the proposal, and insufficient evidence stays `null`.
   - Every table is included. A table without a usable proposal keeps its existing values, and needs
-    `--allow-partial`.
+    `--allow-partial`. In standards mode, its non-standard existing text is withheld as `null` (the live value is left
+    unchanged) and marked in the review.
   - Each row carries provenance: job, result job and `custom_id`, input hash, context hash and proposal hash.
 - **`validate-approved`** checks a (reviewer-edited) file against the job's stored evidence. It rejects:
   - tables or columns that aren't in the job, or are missing or duplicated;
@@ -986,8 +995,10 @@ model, and their approved values are their existing values. The Lighthouse appli
 checks, and otherwise takes the proposal. The review marks such a value as replacing a non-standard one, and
 `validate-approved` reports any non-standard approved value. A valid existing PII tag is never dropped. A table with no
 proposal gets derived tags with classification `pii_scan_required` (or its existing taxonomy value). A description whose
-`CLASSIFICATION:` line conflicts with the tags is withheld (null) and marked. A null approved value (insufficient
-evidence) stays allowed; it is counted and listed.
+`CLASSIFICATION:` line conflicts with the tags is withheld (null) and marked. In a table with no proposal, non-standard
+existing text is withheld (null) and marked. `validate-approved` checks every non-null value; only the framework audit
+columns are exempt (they are locked to their existing values). A null approved value (insufficient evidence, or
+withheld) stays allowed; it is counted and listed.
 
 **Notebooks.** A `.ipynb` used as context or as an attachment has its outputs, execution counts, attachments, raw cells
 and metadata stripped before sending, so nothing from cell outputs reaches the provider. Standards mode refuses a
