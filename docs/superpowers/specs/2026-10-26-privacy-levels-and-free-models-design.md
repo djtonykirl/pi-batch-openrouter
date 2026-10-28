@@ -95,7 +95,7 @@ The guiding principle: **the extension may only make privacy stricter than the a
 | `no-training` | `provider.data_collection: "deny"` | Cannot be expressed per request. Allowed only when the user has **attested** that their account disables training for the relevant model group (`privacy.accountNoTraining: true`, set by `/batch privacy attest`). Otherwise batch models are refused at this level, with a pointer to openrouter.ai/settings/privacy. |
 | `zdr` | `provider.zdr: true` | `provider.only` = the providers whose endpoint for this model is in the ZDR list, plus `allow_fallbacks: false`. If there are none, the model is refused at this level. |
 
-- **Delete after retrieval:** at `no-training` and `zdr`, a finished batch is deleted at OpenRouter once its raw final response has been saved locally.
+- **Delete after retrieval:** at `no-training` and `zdr`, a finished batch is deleted at OpenRouter once its raw final response has been saved locally. A batch that ends failed, expired or cancelled is deleted too, since there is nothing more to retrieve. *(Clarified after the final review.)*
   - The raw response is already saved once and never overwritten (`finalResponseFile`), so nothing local is lost.
   - Failures are logged and retried on later ticks. They never affect the job's local status.
   - Config: `privacy.deleteRemoteBatches` (default `true` at those levels; ignored at `standard` unless set).

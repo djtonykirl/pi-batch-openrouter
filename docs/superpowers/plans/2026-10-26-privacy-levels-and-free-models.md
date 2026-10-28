@@ -35,7 +35,11 @@
 - **Immediate bodies:** carry `provider: { data_collection: "deny" }` at `no-training`, and `provider: { zdr: true }` at `zdr`.
 - **`zdr` on batch:** pin `provider.only` to the ZDR providers for the normalised model, plus `allow_fallbacks: false`. Refuse when there are none, or when the catalog was not loaded successfully in this session.
 - **`no-training` on batch:** allowed only when `privacy.accountNoTraining === true`. Otherwise refuse.
-- **Remote deletion:** delete a finished batch at OpenRouter only when that job's own recorded `privacy.level` is `no-training` or `zdr` and `privacy.deleteRemoteBatches` is true, and only after its raw final response is on disk. Never base this on the current config level.
+- **Remote deletion:** delete a batch at OpenRouter only when that job's own recorded `privacy.level` is `no-training` or `zdr` and `privacy.deleteRemoteBatches` is true. Never base this on the current config level.
+  - A completed batch is deleted only after its raw final response is on disk.
+  - A batch that ends `failed`, `expired` or `cancelled` at OpenRouter is deleted too, since there is nothing more to retrieve; its last status is the saved evidence. A 410 "gone" batch is not deleted.
+  - Failed deletes retry with exponential backoff for up to 24 hours from the first attempt, then show as needing attention. A missing API key is not an attempt: the job shows as waiting for a key.
+  - *(Revised after the final review: the original wording covered only the retrieval case.)*
 - **Model slugs:** normalise before any catalog lookup by stripping `:batch` and `:free`.
 - **Route by model ID:** `:free` → `"immediate"`; anything else → `"batch"`, unless the picker set `route` explicitly.
 - **Catalog freshness:** load on every Pi `session_start`, web server start and web workspace switch, plus on manual refresh. Loads are deduplicated. A catalog read from disk is `fresh: false` and is used only for display.
