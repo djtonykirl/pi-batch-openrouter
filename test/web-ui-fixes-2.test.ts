@@ -85,16 +85,23 @@ test("4a: a rate-limited free-model turn names the route, the retry time and the
   const at = new Date(2026, 9, 28, 14, 15, 0);
   assert.equal(
     inflightHeadline("turn", { route: "immediate", nextPollAt: at.toISOString(), consecutivePollFailures: 5 }, 8),
-    "⏳ Free-model turn rate-limited by OpenRouter; retrying at 14:15 (attempt 5 of 8)",
+    "⏳ Free-model turn rate-limited by OpenRouter; retrying at 14:15 (rate limit 5 of 8)",
   );
   assert.equal(inflightHeadline("turn", { route: "immediate", consecutivePollFailures: 0 }, 8), "⏳ Free-model turn in flight");
   assert.equal(inflightHeadline("turn", { route: "batch", consecutivePollFailures: 0 }, 8), "⏳ Batch turn in flight");
   assert.equal(inflightHeadline("turn", undefined, 8), "⏳ Batch turn in flight");
-  assert.equal(
-    inflightHeadline("turn", { route: "batch", consecutivePollFailures: 2, lastPollError: { message: "HTTP 502" } }, 8),
-    "⏳ Batch turn in flight (last status check failed: HTTP 502)",
-  );
   assert.equal(inflightHeadline("compaction", { route: "batch" }, 8), "⏳ Compaction in flight");
+  // A batch compaction with failed polls (consecutivePollFailures > 0) is not called rate-limited.
+  assert.equal(inflightHeadline("compaction", { route: "immediate", nextPollAt: at.toISOString(), consecutivePollFailures: 3 }, 8), "⏳ Compaction in flight");
+});
+
+test("4a: a poll problem comes first for every kind and route, with the retry time", () => {
+  const at = new Date(2026, 9, 28, 9, 5, 0).toISOString();
+  const err = { message: "HTTP 502: bad gateway" };
+  assert.equal(inflightHeadline("turn", { route: "batch", nextPollAt: at, consecutivePollFailures: 2, lastPollError: err }, 8), "⚠ Batch turn: poll problem: HTTP 502: bad gateway; retrying at 09:05");
+  assert.equal(inflightHeadline("turn", { route: "immediate", nextPollAt: at, consecutivePollFailures: 2, lastPollError: err }, 8), "⚠ Free-model turn: poll problem: HTTP 502: bad gateway; retrying at 09:05");
+  assert.equal(inflightHeadline("compaction", { route: "batch", nextPollAt: at, lastPollError: err }, 8), "⚠ Compaction: poll problem: HTTP 502: bad gateway; retrying at 09:05");
+  assert.equal(inflightHeadline("compaction", { route: "batch", lastPollError: err }, 8), "⚠ Compaction: poll problem: HTTP 502: bad gateway");
 });
 
 test("4a: the page embeds inflightHeadline with the real cap and no longer says 'Batch Turn in Flight'", () => {

@@ -91,27 +91,27 @@ export function metadataWrittenText(
 }
 
 /**
- * The in-flight banner's headline for a thread's pending turn or compaction: names the route, and for a free-model
- * (immediate) turn that OpenRouter rate-limited, when it retries (local time) and how many rate limits so far out of
- * `maxRateLimits` (after which the turn fails). A batch turn whose last status check failed says so. Plain text.
+ * The in-flight banner's headline for a thread's pending turn or compaction. A poll problem (`lastPollError`) comes
+ * first, for every kind and route, with the next retry time. Otherwise a free-model (immediate) turn that OpenRouter
+ * rate-limited says when it retries (local time) and how many rate limits so far out of `maxRateLimits` (after which
+ * the turn fails). Otherwise the kind and route. Plain text.
  */
 export function inflightHeadline(
   kind: "turn" | "compaction",
   job: { route?: string; nextPollAt?: string; consecutivePollFailures?: number; lastPollError?: { message?: string } } | null | undefined,
   maxRateLimits: number,
 ): string {
-  if (kind === "compaction") return "⏳ Compaction in flight";
-  if (job && job.route === "immediate") {
-    const n = job.consecutivePollFailures || 0;
-    const at = job.nextPollAt ? new Date(job.nextPollAt) : null;
-    if (n > 0 && at && Number.isFinite(at.getTime())) {
-      const hhmm = String(at.getHours()).padStart(2, "0") + ":" + String(at.getMinutes()).padStart(2, "0");
-      return "⏳ Free-model turn rate-limited by OpenRouter; retrying at " + hhmm + " (attempt " + n + " of " + maxRateLimits + ")";
-    }
-    return "⏳ Free-model turn in flight";
+  const at = job && job.nextPollAt ? new Date(job.nextPollAt) : null;
+  const hhmm = at && Number.isFinite(at.getTime()) ? String(at.getHours()).padStart(2, "0") + ":" + String(at.getMinutes()).padStart(2, "0") : "";
+  const what = kind === "compaction" ? "Compaction" : job && job.route === "immediate" ? "Free-model turn" : "Batch turn";
+  if (job && job.lastPollError && job.lastPollError.message) {
+    return "⚠ " + what + ": poll problem: " + job.lastPollError.message + (hhmm ? "; retrying at " + hhmm : "");
   }
-  if (job && job.lastPollError && job.lastPollError.message) return "⏳ Batch turn in flight (last status check failed: " + job.lastPollError.message + ")";
-  return "⏳ Batch turn in flight";
+  const n = (job && job.consecutivePollFailures) || 0;
+  if (kind === "turn" && job && job.route === "immediate" && n > 0 && hhmm) {
+    return "⏳ Free-model turn rate-limited by OpenRouter; retrying at " + hhmm + " (rate limit " + n + " of " + maxRateLimits + ")";
+  }
+  return "⏳ " + what + " in flight";
 }
 
 /**
@@ -1740,7 +1740,11 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
 
     async function selectThread(threadId, preserveScroll = false) {
       // A notice about another thread (e.g. the model a new thread started on) does not belong to this one.
-      if (state.activeThreadId !== threadId) document.getElementById("chatModelAlert").innerHTML = "";
+      // An open Compact form belongs to the thread it was opened on (a live refresh of the same thread keeps it).
+      if (state.activeThreadId !== threadId) {
+        document.getElementById("chatModelAlert").innerHTML = "";
+        window.cancelCompact();
+      }
       state.activeThreadId = threadId;
       renderThreadList();
       const detail = await api("/api/threads/" + encodeURIComponent(threadId));
