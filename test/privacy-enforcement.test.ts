@@ -180,8 +180,8 @@ test(
     const prepared = await service.prepare(ASK);
     await assert.rejects(service.createJob(prepared, { previewOnly: false }), (err: unknown) => {
       assert.ok(err instanceof SubmissionBlockedError);
-      // No ZDR endpoint, so no batch endpoint either (the stub's batch endpoints mirror the ZDR list): unknown.
-      assert.equal(err.message, "Privacy level zdr: the batch endpoints of anthropic/claude-opus-5.5 could not be loaded this session (run /batch privacy refresh)");
+      // No ZDR endpoint at all: the definitive refusal, whatever its batch endpoints (a refresh can't help).
+      assert.equal(err.message, "Privacy level zdr: anthropic/claude-opus-5.5 has no batch endpoint on OpenRouter's ZDR list (its batch endpoints: unknown; ZDR endpoints: none)");
       return true;
     });
     assert.deepEqual(jobDirs(jobsDir), []);

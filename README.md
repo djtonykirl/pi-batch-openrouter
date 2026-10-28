@@ -204,9 +204,13 @@ expired or cancelled) is deleted too; one OpenRouter reports gone (HTTP 410) is 
 
 The extension loads `/api/v1/models` and `/api/v1/endpoints/zdr` once on every Pi `session_start`, web server start
 and web workspace switch. `/api/v1/models` also lists the batch models (IDs ending in `:batch`); for each of them the
-extension then loads `/api/v1/models/{model}:batch/endpoints` (all public), at most 8 at a time. A model whose batch
-endpoints fail to load is treated as unknown: `zdr` refuses it ("the batch endpoints of <model> could not be loaded
-this session") until a refresh loads them, while the rest of the catalog still counts as loaded. Loads are deduplicated. A last-known copy is kept on disk **for display only**: a catalog read
+extension then loads `/api/v1/models/{model}:batch/endpoints` (all public), at most 8 at a time and within 20 seconds
+in all. A model whose batch endpoints fail to load in that time is treated as unknown: `zdr` refuses it ("the batch
+endpoints of <model> could not be loaded this session") until a refresh loads them, while the rest of the catalog
+still counts as loaded, and `/batch privacy` shows how many are unknown. A model with no ZDR endpoint at all is
+refused outright, since a refresh can't change that. A `zdr` send made while the catalog is still loading waits for it
+(up to `polling.requestTimeoutSeconds`) and is otherwise refused with "the model catalog is still loading; try again
+in a moment". Loads are deduplicated. A last-known copy is kept on disk **for display only**: a catalog read
 from disk is never used to authorise a `zdr` send. If the load fails, `zdr` batch sends are refused until
 `/batch privacy refresh` (or `/batch chat model --refresh`, or the web "Refresh models" button) succeeds; no restart is
 needed. The model picker labels models `batch`, `free` and `ZDR`, and hides the ones the level rules out. A batch

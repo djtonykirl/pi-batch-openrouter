@@ -46,6 +46,8 @@ export interface CatalogView {
    * only on these, which are a different set from the sync endpoints that /endpoints/zdr lists. No entry: unknown.
    */
   batchEndpoints?: Record<string, string[]>;
+  /** A load is still in flight (only meaningful when not fresh): refusals say so rather than suggesting a refresh. */
+  loading?: true;
 }
 
 /**
@@ -63,11 +65,21 @@ export function batchZdrView(catalog: CatalogView | undefined, model: string): {
 
 /** Why `model` can't run on the batch route at zdr from the catalog alone (fresh catalog, no pin, no allow-list), or undefined. */
 function batchZdrRefusal(slug: string, view: ReturnType<typeof batchZdrView>): string | undefined {
+  // No ZDR endpoint at all is definitive: knowing the batch endpoints (a refresh) could not change the answer.
+  const noZdr = () => `Privacy level zdr: ${slug} has no batch endpoint on OpenRouter's ZDR list (its batch endpoints: ${view.batch ? view.batch.join(", ") || "none" : "unknown"}; ZDR endpoints: ${view.zdr.join(", ") || "none"})`;
+  if (view.zdr.length === 0) return noZdr();
   if (!view.batch) return `Privacy level zdr: the batch endpoints of ${slug} could not be loaded this session (run /batch privacy refresh)`;
-  if (view.pinnable.length === 0) {
-    return `Privacy level zdr: ${slug} has no batch endpoint on OpenRouter's ZDR list (its batch endpoints: ${view.batch.join(", ") || "none"}; ZDR endpoints: ${view.zdr.join(", ") || "none"})`;
-  }
-  return undefined;
+  return view.pinnable.length === 0 ? noZdr() : undefined;
+}
+
+/**
+ * The API path of a model's `:batch` endpoint list, each segment URL-encoded (`:` kept). Undefined for an ID with an
+ * empty, "." or ".." segment, which is never requested.
+ */
+export function batchEndpointsPath(model: string): string | undefined {
+  const segments = normaliseModelSlug(model).split("/");
+  if (segments.some((s) => s === "" || s === "." || s === "..")) return undefined;
+  return `/models/${segments.map((s) => encodeURIComponent(s).replace(/%3A/gi, ":")).join("/")}:batch/endpoints`;
 }
 
 export type ProviderDecision =
@@ -97,7 +109,9 @@ export function resolveBatchProvider(input: {
   if (!catalog?.fresh) {
     return {
       ok: false,
-      reason: "Privacy level zdr: model catalog not loaded this session, so ZDR providers can't be verified (run /batch privacy refresh)",
+      reason: catalog?.loading
+        ? "Privacy level zdr: the model catalog is still loading; try again in a moment"
+        : "Privacy level zdr: model catalog not loaded this session, so ZDR providers can't be verified (run /batch privacy refresh)",
     };
   }
   const slug = normaliseModelSlug(model);

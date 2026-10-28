@@ -1,6 +1,6 @@
 import type { BatchSnapshot, SubmitBody } from "./types.js";
 import type { CatalogModel } from "../models/catalog.js";
-import { normaliseModelSlug, type ZdrEndpoint } from "../privacy/policy.js";
+import { batchEndpointsPath, normaliseModelSlug, type ZdrEndpoint } from "../privacy/policy.js";
 
 export interface HttpResponseLike {
   status: number;
@@ -175,8 +175,8 @@ export class OpenRouterBatchClient {
    * differ from the sync endpoints that /endpoints/zdr lists, and the Batch API checks `provider.only` against them.
    */
   public async listBatchEndpoints(model: string): Promise<{ raw: RawExchange; tags: string[] }> {
-    const id = `${normaliseModelSlug(model)}:batch`;
-    const pathName = `/models/${id.split("/").map((seg) => encodeURIComponent(seg).replace(/%3A/gi, ":")).join("/")}/endpoints`;
+    const pathName = batchEndpointsPath(model);
+    if (!pathName) throw new Error(`refusing to request the batch endpoints of ${JSON.stringify(model)}: unsafe model ID`);
     const raw = await this.request("GET", pathName, "batch_endpoints");
     return { raw, tags: parseBatchEndpointTags(raw.bodyText) };
   }
