@@ -163,3 +163,11 @@ export function batchEndpointsMatchingZdr(zdr: readonly { model: string; provide
   for (const e of zdr) (out[e.model] ??= []).push(e.provider);
   return out;
 }
+
+/** The free model the immediate-route tests use, shaped like xingchen-agi/xing4.0-29b-a4b:free (its free endpoint is on the ZDR list). */
+export const FREE_ZDR_ROW = { model: "meta/llama-free", provider: "free-zdr-host" };
+
+/** Catalog data plus a ZDR-qualifying free model (meta/llama-free:free), so a zdr free send is allowed. */
+export function withFreeZdr<T extends { zdr: { model: string; provider: string }[] }>(data: T): T & { freeEndpoints: Record<string, string[]> } {
+  return { ...data, zdr: [...data.zdr, FREE_ZDR_ROW], freeEndpoints: { [FREE_ZDR_ROW.model]: [FREE_ZDR_ROW.provider] } };
+}

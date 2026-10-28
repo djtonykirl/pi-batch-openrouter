@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import test from "node:test";
+import * as path from "node:path";
+import { ModelCatalog } from "../src/models/catalog.js";
+import { withFreeZdr } from "./fixtures/catalog.js";
 import type { BatchConfig } from "../src/config.js";
 import { atomicWriteJson } from "../src/fsutil.js";
 import { itemText, jobItems } from "../src/items.js";
@@ -33,7 +36,9 @@ function withService(level: BatchConfig["privacy"]["level"], fn: (c: Ctx) => Pro
         c.privacy.level = level;
       });
       const settled: JobManifest[] = [];
-      await fn({ service: makeService(root, fake, cfg, settled), fake, cfg, settled });
+      const catalog = new ModelCatalog({ fetch: async () => withFreeZdr({ models: [], zdr: [] }), file: path.join(root, "catalog.json") });
+      await catalog.load();
+      await fn({ service: makeService(root, fake, cfg, settled, catalog), fake, cfg, settled });
     } finally {
       rm(root);
     }

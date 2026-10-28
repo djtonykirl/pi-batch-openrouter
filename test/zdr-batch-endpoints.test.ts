@@ -103,11 +103,14 @@ test("labels: a Claude-shaped batch model has no ZDR label and is blocked at zdr
   assert.match(unknown.blocked ?? "", /could not be loaded this session/);
 });
 
-test("labels: an immediate-route (free) model keeps the sync ZDR rule", () => {
-  const snap = { fresh: true, zdr: [{ model: "f/free", provider: "p" }], batchEndpoints: {}, models: [{ id: "f/free:free", name: "F", free: true }], loadedAt: "2026-10-28T09:00:00.000Z" };
+test("labels: a :free model is ZDR only when one of its free endpoints is on the ZDR list (see zdr-free-endpoints.test)", () => {
+  const snap = { fresh: true, zdr: [{ model: "f/free", provider: "p" }], batchEndpoints: {}, freeEndpoints: { "f/free": ["p"] }, models: [{ id: "f/free:free", name: "F", free: true }], loadedAt: "2026-10-28T09:00:00.000Z" };
   const e = pickerEntries(snap, [], "zdr", false).find((x) => x.id === "f/free:free")!;
   assert.deepEqual(e.labels, ["free", "ZDR"]);
   assert.equal(e.blocked, undefined);
+  const other = pickerEntries({ ...snap, freeEndpoints: { "f/free": ["q"] } }, [], "zdr", false).find((x) => x.id === "f/free:free")!;
+  assert.deepEqual(other.labels, ["free"]);
+  assert.match(other.blocked ?? "", /has no free endpoint on OpenRouter's ZDR list/);
 });
 
 test("ModelCatalog.labels uses the batch intersection for batch-route models", async () => {
@@ -183,6 +186,7 @@ test("fetchCatalogData loads the core lists, then each :batch model's endpoints;
     {
       listModels: async () => ({ models: [{ id: `${GEMINI}:batch`, name: "G", free: false }, { id: `${CLAUDE}:batch`, name: "C", free: false }, { id: GEMINI, name: "G", free: false }] }),
       listZdrEndpoints: async () => ({ endpoints: ZDR }),
+      listFreeEndpoints: async () => ({ tags: [] }),
       listBatchEndpoints: async (id) => {
         asked.push(id);
         if (id.startsWith("anthropic/")) throw new Error("HTTP 503");
@@ -197,7 +201,7 @@ test("fetchCatalogData loads the core lists, then each :batch model's endpoints;
   assert.equal(data.models.length, 3);
   assert.deepEqual(logged, [["warn", "catalog.batch_endpoints_failed", { count: 1, models: [`${CLAUDE}:batch`] }]]);
   await assert.rejects(
-    fetchCatalogData({ listModels: async () => ({ models: [] }), listZdrEndpoints: async () => Promise.reject(new Error("zdr down")), listBatchEndpoints: async () => ({ tags: [] }) }),
+    fetchCatalogData({ listModels: async () => ({ models: [] }), listZdrEndpoints: async () => Promise.reject(new Error("zdr down")), listBatchEndpoints: async () => ({ tags: [] }), listFreeEndpoints: async () => ({ tags: [] }) }),
     /zdr down/,
   );
 });

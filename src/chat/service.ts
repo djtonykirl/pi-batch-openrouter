@@ -10,7 +10,7 @@ import { immediateRouteAllowed, immediateRouteRefusal } from "../models/catalog.
 import { allowedProviders } from "../openrouter/routing.js";
 import {
   effectiveLevel as effectiveLevelOf,
-  normaliseModelSlug,
+  immediateZdrRefusal,
   PRIVACY_LEVELS,
   resolveBatchProvider,
   RETENTION_DELETED,
@@ -317,15 +317,9 @@ export class ChatService {
       const d = resolveBatchProvider({ level, model: to, userPin: thread.providerPin, catalog, accountNoTraining: privacy.accountNoTraining, allowedProviders: allowedProviders(config) });
       if (!d.ok) throw new Error(d.reason);
     } else if (level === "zdr") {
-      const base = normaliseModelSlug(to);
-      if (!catalog?.fresh) {
-        throw new Error(
-          catalog?.loading
-            ? "Privacy level zdr: the model catalog is still loading; try again in a moment"
-            : "Privacy level zdr: model catalog not loaded this session, so ZDR endpoints can't be verified (run /batch privacy refresh)",
-        );
-      }
-      if (!catalog.zdr.some((e) => e.model === base)) throw new Error(`Privacy level zdr: no ZDR endpoint available for ${base}`);
+      // A `:free` model needs one of its own free endpoints on the ZDR list (the same check a send makes).
+      const refusal = immediateZdrRefusal(catalog, to);
+      if (refusal) throw new Error(refusal);
     }
     this.store.update(threadId, (t, append) => {
       if (t.model !== to) {

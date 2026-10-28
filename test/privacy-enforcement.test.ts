@@ -13,7 +13,7 @@ import { CLASSIFY_YAML, TICKETS_CSV } from "./fixtures/datasets.js";
 import { FAKE_KEY, FakeOpenRouter, accepted, makeConfig } from "./fixtures/fake-openrouter.js";
 import { chatCompletion, completed, successItem } from "./fixtures/openrouter.js";
 import { rm, tempWorkspace, writeFiles } from "./helpers.js";
-import { batchEndpointsMatchingZdr } from "./fixtures/catalog.js";
+import { batchEndpointsMatchingZdr, withFreeZdr } from "./fixtures/catalog.js";
 
 const ASK: AskOptions = { objective: "Review the authentication design", files: ["src/auth.ts"], contexts: [], format: "markdown", includeInstructions: true };
 
@@ -39,7 +39,7 @@ async function stubCatalog(zdr: ZdrEndpoint[] | Error, file: string): Promise<Mo
   const catalog = new ModelCatalog({
     fetch: async () => {
       if (zdr instanceof Error) throw zdr;
-      return { models: [], zdr, batchEndpoints: batchEndpointsMatchingZdr(zdr) };
+      return withFreeZdr({ models: [], zdr, batchEndpoints: batchEndpointsMatchingZdr(zdr) });
     },
     file,
   });

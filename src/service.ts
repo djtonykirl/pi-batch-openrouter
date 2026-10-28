@@ -15,7 +15,7 @@ import { immediateResultId, runImmediateJob, type ImmediateItemState, type Immed
 import { normaliseBatchResult, type NormalisedBatchResult } from "./openrouter/normalise-result.js";
 import { accountRequirementBlockers, allowListPin, allowedProviders, pinOutsideAllowList, resolveRouting } from "./openrouter/routing.js";
 import { buildSubmitBody, messageText, submitBodyProblems, type BatchRequestItem, type ChatMessage, type ProviderPin, type SubmitBody } from "./openrouter/types.js";
-import { effectiveLevel, resolveBatchProvider, routeForModel, stricter, type CatalogView, type PrivacyLevel, type Route } from "./privacy/policy.js";
+import { effectiveLevel, immediateZdrRefusal, resolveBatchProvider, routeForModel, stricter, type CatalogView, type PrivacyLevel, type Route } from "./privacy/policy.js";
 import { compileOutputSchema, type OutputValidator } from "./workflows/structured.js";
 import { findWorkflow, formatDiagnostics, type WorkflowDefinition, type WorkflowEntry } from "./workflows/definition.js";
 import { planDatasetRun, type DatasetPlan, type EffectiveLimits } from "./workflows/dataset-run.js";
@@ -219,7 +219,7 @@ export type PrivacyDecision =
 /**
  * The privacy decision for a draft, without I/O: the effective level (stricter of config and draft), the routing.require*
  * checks, the immediate-route rules, routing.allowedProviders and the batch provider decision. `persistJob` applies it
- * before anything is written; `previewPrivacy` shows it in a dry run. `catalog` is only read at zdr on the batch route.
+ * before anything is written; `previewPrivacy` shows it in a dry run. `catalog` is only read at zdr.
  */
 export function decidePrivacyFor(input: {
   config: BatchConfig;
@@ -240,6 +240,12 @@ export function decidePrivacyFor(input: {
     // The allow-list is sent as provider.only with each call (immediateStep); a user pin must still be within it.
     const outsideList = pinOutsideAllowList(config, draft.pin);
     if (outsideList) return { ok: false, reason: outsideList, refusal: "policy" };
+    // At zdr a `:free` model must have a free endpoint on the ZDR list, checked locally before any request (OpenRouter
+    // would otherwise answer 404 "No endpoints found matching your data policy"). The request still carries zdr: true.
+    if (level === "zdr") {
+      const refusal = immediateZdrRefusal(catalog, draft.model);
+      if (refusal) return { ok: false, reason: refusal, refusal: "privacy" };
+    }
     const enforcement = level === "zdr" ? "immediate: zdr=true" : level === "no-training" ? "immediate: data_collection=deny" : "none";
     // The immediate body carries only the privacy fields, so a pin is never recorded as if it were sent.
     return { ok: true, route, privacy: { level, route, enforcement } };
@@ -667,7 +673,7 @@ export class BatchService {
     const config = this.deps.getConfig();
     const privacy = this.privacyConfig();
     const level = effectiveLevel(privacy.level, draft.privacyLevel);
-    const catalog = await this.privacyCatalog(level, routeForModel(draft.model, draft.route));
+    const catalog = await this.privacyCatalog(level);
     const decision = decidePrivacyFor({ config, privacy, draft, catalog });
     if (!decision.ok) {
       if (decision.refusal !== "policy") this.logger.log("warn", `${decision.refusal}_refused`, { kind: draft.kind, level, model: draft.model });
@@ -677,12 +683,13 @@ export class BatchService {
   }
 
   /**
-   * The catalog a privacy decision reads: only at zdr on the batch route. It waits for an in-flight load (up to the
+   * The catalog a privacy decision reads: only at zdr (either route). It waits for an in-flight load (up to the
    * request timeout); on a timeout the view says "still loading" (rather than "not loaded"). A snapshot loaded
    * successfully this session stays authoritative during a background refresh, exactly as when none runs.
    */
-  private async privacyCatalog(level: PrivacyLevel, route: Route): Promise<CatalogView | undefined> {
-    if (level !== "zdr" || route !== "batch") return undefined;
+  private async privacyCatalog(level: PrivacyLevel): Promise<CatalogView | undefined> {
+    // Both routes read it at zdr: the batch pin, and the `:free` endpoints check on the immediate route.
+    if (level !== "zdr") return undefined;
     const config = this.deps.getConfig();
     return (await this.deps.catalog?.whenLoaded(config.polling.requestTimeoutSeconds * 1000)) ?? this.deps.catalog?.view();
   }
@@ -694,7 +701,7 @@ export class BatchService {
   public async previewPrivacy(draft: PrivacyDraft): Promise<PrivacyPreview> {
     const config = this.deps.getConfig();
     const privacy = this.privacyConfig();
-    const catalog = await this.privacyCatalog(effectiveLevel(privacy.level, draft.privacyLevel), routeForModel(draft.model, draft.route));
+    const catalog = await this.privacyCatalog(effectiveLevel(privacy.level, draft.privacyLevel));
     return previewPrivacy({ config, privacy, draft, catalog });
   }
 

@@ -158,6 +158,14 @@ most private value from what could be read, the last clean read and the settings
     endpoint on OpenRouter's ZDR list (its batch endpoints: …; ZDR endpoints: …)`), when its batch endpoints could not
     be loaded this session, when your own `--provider` pin or `routing.allowedProviders` leaves none, or when the
     catalog was not loaded successfully this session.
+  - **Free models follow the same rule.** A `:free` model runs only on its own free endpoints (from
+    `/api/v1/models/{model}:free/endpoints`), which are usually not the paid endpoints the ZDR list names for the base
+    model. At `zdr` it is allowed only when one of its free endpoint tags is on the ZDR list for that model; otherwise
+    it is refused locally, before any request (`Privacy level zdr: <model> has no free endpoint on OpenRouter's ZDR
+    list (its free endpoints: …; ZDR endpoints: …)`), and so is a model whose free endpoints could not be loaded. As
+    of 2026-10-28, `google/gemma-4-31b-it:free` (free endpoint `google-ai-studio`) does not qualify, and
+    `xingchen-agi/xing4.0-29b-a4b:free` (free endpoint `phala`, on the ZDR list) does. The request still carries
+    `provider: { zdr: true }`.
 - **Immediate route.** Models with the `:free` suffix run through `POST /chat/completions` and carry the
   `data_collection` or `zdr` field above. Items sent later (after a per-minute 429 or a crash) go out at the stricter
   of the job's recorded level, the current project level and the thread's own level; an escalation is recorded as a
@@ -205,7 +213,7 @@ expired or cancelled) is deleted too; one OpenRouter reports gone (HTTP 410) is 
 The extension loads `/api/v1/models` and `/api/v1/endpoints/zdr` once on every Pi `session_start`, web server start
 and web workspace switch. `/api/v1/models` also lists the batch models (IDs ending in `:batch`); for each of them the
 extension then loads `/api/v1/models/{model}:batch/endpoints` (all public), at most 8 at a time and within 20 seconds
-in all. A model whose batch endpoints fail to load in that time is treated as unknown: `zdr` refuses it ("the batch
+in all. The free models (IDs ending in `:free`) get the same treatment with `/api/v1/models/{model}:free/endpoints`. A model whose batch endpoints fail to load in that time is treated as unknown: `zdr` refuses it ("the batch
 endpoints of <model> could not be loaded this session") until a refresh loads them, while the rest of the catalog
 still counts as loaded, and `/batch privacy` shows how many are unknown. A model with no ZDR endpoint at all is
 refused outright, since a refresh can't change that. A `zdr` send made while the catalog is still loading waits for it
@@ -214,8 +222,8 @@ in a moment". Loads are deduplicated. A last-known copy is kept on disk **for di
 from disk is never used to authorise a `zdr` send. If the load fails, `zdr` batch sends are refused until
 `/batch privacy refresh` (or `/batch chat model --refresh`, or the web "Refresh models" button) succeeds; no restart is
 needed. The model picker labels models `batch`, `free` and `ZDR`, and hides the ones the level rules out. A batch
-model is labelled `ZDR` only when one of its batch endpoints is on the ZDR list; a free (immediate-route) model is
-labelled `ZDR` when it has any ZDR endpoint, since its requests carry `zdr: true`.
+model is labelled `ZDR` only when one of its batch endpoints is on the ZDR list, and a `:free` model only when one of
+its free endpoints is.
 
 ### Free models
 
