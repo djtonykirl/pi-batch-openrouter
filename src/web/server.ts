@@ -24,7 +24,7 @@ import { FileLogger } from "../logger.js";
 import { fetchCatalogData, immediateRouteAllowed, immediateRouteRefusal, ModelCatalog, type CatalogData } from "../models/catalog.js";
 import { normalizeBatchModelSlug } from "../models.js";
 import { OpenRouterBatchClient } from "../openrouter/client.js";
-import { ATTEST_NOTE, attestationUpdate, catalogStateLine, levelSource, levelUpdate, pickerEntries, PRIVACY_NOTICE, PRIVACY_SETTINGS_URL } from "../privacy/commands.js";
+import { ATTEST_NOTE, attestationUpdate, batchModelCandidates, catalogStateLine, fallbackPickerEntry, levelSource, levelUpdate, pickerEntries, PRIVACY_NOTICE, PRIVACY_SETTINGS_URL } from "../privacy/commands.js";
 import { isPrivacyLevel, type PrivacyLevel, type Route } from "../privacy/policy.js";
 import { badgeText, BatchPoller } from "../poller.js";
 import { JobRegistry } from "../registry.js";
@@ -76,6 +76,9 @@ export interface WorkspaceEntryInfo {
   excludedLayer?: string;
   rule?: string;
 }
+
+/** Project configuration files the workspace picker never offers. */
+const PROJECT_CONFIG_FILES = new Set([".pi/batch.config.json", PROJECT_INSTRUCTIONS_FILE]);
 
 const DEFAULT_FALLBACK_MODELS = [
   "anthropic/claude-opus-5.5",
@@ -234,6 +237,14 @@ export function inspectWorkspaceFiles(workspaceRoot: string, config: BatchConfig
       e.selectable = false;
       e.excludedLayer = "too-large";
       e.rule = `> ${config.context.maxFileBytes} B`;
+    }
+  }
+  // The project's own batch configuration is never offered as an attachment (buildContextPackage's rules are unchanged).
+  for (const e of entries) {
+    if (e.kind === "file" && e.selectable && PROJECT_CONFIG_FILES.has(e.relPath)) {
+      e.selectable = false;
+      e.excludedLayer = "config";
+      e.rule = "project batch configuration";
     }
   }
 
@@ -547,10 +558,49 @@ export class BatchWebServer {
     };
   }
 
+  /** The picker's batch candidates: Pi's known models (standalone: the default plus a fixed list) and the catalog's `:batch` models. */
+  private batchCandidates(): string[] {
+    const known = this.deps.getKnownModels?.() ?? [];
+    const sources = known.length > 0 ? known : [this.deps.getConfig().defaultModel, ...DEFAULT_FALLBACK_MODELS];
+    return batchModelCandidates(this.deps.catalog?.snapshot(), sources);
+  }
+
+  /** Why `level` refuses `model` in the picker (the same check a submit makes), or undefined when it is selectable. */
+  private modelRefusal(model: string, level: PrivacyLevel): string | undefined {
+    const privacy = this.deps.service.privacyConfig();
+    const config = this.deps.getConfig();
+    const entries = pickerEntries(this.deps.catalog?.snapshot(), [model], level, privacy.accountNoTraining, allowedProviders(config), config);
+    return entries.find((e) => e.id === model)?.blocked;
+  }
+
+  /**
+   * A new thread whose default model the level refuses starts on the first selectable picker model instead (a
+   * ZDR-labelled batch model first at zdr, then a free model). setModel decides again, so nothing is weakened here.
+   */
+  private async startOnSelectableModel(threadId: string, model: string): Promise<{ notice?: string; warning?: string }> {
+    const level = this.deps.chat.effectiveLevel(threadId);
+    const refusal = this.modelRefusal(model, level);
+    if (!refusal) return {};
+    const privacy = this.deps.service.privacyConfig();
+    const config = this.deps.getConfig();
+    const entries = pickerEntries(this.deps.catalog?.snapshot(), this.batchCandidates(), level, privacy.accountNoTraining, allowedProviders(config), config);
+    const pick = fallbackPickerEntry(entries, level);
+    if (!pick) return { warning: `The default model ${model} is refused at privacy level ${level} and no other model is selectable: ${refusal}` };
+    try {
+      await this.deps.chat.setModel(threadId, pick.id, { route: pick.route });
+    } catch (err) {
+      // setModel decides again; if it refuses, the thread keeps the default and the reason is shown.
+      return { warning: `The default model ${model} is refused at privacy level ${level} (${refusal}); switching to ${pick.id} was refused too: ${err instanceof Error ? err.message : String(err)}` };
+    }
+    return { notice: `Started on ${pick.id} [${pick.labels.join(", ")}]: the default model ${model} is refused at privacy level ${level} (${refusal}).` };
+  }
+
   private privacyState(): Record<string, unknown> {
     const p = this.deps.service.privacyConfig();
     const config = this.deps.getConfig();
+    const defaultModelRefusal = this.modelRefusal(normalizeBatchModelSlug(config.defaultModel), p.level);
     return {
+      ...(defaultModelRefusal ? { defaultModelRefusal } : {}),
       level: p.level,
       source: levelSource(this.deps.workspaceRoot),
       accountNoTraining: p.accountNoTraining,
@@ -716,6 +766,7 @@ export class BatchWebServer {
         }));
         const models = new Set<string>([config.defaultModel, ...DEFAULT_FALLBACK_MODELS]);
         for (const m of this.deps.getKnownModels?.() ?? []) models.add(m);
+        for (const m of this.batchCandidates()) models.add(m);
         for (const t of threads) models.add(t.model);
         for (const j of jobs) models.add(j.model);
 
@@ -930,8 +981,11 @@ export class BatchWebServer {
         const body = await this.readJson<{ model?: string; title?: string; route?: string }>(req);
         const route = parseRoute(body.route, body.model, this.deps.catalog);
         const thread = this.deps.chat.newThread();
+        let notice: string | undefined;
+        let warning: string | undefined;
         try {
           if (body.model?.trim()) await this.deps.chat.setModel(thread.id, body.model.trim(), { route });
+          else ({ notice, warning } = await this.startOnSelectableModel(thread.id, thread.model));
           if (body.title?.trim()) this.deps.chat.rename(thread.id, body.title.trim());
         } catch (err) {
           // A refused create (privacy level, empty title) must not leave an orphan thread behind.
@@ -943,7 +997,7 @@ export class BatchWebServer {
           throw err;
         }
         this.broadcast({ type: "thread_created", threadId: thread.id });
-        this.sendJson(res, 201, { thread: this.deps.chatStore.read(thread.id) });
+        this.sendJson(res, 201, { thread: this.deps.chatStore.read(thread.id), ...(notice ? { notice } : {}), ...(warning ? { warning } : {}) });
         return;
       }
 
@@ -1073,11 +1127,9 @@ export class BatchWebServer {
         const privacy = this.deps.service.privacyConfig();
         const threadParam = parsedUrl.searchParams.get("threadId");
         const level: PrivacyLevel = threadParam ? this.deps.chat.effectiveLevel(this.deps.chatStore.resolve(threadParam)) : privacy.level;
-        const known = this.deps.getKnownModels?.() ?? [];
-        const batchModels = known.length > 0 ? known : [config.defaultModel, ...DEFAULT_FALLBACK_MODELS];
         this.sendJson(res, 200, {
           level,
-          entries: pickerEntries(this.deps.catalog?.snapshot(), batchModels, level, privacy.accountNoTraining, allowedProviders(config)),
+          entries: pickerEntries(this.deps.catalog?.snapshot(), this.batchCandidates(), level, privacy.accountNoTraining, allowedProviders(config), config),
           catalog: this.catalogInfo(),
         });
         return;
@@ -1129,6 +1181,7 @@ export class BatchWebServer {
             excludedCount: prepared.pkg.excluded.length,
             characters: prepared.pkg.characters,
             contentSha256: prepared.contentSha256,
+            privacy: await this.deps.service.previewPrivacy({ kind: "goal", model: prepared.model, pin: prepared.pin }),
             summary: `Model: ${prepared.model} · Workspace files: ${prepared.pkg.files.length} · Uploads: ${(prepared.uploads ?? []).length} · Total characters: ${prepared.pkg.characters} (~${Math.ceil(prepared.pkg.characters / 4)} tokens)`,
           });
           return;
@@ -1167,6 +1220,7 @@ export class BatchWebServer {
           this.sendJson(res, 200, {
             blockers: plan.blockers,
             warnings: plan.pkg.warnings,
+            privacy: await this.deps.service.previewPrivacy({ kind: "workflow", model: plan.model, pin: plan.pin }),
             summary: `Model: ${plan.model} · Requests in batch: ${plan.items.length} · Files selected: ${plan.pkg.files.length} · Total characters: ${plan.totalCharacters}`,
           });
           return;
@@ -1198,6 +1252,7 @@ export class BatchWebServer {
           this.sendJson(res, 200, {
             blockers: prepared.blockers,
             warnings: prepared.warnings,
+            privacy: await this.deps.service.previewPrivacy({ kind: "workflow", model: prepared.model, pin: prepared.pin }),
             summary: `Workflow: ${body.workflow} · Model: ${prepared.model} · Rows selected: ${prepared.plan?.counts.selectedRows ?? 0} · Total characters: ${prepared.plan?.totalCharacters ?? 0}`,
           });
           return;
@@ -1238,7 +1293,7 @@ export class BatchWebServer {
           return;
         }
         if (body.mode === "dryrun") {
-          this.sendJson(res, 200, { blockers: prepared.blockers, warnings: prepared.warnings, preview });
+          this.sendJson(res, 200, { blockers: prepared.blockers, warnings: prepared.warnings, preview, privacy: await this.deps.service.previewPrivacy({ kind: "workflow", model: prepared.model, pin: prepared.pin }) });
           return;
         }
         const job = await this.deps.service.createMetadataJob(prepared, { previewOnly });

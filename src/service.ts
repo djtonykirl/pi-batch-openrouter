@@ -15,7 +15,7 @@ import { immediateResultId, runImmediateJob, type ImmediateItemState, type Immed
 import { normaliseBatchResult, type NormalisedBatchResult } from "./openrouter/normalise-result.js";
 import { accountRequirementBlockers, allowListPin, allowedProviders, pinOutsideAllowList, resolveRouting } from "./openrouter/routing.js";
 import { buildSubmitBody, messageText, submitBodyProblems, type BatchRequestItem, type ChatMessage, type ProviderPin, type SubmitBody } from "./openrouter/types.js";
-import { effectiveLevel, resolveBatchProvider, routeForModel, stricter, type PrivacyLevel, type Route } from "./privacy/policy.js";
+import { effectiveLevel, resolveBatchProvider, routeForModel, stricter, type CatalogView, type PrivacyLevel, type Route } from "./privacy/policy.js";
 import { compileOutputSchema, type OutputValidator } from "./workflows/structured.js";
 import { findWorkflow, formatDiagnostics, type WorkflowDefinition, type WorkflowEntry } from "./workflows/definition.js";
 import { planDatasetRun, type DatasetPlan, type EffectiveLimits } from "./workflows/dataset-run.js";
@@ -202,6 +202,69 @@ export interface StoredMetadataPlan {
 }
 
 export const IMMEDIATE_CHAT_ONLY = "Free models run only in batch chat (/batch chat); /batch ask and workflows need a batch model";
+
+/** What the privacy decision reads from a draft. */
+export interface PrivacyDraft {
+  kind: JobKind;
+  model: string;
+  pin?: ProviderPin;
+  privacyLevel?: PrivacyLevel;
+  route?: Route;
+}
+
+export type PrivacyDecision =
+  | { ok: true; pin?: ProviderPin; route: Route; privacy: NonNullable<JobManifest["privacy"]> }
+  | { ok: false; reason: string; refusal: "routing" | "privacy" | "policy" };
+
+/**
+ * The privacy decision for a draft, without I/O: the effective level (stricter of config and draft), the routing.require*
+ * checks, the immediate-route rules, routing.allowedProviders and the batch provider decision. `persistJob` applies it
+ * before anything is written; `previewPrivacy` shows it in a dry run. `catalog` is only read at zdr on the batch route.
+ */
+export function decidePrivacyFor(input: {
+  config: BatchConfig;
+  privacy: { level: PrivacyLevel; accountNoTraining: boolean };
+  draft: PrivacyDraft;
+  catalog?: CatalogView;
+}): PrivacyDecision {
+  const { config, privacy, draft, catalog } = input;
+  const level = effectiveLevel(privacy.level, draft.privacyLevel);
+  const route = routeForModel(draft.model, draft.route);
+  // routing.require* checked here, where the effective level (a chat thread's included) is known: zdr and
+  // no-training satisfy them (per request on the immediate route; by the ZDR pin or the attested account on batch).
+  const unmet = accountRequirementBlockers(config, level, route);
+  if (unmet.length) return { ok: false, reason: unmet.join("\n\n"), refusal: "routing" };
+  if (route === "immediate") {
+    // Spec non-goal (v1): immediate requests outside batch chat need a rate-paced queue.
+    if (draft.kind !== "chat") return { ok: false, reason: IMMEDIATE_CHAT_ONLY, refusal: "policy" };
+    // The allow-list is sent as provider.only with each call (immediateStep); a user pin must still be within it.
+    const outsideList = pinOutsideAllowList(config, draft.pin);
+    if (outsideList) return { ok: false, reason: outsideList, refusal: "policy" };
+    const enforcement = level === "zdr" ? "immediate: zdr=true" : level === "no-training" ? "immediate: data_collection=deny" : "none";
+    // The immediate body carries only the privacy fields, so a pin is never recorded as if it were sent.
+    return { ok: true, route, privacy: { level, route, enforcement } };
+  }
+  // routing.allowedProviders restricts every batch: a pin outside it is refused, and a job without a pin (chat) gets it.
+  const outside = pinOutsideAllowList(config, draft.pin);
+  if (outside) return { ok: false, reason: outside, refusal: "policy" };
+  const userPin = draft.pin ?? allowListPin(config);
+  const decision = resolveBatchProvider({ level, model: draft.model, userPin, catalog, accountNoTraining: privacy.accountNoTraining, allowedProviders: allowedProviders(config) });
+  if (!decision.ok) return { ok: false, reason: decision.reason, refusal: "privacy" };
+  return { ok: true, pin: decision.provider, route, privacy: { level, route, enforcement: decision.enforcement } };
+}
+
+/** A dry run's read-only view of the privacy decision: whether the job would be refused, and how it would be enforced. */
+export interface PrivacyPreview {
+  ok: boolean;
+  reason?: string;
+  enforcement?: string;
+}
+
+/** Pure: the same decision `persistJob` makes, reduced for a dry run. Never writes anything. */
+export function previewPrivacy(input: Parameters<typeof decidePrivacyFor>[0]): PrivacyPreview {
+  const d = decidePrivacyFor(input);
+  return d.ok ? { ok: true, enforcement: d.privacy.enforcement } : { ok: false, reason: d.reason };
+}
 
 export class SubmissionBlockedError extends Error {
   constructor(message: string) {
@@ -604,37 +667,35 @@ export class BatchService {
     const config = this.deps.getConfig();
     const privacy = this.privacyConfig();
     const level = effectiveLevel(privacy.level, draft.privacyLevel);
-    const route = routeForModel(draft.model, draft.route);
-    // routing.require* checked here, where the effective level (a chat thread's included) is known: zdr and
-    // no-training satisfy them (per request on the immediate route; by the ZDR pin or the attested account on batch).
-    const unmet = accountRequirementBlockers(config, level, route);
-    if (unmet.length) {
-      this.logger.log("warn", "routing_refused", { kind: draft.kind, level, model: draft.model });
-      throw new SubmissionBlockedError(unmet.join("\n\n"));
-    }
-    if (route === "immediate") {
-      // Spec non-goal (v1): immediate requests outside batch chat need a rate-paced queue.
-      if (draft.kind !== "chat") throw new SubmissionBlockedError(IMMEDIATE_CHAT_ONLY);
-      // The allow-list is sent as provider.only with each call (immediateStep); a user pin must still be within it.
-      const outsideList = pinOutsideAllowList(config, draft.pin);
-      if (outsideList) throw new SubmissionBlockedError(outsideList);
-      const enforcement = level === "zdr" ? "immediate: zdr=true" : level === "no-training" ? "immediate: data_collection=deny" : "none";
-      // The immediate body carries only the privacy fields, so a pin is never recorded as if it were sent.
-      return { route, privacy: { level, route, enforcement } };
-    }
-    // On a timeout the view says "still loading" (rather than "not loaded") while the load is in flight. A snapshot
-    // loaded successfully this session stays authoritative during a background refresh, exactly as when none runs.
-    const catalog = level === "zdr" ? ((await this.deps.catalog?.whenLoaded(config.polling.requestTimeoutSeconds * 1000)) ?? this.deps.catalog?.view()) : undefined;
-    // routing.allowedProviders restricts every batch: a pin outside it is refused, and a job without a pin (chat) gets it.
-    const outside = pinOutsideAllowList(config, draft.pin);
-    if (outside) throw new SubmissionBlockedError(outside);
-    const userPin = draft.pin ?? allowListPin(config);
-    const decision = resolveBatchProvider({ level, model: draft.model, userPin, catalog, accountNoTraining: privacy.accountNoTraining, allowedProviders: allowedProviders(config) });
+    const catalog = await this.privacyCatalog(level, routeForModel(draft.model, draft.route));
+    const decision = decidePrivacyFor({ config, privacy, draft, catalog });
     if (!decision.ok) {
-      this.logger.log("warn", "privacy_refused", { kind: draft.kind, level, model: draft.model });
+      if (decision.refusal !== "policy") this.logger.log("warn", `${decision.refusal}_refused`, { kind: draft.kind, level, model: draft.model });
       throw new SubmissionBlockedError(decision.reason);
     }
-    return { pin: decision.provider, route, privacy: { level, route, enforcement: decision.enforcement } };
+    return { pin: decision.pin, route: decision.route, privacy: decision.privacy };
+  }
+
+  /**
+   * The catalog a privacy decision reads: only at zdr on the batch route. It waits for an in-flight load (up to the
+   * request timeout); on a timeout the view says "still loading" (rather than "not loaded"). A snapshot loaded
+   * successfully this session stays authoritative during a background refresh, exactly as when none runs.
+   */
+  private async privacyCatalog(level: PrivacyLevel, route: Route): Promise<CatalogView | undefined> {
+    if (level !== "zdr" || route !== "batch") return undefined;
+    const config = this.deps.getConfig();
+    return (await this.deps.catalog?.whenLoaded(config.polling.requestTimeoutSeconds * 1000)) ?? this.deps.catalog?.view();
+  }
+
+  /**
+   * The dry-run view of the privacy decision for a draft: read-only, with the catalog acquired exactly as
+   * `decidePrivacy` acquires it, so a dry run and the job it previews agree. The job is still decided when created.
+   */
+  public async previewPrivacy(draft: PrivacyDraft): Promise<PrivacyPreview> {
+    const config = this.deps.getConfig();
+    const privacy = this.privacyConfig();
+    const catalog = await this.privacyCatalog(effectiveLevel(privacy.level, draft.privacyLevel), routeForModel(draft.model, draft.route));
+    return previewPrivacy({ config, privacy, draft, catalog });
   }
 
   // ------------------------------------------------------------ map-files
@@ -1202,7 +1263,8 @@ export class BatchService {
           `Check your OpenRouter activity before using /batch retry, to avoid paying twice. Detail: ${err.detail}`;
       } else {
         code = `submission_rejected_${err.category}`;
-        message = err.detail;
+        // The raw detail ("User not found.") does not say that the key is the problem; it stays in parentheses.
+        message = err.category === "auth" ? `API key rejected by OpenRouter (HTTP ${err.httpStatus ?? 401}: ${err.detail})` : err.detail;
         if (err.rawBody) writeOnce(this.registry.artefact(localId, "submissionResponse"), err.rawBody);
       }
     }

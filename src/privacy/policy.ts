@@ -139,6 +139,17 @@ export function resolveBatchProvider(input: {
 /** Retention lines (`/batch show`, `/batch chat context`, web job detail). */
 export const RETENTION_DELETED = "Batch jobs are held at OpenRouter until finished; deleted after retrieval, or once they fail, expire or are cancelled";
 export const RETENTION_KEPT = "Batch jobs are kept up to 30 days";
+export const RETENTION_NOT_APPLICABLE = "Remote deletion: not applicable (never reached OpenRouter)";
+
+/**
+ * True for a job that ended without ever reaching OpenRouter (refused, rejected or cancelled before a provider batch
+ * existed), so there is nothing to keep or delete there. A submit with an unknown outcome MAY have reached it, so it
+ * never counts. Self-contained: the web page embeds this function's source.
+ */
+export function neverReachedOpenRouter(job: { providerBatchId?: string; localStatus: string; error?: { code: string } }): boolean {
+  const ended = ["ready", "partial", "failed", "cancelled", "expired", "corrupt"].includes(job.localStatus);
+  return ended && !job.providerBatchId && job.error?.code !== "submission_unknown";
+}
 
 /** routing.allowedProviders as the immediate route sends it. */
 export interface ImmediateAllowList {

@@ -85,7 +85,7 @@ export interface PackageInput {
 }
 
 const KNOWN_TEXT_EXTENSIONS = new Set(
-  ".ts .tsx .js .jsx .mjs .cjs .py .sql .ps1 .psm1 .sh .bash .json .jsonc .yaml .yml .toml .md .txt .cs .java .scala .kt .go .rs .rb .php .c .h .cpp .hpp .html .css .scss .xml .ini .cfg .conf .csv .tsv .graphql .proto .tf .dockerfile .gitignore .editorconfig"
+  ".ts .tsx .js .jsx .mjs .cjs .py .sql .ps1 .psm1 .sh .bash .json .jsonc .yaml .yml .toml .md .txt .cs .java .scala .kt .go .rs .rb .php .c .h .cpp .hpp .html .css .scss .xml .ini .cfg .conf .csv .tsv .ipynb .graphql .proto .tf .dockerfile .gitignore .editorconfig"
     .split(" "),
 );
 

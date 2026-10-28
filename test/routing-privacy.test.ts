@@ -241,11 +241,11 @@ test(
 
 test("formatPrivacyPolicy names a requirement the level satisfies (no-training only with the attestation)", () => {
   const cfg = makeConfig((c) => Object.assign(c.routing, { requireZdr: true, requireNoDataCollection: true }));
-  assert.equal(formatPrivacyPolicy(cfg), "ZDR required (NOT attested); no data collection required (NOT attested)");
-  assert.equal(formatPrivacyPolicy(cfg, { level: "zdr", accountNoTraining: false }), "ZDR required (satisfied by privacy level zdr); no data collection required (satisfied by privacy level zdr)");
-  assert.equal(formatPrivacyPolicy(cfg, { level: "no-training", accountNoTraining: true }), "ZDR required (NOT attested); no data collection required (satisfied by privacy level no-training)");
+  assert.equal(formatPrivacyPolicy(cfg), "routing.requireZdr: on (NOT attested); routing.requireNoDataCollection: on (NOT attested)");
+  assert.equal(formatPrivacyPolicy(cfg, { level: "zdr", accountNoTraining: false }), "routing.requireZdr: on (satisfied by privacy level zdr); routing.requireNoDataCollection: on (satisfied by privacy level zdr)");
+  assert.equal(formatPrivacyPolicy(cfg, { level: "no-training", accountNoTraining: true }), "routing.requireZdr: on (NOT attested); routing.requireNoDataCollection: on (satisfied by privacy level no-training)");
   // On a batch, no-training meets requireNoDataCollection only with the no-training attestation.
-  assert.equal(formatPrivacyPolicy(cfg, { level: "no-training", accountNoTraining: false }), "ZDR required (NOT attested); no data collection required (NOT attested) (needs /batch privacy attest)");
+  assert.equal(formatPrivacyPolicy(cfg, { level: "no-training", accountNoTraining: false }), "routing.requireZdr: on (NOT attested); routing.requireNoDataCollection: on (NOT attested) (needs /batch privacy attest)");
 });
 
 // ------------------------------------------------------------ standards mode x contract v2
@@ -396,9 +396,9 @@ test("model picker at zdr: a batch model with no ZDR endpoint in the allow-list 
 test("/batch privacy status shows the routing policy", () => {
   const cfg = makeConfig((c) => Object.assign(c.routing, { allowedProviders: ["azure"], allowFallbacks: false, requireZdr: true }));
   const routing = formatRoutingPolicy(cfg, { level: "zdr", accountNoTraining: false });
-  assert.equal(routing, "Provider allow-list: azure (no fallbacks); ZDR required (satisfied by privacy level zdr); no data collection not required");
+  assert.equal(routing, "Provider allow-list: azure (no fallbacks); routing.requireZdr: on (satisfied by privacy level zdr); routing.requireNoDataCollection: off");
   const text = formatPrivacyStatus({ level: "zdr", source: "project", accountNoTraining: false, snapshot: undefined, routing });
-  assert.match(text, /^Routing: Provider allow-list: azure \(no fallbacks\); ZDR required/m);
+  assert.match(text, /^Routing: Provider allow-list: azure \(no fallbacks\); routing.requireZdr: on/m);
 });
 
 test("previews at zdr show the ZDR pin note instead of the allow-list pin", async () => {
