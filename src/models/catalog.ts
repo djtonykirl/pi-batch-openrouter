@@ -27,15 +27,16 @@ export interface CatalogDeps {
 }
 
 /**
- * Whether `route: "immediate"` may be chosen explicitly for `modelId`: only a `:free` ID, or a model the catalog lists
- * as free under that exact ID. Anything else is a batch model and goes through the batch route's privacy checks.
+ * Whether `route: "immediate"` may be chosen explicitly for `modelId`: only a `:free` ID, or a model the catalog loaded
+ * this session lists as free under that exact ID (a copy read from disk may be out of date, and a model that has since
+ * been priced would be billed at full non-batch rates). Anything else goes through the batch route's privacy checks.
  */
 export function immediateRouteAllowed(modelId: string, snapshot: CatalogSnapshot | undefined): boolean {
-  return modelId.endsWith(":free") || !!snapshot?.models.some((m) => m.id === modelId && m.free);
+  return modelId.endsWith(":free") || (!!snapshot?.fresh && snapshot.models.some((m) => m.id === modelId && m.free));
 }
 
 export function immediateRouteRefusal(modelId: string): string {
-  return `Route immediate is only for free models (a ":free" ID or one the model catalog lists as free); ${modelId} is not one`;
+  return `Route immediate is only for free models (a ":free" ID or one the model catalog loaded this session lists as free); ${modelId} is not one (if the catalog failed to load, refresh it and try again)`;
 }
 
 /** Session model catalog: one deduplicated load at a time; `fresh` is true only after a successful network load. */

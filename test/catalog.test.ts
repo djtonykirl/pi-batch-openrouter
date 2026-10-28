@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { OpenRouterBatchClient, parseModels, parseZdrEndpoints } from "../src/openrouter/client.js";
-import { ModelCatalog, type CatalogModel } from "../src/models/catalog.js";
+import { immediateRouteAllowed, immediateRouteRefusal, ModelCatalog, type CatalogModel } from "../src/models/catalog.js";
 import { pickerEntries } from "../src/privacy/commands.js";
 import type { ZdrEndpoint } from "../src/privacy/policy.js";
 import { MODELS_RESPONSE, ZDR_RESPONSE } from "./fixtures/catalog.js";
@@ -18,6 +18,16 @@ const MODELS: CatalogModel[] = [
   { id: "c/d:free", name: "C: D", free: true, contextLength: 1000 },
 ];
 const ZDR: ZdrEndpoint[] = [{ model: "a/b", provider: "azure" }];
+
+test("an explicit immediate route needs a :free ID or a catalog loaded this session that lists the model as free", () => {
+  const snap = (fresh: boolean) => ({ fresh, zdr: [], models: [{ id: "z/zero-priced", name: "Z", free: true }], loadedAt: "2026-10-28T09:00:00.000Z" });
+  assert.equal(immediateRouteAllowed("c/one:free", undefined), true);
+  assert.equal(immediateRouteAllowed("z/zero-priced", snap(true)), true);
+  assert.equal(immediateRouteAllowed("z/zero-priced", snap(false)), false, "a copy read from disk may be out of date: never decides a route");
+  assert.equal(immediateRouteAllowed("z/zero-priced", undefined), false);
+  assert.equal(immediateRouteAllowed("a/paid", snap(true)), false);
+  assert.match(immediateRouteRefusal("z/zero-priced"), /loaded this session/);
+});
 
 test("parseModels marks free", () => {
   const models = parseModels(JSON.stringify(MODELS_RESPONSE));
