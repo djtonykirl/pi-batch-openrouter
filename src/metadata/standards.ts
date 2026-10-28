@@ -68,6 +68,24 @@ export function medallionLayer(table: string): MedallionLayer | null {
   return m ? (m[0] as MedallionLayer) : null;
 }
 
+/**
+ * The table's medallion layer in standards mode. Contract v2 evidence's `layer` is used when
+ * present ("other" names no medallion layer); otherwise the schema name's layer. The plan blocks
+ * a v2 `layer` that disagrees with the schema name, so the two never differ in a job.
+ */
+export function evidenceLayer(ev: { table: string; layer?: string }): MedallionLayer | null {
+  if (ev.layer !== undefined) return (MEDALLION_LAYERS as readonly string[]).includes(ev.layer) ? (ev.layer as MedallionLayer) : null;
+  return medallionLayer(ev.table);
+}
+
+/**
+ * Contract v2 `domain_prefix` (four characters, e.g. "PNPT") against --uc-prefix ("PNPT_"):
+ * equal, case-insensitively, once the uc prefix's trailing "_" separator is left off.
+ */
+export function domainPrefixMatches(domainPrefix: string, ucPrefix: string): boolean {
+  return domainPrefix.toLowerCase() === ucPrefix.replace(/_$/, "").toLowerCase();
+}
+
 /** The last part of catalog.schema.table starts with the prefix (case-insensitive). */
 export function hasUcPrefix(table: string, ucPrefix: string): boolean {
   const name = table.split(".").pop() ?? "";

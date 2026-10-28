@@ -12,8 +12,8 @@ import {
   columnTagsFromProposal,
   deriveTableTags,
   descriptionProblems,
+  evidenceLayer,
   isAuditColumn,
-  medallionLayer,
   piiTextProblems,
   tableTagProblems,
   type MetadataStandards,
@@ -199,6 +199,9 @@ export function metadataReviewMarkdown(o: MetadataOutcome): string {
   const draft = std ? new Map(approvedDraftRows(o).map((r) => [r.table, r])) : undefined;
   for (const t of o.tables) {
     out.push("", `## ${t.table}`, "");
+    // Contract v2 only: v1 documents are unchanged.
+    const facts = [t.evidence.layer && `**Layer:** ${t.evidence.layer}`, t.evidence.object_type && `**Object:** ${t.evidence.object_type}`].filter(Boolean);
+    if (facts.length) out.push(facts.join(" · "), "");
     out.push("**Existing description:**", "", block(t.evidence.existing_description), "");
     const row = draft?.get(t.table);
     if (row) out.push(...reviewTagLines(row));
@@ -224,19 +227,22 @@ export function metadataReviewMarkdown(o: MetadataOutcome): string {
     if (descReplaced) out.push(REPLACES_MARK, "");
     out.push(`**Confidence:** ${d.confidence}`, "", `**Reason:** ${d.reason}`, "");
     if (!descReplaced && t.evidence.existing_description !== null && d.comment !== null && d.comment !== t.evidence.existing_description) out.push("_An existing description is present: the proposal replaces it only if a reviewer approves the change._", "");
-    if (std) out.push("### Columns", "", "| Column | Type | Existing | Proposed | Confidence | PII |", "|---|---|---|---|---|---|");
-    else out.push("### Columns", "", "| Column | Type | Existing | Proposed | Confidence |", "|---|---|---|---|---|");
+    // Contract v2 adds a Tier column, standards mode a PII column; v1 documents are unchanged.
+    const tiers = t.evidence.columns.some((c) => c.profile);
+    const heads = ["Column", "Type", ...(tiers ? ["Tier"] : []), "Existing", "Proposed", "Confidence", ...(std ? ["PII"] : [])];
+    out.push("### Columns", "", `| ${heads.join(" | ")} |`, `|${heads.map(() => "---").join("|")}|`);
     const byName = new Map(t.proposal.columns.map((c) => [c.name, c]));
     const approvedByName = new Map((row?.columns ?? []).map((c) => [c.name, c]));
     for (const c of t.evidence.columns) {
+      const tier = tiers ? ` ${c.profile ? String(c.profile.disclosure_tier) : "—"} |` : "";
       if (!std) {
         const p = byName.get(c.name)!;
-        out.push(`| ${cell(c.name)} | ${cell(c.data_type)} | ${cell(c.existing_comment)} | ${cell(p.comment)} | ${p.confidence} |`);
+        out.push(`| ${cell(c.name)} | ${cell(c.data_type)} |${tier} ${cell(c.existing_comment)} | ${cell(p.comment)} | ${p.confidence} |`);
         continue;
       }
       const p = byName.get(c.name);
       if (isAuditColumn(c.name) || !p) {
-        out.push(`| ${cell(c.name)} | ${cell(c.data_type)} | ${cell(c.existing_comment)} | — | audit column (not sent) | — |`);
+        out.push(`| ${cell(c.name)} | ${cell(c.data_type)} |${tier} ${cell(c.existing_comment)} | — | audit column (not sent) | — |`);
         continue;
       }
       const replaced = replacesNonStandard(c.existing_comment, approvedByName.get(c.name)?.approved_comment ?? null, p.comment, commentIsStandard);
@@ -244,7 +250,7 @@ export function metadataReviewMarkdown(o: MetadataOutcome): string {
       const approvedTags = ac?.approved_tags ?? {};
       const mark = !p.pii_tags && approvedTags.pii === "true" ? ` ${KEPT_PII_MARK}` : !sameTags(ac?.existing_tags, approvedTags) ? ` ${tagsChangedMark(ac?.existing_tags, approvedTags)}` : "";
       const pii = cell(`${approvedTags.pii === "true" ? `${approvedTags.pii_type} (${approvedTags.sensitivity}, masking ${approvedTags.requires_masking})` : "—"}${mark}`);
-      out.push(`| ${cell(c.name)} | ${cell(c.data_type)} | ${cell(c.existing_comment)} | ${cell(p.comment)}${replaced ? ` ${REPLACES_MARK}` : ""} | ${p.confidence} | ${pii} |`);
+      out.push(`| ${cell(c.name)} | ${cell(c.data_type)} |${tier} ${cell(c.existing_comment)} | ${cell(p.comment)}${replaced ? ` ${REPLACES_MARK}` : ""} | ${p.confidence} | ${pii} |`);
     }
     const insufficient = t.proposal.columns.filter((c) => c.comment === null);
     if (d.comment === null || insufficient.length) {
@@ -332,7 +338,7 @@ function standardsDraftRow(o: MetadataOutcome, t: TableOutcome, standards: Metad
     existing_description: ev.existing_description,
     approved_description: description,
     existing_tags: existingTags,
-    approved_tags: deriveTableTags(classification, standards, medallionLayer(t.table) ?? "", anyColumnPii),
+    approved_tags: deriveTableTags(classification, standards, evidenceLayer(ev) ?? "", anyColumnPii),
     columns,
     provenance: draftProvenance(o, t),
   };
@@ -501,7 +507,7 @@ function standardsRowProblems(line: number, row: ApprovedRow, t: TableOutcome, s
   const business = known.filter((c) => !isAuditColumn(c.name));
   const anyColumnPii = business.some((c) => c.approved_tags?.pii === "true");
   const tags = row.approved_tags ?? {};
-  problems.push(...tableTagProblems(tags, { ...std, layer: medallionLayer(row.table) }, anyColumnPii).map((m) => at(`approved_tags: ${m}`)));
+  problems.push(...tableTagProblems(tags, { ...std, layer: evidenceLayer(ev) }, anyColumnPii).map((m) => at(`approved_tags: ${m}`)));
 
   const desc = row.approved_description;
   if (desc === null) res.nullValues!.push(`${row.table} description`);

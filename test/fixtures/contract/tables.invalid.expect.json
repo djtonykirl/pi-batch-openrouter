@@ -1,0 +1,8 @@
+[
+  {"line": 1, "v1": "fail", "v2": "fail", "reason": "unknown table-level field 'owner' (additionalProperties false)"},
+  {"line": 2, "v1": "fail", "v2": "fail", "reason": "existing_comment is an empty string; the exporter must write '' as null (minLength 1)"},
+  {"line": 3, "v1": "fail", "v2": "fail", "reason": "v1: 'profile' is unknown. v2: sample_values on a disclosure_tier 2 column"},
+  {"line": 4, "v1": "fail", "v2": "fail", "reason": "v1: 'contract_version' is unknown. v2: contract_version '2' requires a profile on every column"},
+  {"line": 5, "v1": "fail", "v2": "fail", "reason": "table name is two-part; must be catalog.schema.table"},
+  {"line": 6, "v1": "pass", "v2": "pass", "reason": "schema-valid but Pi rejects it: duplicate column names compared case-insensitively (Sector / SECTOR). The exporter must check this itself"}
+]

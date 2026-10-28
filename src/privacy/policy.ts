@@ -1,3 +1,4 @@
+import { providerAllowed } from "../openrouter/routing.js";
 import type { ProviderPin } from "../openrouter/types.js";
 
 /** Pure privacy policy: no I/O. Decides what provider fields a request may carry, or refuses. */
@@ -52,8 +53,11 @@ export function resolveBatchProvider(input: {
   userPin?: ProviderPin;
   catalog?: CatalogView;
   accountNoTraining: boolean;
+  /** routing.allowedProviders (trimmed); at zdr the ZDR endpoint tags are intersected with it. Empty or absent: no restriction. */
+  allowedProviders?: readonly string[];
 }): ProviderDecision {
   const { level, model, userPin, catalog, accountNoTraining } = input;
+  const allow = input.allowedProviders ?? [];
   if (level === "standard") return { ok: true, provider: userPin, enforcement: "none" };
   if (level === "no-training") {
     if (accountNoTraining) return { ok: true, provider: userPin, enforcement: "account attested no-training" };
@@ -71,7 +75,12 @@ export function resolveBatchProvider(input: {
   }
   const slug = normaliseModelSlug(model);
   let only = [...new Set(catalog.zdr.filter((e) => e.model === slug).map((e) => e.provider))].sort();
-  if (userPin) only = only.filter((p) => userPin.only.includes(p));
+  if (allow.length && only.length) {
+    only = only.filter((p) => providerAllowed(allow, p));
+    if (only.length === 0) return { ok: false, reason: `Privacy level zdr: no ZDR provider for ${slug} within routing.allowedProviders (${allow.join(", ")})` };
+  }
+  // routing.allowFallbacks never applies here: the ZDR pin is always without fallbacks.
+  if (userPin) only = only.filter((p) => providerAllowed(userPin.only, p));
   if (only.length === 0) {
     return {
       ok: false,

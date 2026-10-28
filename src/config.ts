@@ -48,6 +48,19 @@ export interface BatchConfig {
   chat: { autoCompact: boolean; autoCompactTokens: number; keepRecentExchanges: number; retitleAtTurn: number; systemPrompt: string };
   /** Per-project privacy level and the account-level attestations behind it. */
   privacy: { level: PrivacyLevel; accountNoTraining: boolean; deleteRemoteBatches: boolean; noticeShown: boolean; /** ISO time of the no-training attestation (set with accountNoTraining, removed on unattest). */ attestedAt?: string };
+  /**
+   * Provider routing policy. allowedProviders becomes `provider.only` on every batch.
+   * ZDR and data-collection rules cannot be sent with a batch; the require* flags block
+   * planning unless the matching account* attestation says the OpenRouter account enforces them.
+   */
+  routing: {
+    allowedProviders: string[];
+    allowFallbacks: boolean;
+    requireZdr: boolean;
+    accountZdrEnforced: boolean;
+    requireNoDataCollection: boolean;
+    accountDataCollectionDenied: boolean;
+  };
 }
 
 export const DEFAULT_CONFIG: BatchConfig = {
@@ -88,6 +101,7 @@ export const DEFAULT_CONFIG: BatchConfig = {
       "You are a helpful, knowledgeable assistant in an ongoing conversation. Answer clearly and directly. Use Markdown where it helps.",
   },
   privacy: { level: "standard", accountNoTraining: false, deleteRemoteBatches: true, noticeShown: false },
+  routing: { allowedProviders: [], allowFallbacks: true, requireZdr: false, accountZdrEnforced: false, requireNoDataCollection: false, accountDataCollectionDenied: false },
 };
 
 export const GLOBAL_CONFIG_DIR = path.join(os.homedir(), ".pi", "agent", "pi-batch-openrouter");
@@ -203,6 +217,14 @@ const SCHEMA: Record<string, Check | Record<string, Check>> = {
     systemPrompt: str,
   },
   privacy: { level: isPrivacyLevel, accountNoTraining: bool, deleteRemoteBatches: bool, noticeShown: bool, attestedAt: (v) => typeof v === "string" && !Number.isNaN(Date.parse(v)) },
+  routing: {
+    allowedProviders: (v) => Array.isArray(v) && v.length <= 50 && v.every((x) => typeof x === "string" && /^[a-z0-9][a-z0-9._/-]{0,99}$/i.test(x)),
+    allowFallbacks: bool,
+    requireZdr: bool,
+    accountZdrEnforced: bool,
+    requireNoDataCollection: bool,
+    accountDataCollectionDenied: bool,
+  },
 };
 
 /** Validates field-by-field; invalid fields revert to defaults and are reported. Unknown keys are reported. */

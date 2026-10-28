@@ -2,6 +2,7 @@ import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { parseArgs, tokenize, type ParsedArgs } from "./args.js";
 import { saveConfigUpdate } from "./config.js";
+import { formatPin } from "./openrouter/routing.js";
 import { BatchDashboardComponent, TextViewerComponent, describeJob, itemsCell, retentionLine } from "./dashboard.js";
 import { discoverBatchModels } from "./models.js";
 import { INJECTED_MESSAGE_TYPE, type BatchRuntime } from "./runtime.js";
@@ -364,7 +365,7 @@ function formatPreview(p: PreparedAsk, previewOnly: boolean): string {
     "",
     `Objective:    ${p.options.objective.replace(/\s+/g, " ").slice(0, 100)}`,
     `Model:        ${p.model}`,
-    `Account:      ${p.account}${p.pin ? `   Provider pin: ${p.pin.only.join(",")} (no fallbacks)` : ""}`,
+    `Account:      ${p.account}${p.pin ? `   Provider pin: ${formatPin(p.pin)}` : ""}`,
     `Files:        ${p.pkg.files.length}${p.pkg.files.length ? `  (${p.pkg.files.slice(0, 5).map((f) => f.relPath).join(", ")}${p.pkg.files.length > 5 ? ", …" : ""})` : ""}`,
     `Characters:   ${p.pkg.characters}  (context package; not a token count)`,
     `Excluded:     ${p.pkg.excluded.length}${p.pkg.excluded.length ? `  (${p.pkg.excluded.slice(0, 4).map((e) => `${e.relPath} [${e.layer}]`).join(", ")}${p.pkg.excluded.length > 4 ? ", …" : ""})` : ""}`,
@@ -715,7 +716,7 @@ export function formatDatasetPreview(p: PreparedDatasetRun, previewOnly: boolean
       `Fields sent:       ${def.input.fields.join(", ")}  (only these reach the model; other columns are not read into prompts)`,
       `Model:             ${p.model}`,
       `Account:           ${p.account}`,
-      `Provider pin:      ${p.pin ? `${p.pin.only.join(",")} (no fallbacks)` : "none"}`,
+      `Provider pin:      ${formatPin(p.pin)}`,
       `Output:            ${def.output.type === "json" ? "json — validated locally against the workflow's JSON Schema; invalid output makes the item corrupt" : "markdown"}`,
       `Characters:        ${plan.totalCharacters} provider-bound (not a token count; no cost estimate is made)`,
       `Largest item:      ${plan.largest ? `${plan.largest.characters} characters (${plan.largest.label})` : "-"}`,
@@ -834,7 +835,7 @@ function formatPlanPreview(p: PreparedPlan, previewOnly: boolean): string {
     `Objective:         ${p.options.objective.replace(/\s+/g, " ").slice(0, 100)}`,
     `Model:             ${p.model}`,
     `Account:           ${p.account}`,
-    `Provider pin:      ${p.pin ? `${p.pin.only.join(",")} (no fallbacks)` : "none"}`,
+    `Provider pin:      ${formatPin(p.pin)}`,
     `Requests:          ${p.items.length}`,
     `Selected files:    ${p.pkg.files.length}`,
     `Total characters:  ${p.totalCharacters}  (prompt characters; not a token count)`,
@@ -944,7 +945,7 @@ function formatSynthesisPreview(p: PreparedSynthesis, previewOnly: boolean): str
     "",
     `Source job:        ${p.sourceJobId}`,
     `Model:             ${p.model}`,
-    `Provider pin:      ${p.pin ? `${p.pin.only.join(",")} (no fallbacks)` : "none"}`,
+    `Provider pin:      ${formatPin(p.pin)}`,
     `Expected items:    ${c.expected}`,
     `Included items:    ${c.included}`,
     `Unusable items:    ${c.unusable.length}  (failed ${c.failed}, corrupt ${c.corrupt}, missing ${c.missing}${c.noResult ? `, no result ${c.noResult}` : ""})`,

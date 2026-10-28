@@ -1,0 +1,6 @@
+{"table":"demo_catalog.beverage.product","existing_description":null,"owner":"Data Ops","columns":[{"name":"product_id","data_type":"STRING","nullable":false,"existing_comment":null}]}
+{"table":"demo_catalog.beverage.product","existing_description":null,"columns":[{"name":"product_id","data_type":"STRING","nullable":false,"existing_comment":""}]}
+{"table":"demo_catalog.lighthouse_silver.PNPT_location_data","existing_description":null,"columns":[{"name":"LAT_QTY","data_type":"DECIMAL(38,18)","nullable":true,"existing_comment":null,"sample_values":[51.5,52.1],"profile":{"disclosure_tier":2,"tier_reason":"geolocation measure"}}]}
+{"table":"demo_catalog.lighthouse_silver.PNPT_location_data","existing_description":null,"contract_version":"2","columns":[{"name":"Sector","data_type":"STRING","nullable":true,"existing_comment":null}]}
+{"table":"lighthouse_silver.PNPT_location_data","existing_description":null,"columns":[{"name":"Sector","data_type":"STRING","nullable":true,"existing_comment":null}]}
+{"table":"demo_catalog.lighthouse_silver.PNPT_location_data","existing_description":null,"columns":[{"name":"Sector","data_type":"STRING","nullable":true,"existing_comment":null},{"name":"SECTOR","data_type":"STRING","nullable":true,"existing_comment":null}]}

@@ -13,6 +13,7 @@ import type { ModelCatalog } from "./models/catalog.js";
 import { OpenRouterBatchClient, OpenRouterError, type RawExchange } from "./openrouter/client.js";
 import { immediateResultId, runImmediateJob, type ImmediateItemState, type ImmediateProgress } from "./openrouter/immediate.js";
 import { normaliseBatchResult, type NormalisedBatchResult } from "./openrouter/normalise-result.js";
+import { accountRequirementBlockers, allowListPin, allowedProviders, pinOutsideAllowList, resolveRouting } from "./openrouter/routing.js";
 import { buildSubmitBody, messageText, submitBodyProblems, type BatchRequestItem, type ChatMessage, type ProviderPin, type SubmitBody } from "./openrouter/types.js";
 import { effectiveLevel, resolveBatchProvider, routeForModel, stricter, type PrivacyLevel, type Route } from "./privacy/policy.js";
 import { compileOutputSchema, type OutputValidator } from "./workflows/structured.js";
@@ -376,7 +377,8 @@ export class BatchService {
     const objective = options.objective.trim();
     const model = normalizeBatchModelSlug(options.model ?? config.defaultModel);
     const account = options.account ?? config.defaultAccount;
-    const pin: ProviderPin | undefined = options.providerPin ? { only: [options.providerPin], allow_fallbacks: false } : undefined;
+    const routing = resolveRouting(config, options.providerPin, this.privacyConfig().level);
+    const pin = routing.pin;
     const knownSecrets = await this.knownSecrets(account);
     const pkg = buildContextPackage({
       workspaceRoot: this.deps.workspaceRoot,
@@ -390,7 +392,7 @@ export class BatchService {
       gitIgnored: this.deps.gitIgnored,
     });
 
-    const blockers: string[] = [];
+    const blockers: string[] = [...routing.blockers];
     if (!objective) blockers.push("objective is empty");
     for (const p of pkg.problems) blockers.push(p.message);
     if (pkg.secretFindings.length > 0 && config.security.blockOnSecret) blockers.push(formatSecretFindings(pkg.secretFindings));
@@ -603,6 +605,13 @@ export class BatchService {
     const privacy = this.privacyConfig();
     const level = effectiveLevel(privacy.level, draft.privacyLevel);
     const route = routeForModel(draft.model, draft.route);
+    // routing.require* checked here, where the effective level (a chat thread's included) is known: zdr and
+    // no-training satisfy them (per request on the immediate route; by the ZDR pin or the attested account on batch).
+    const unmet = accountRequirementBlockers(config, level);
+    if (unmet.length) {
+      this.logger.log("warn", "routing_refused", { kind: draft.kind, level, model: draft.model });
+      throw new SubmissionBlockedError(unmet.join("\n\n"));
+    }
     if (route === "immediate") {
       // Spec non-goal (v1): immediate requests outside batch chat need a rate-paced queue.
       if (draft.kind !== "chat") throw new SubmissionBlockedError(IMMEDIATE_CHAT_ONLY);
@@ -611,7 +620,11 @@ export class BatchService {
       return { route, privacy: { level, route, enforcement } };
     }
     const catalog = level === "zdr" ? await this.deps.catalog?.whenLoaded(config.polling.requestTimeoutSeconds * 1000) : undefined;
-    const decision = resolveBatchProvider({ level, model: draft.model, userPin: draft.pin, catalog, accountNoTraining: privacy.accountNoTraining });
+    // routing.allowedProviders restricts every batch: a pin outside it is refused, and a job without a pin (chat) gets it.
+    const outside = pinOutsideAllowList(config, draft.pin);
+    if (outside) throw new SubmissionBlockedError(outside);
+    const userPin = draft.pin ?? allowListPin(config);
+    const decision = resolveBatchProvider({ level, model: draft.model, userPin, catalog, accountNoTraining: privacy.accountNoTraining, allowedProviders: allowedProviders(config) });
     if (!decision.ok) {
       this.logger.log("warn", "privacy_refused", { kind: draft.kind, level, model: draft.model });
       throw new SubmissionBlockedError(decision.reason);
@@ -628,7 +641,8 @@ export class BatchService {
     const objective = options.objective.trim();
     const model = normalizeBatchModelSlug(options.model ?? config.defaultModel);
     const account = options.account ?? config.defaultAccount;
-    const pin: ProviderPin | undefined = options.providerPin ? { only: [options.providerPin], allow_fallbacks: false } : undefined;
+    const routing = resolveRouting(config, options.providerPin, this.privacyConfig().level);
+    const pin = routing.pin;
     const groupSize = options.groupSize ?? 1;
     const workflow: MapFilesWorkflowInfo = { name: MAP_FILES.name, version: MAP_FILES.version, options: { groupSize, format: options.format, includeInstructions: options.includeInstructions } };
 
@@ -645,7 +659,7 @@ export class BatchService {
       renderPackage: false,
     });
 
-    const blockers: string[] = [];
+    const blockers: string[] = [...routing.blockers];
     if (!objective) blockers.push("objective is empty");
     if (!Number.isInteger(groupSize) || groupSize < 1) blockers.push(`--group-size must be a positive integer (got ${options.groupSize})`);
     for (const p of pkg.problems) blockers.push(p.message);
@@ -781,7 +795,9 @@ export class BatchService {
     const def = entry.definition;
     const model = normalizeBatchModelSlug(options.model ?? def.model.default ?? config.defaultModel);
     const pinSlug = options.providerPin ?? def.model.provider;
-    const pin: ProviderPin | undefined = pinSlug ? { only: [pinSlug], allow_fallbacks: false } : undefined;
+    const routing = resolveRouting(config, pinSlug, this.privacyConfig().level);
+    const pin = routing.pin;
+    blockers.push(...routing.blockers);
     const maxTokens = def.request.maxTokens ?? config.request.maxTokens;
     // Workflow limits can only tighten the local configuration, never loosen it.
     const min = (a: number, b?: number) => (b === undefined ? a : Math.min(a, b));
@@ -937,7 +953,9 @@ export class BatchService {
     const blockers: string[] = [];
     const account = options.account ?? config.defaultAccount;
     const model = normalizeBatchModelSlug(options.model ?? config.defaultModel);
-    const pin: ProviderPin | undefined = options.providerPin ? { only: [options.providerPin], allow_fallbacks: false } : undefined;
+    const routing = resolveRouting(config, options.providerPin, this.privacyConfig().level);
+    const pin = routing.pin;
+    blockers.push(...routing.blockers);
     const base: PreparedMetadataRun = { options, model, account, pin, maxTokens: config.request.maxTokens, objective: "", contentSha256: "", blockers, warnings: [] };
     const mode = standardsFromOptions(options.domain, options.ucPrefix);
     if (mode.error) {
@@ -2034,12 +2052,13 @@ export class BatchService {
     }
     const model = normalizeBatchModelSlug(opts.model ?? config.defaultModel);
     const account = opts.account ?? source.account;
-    const pin: ProviderPin | undefined = opts.providerPin ? { only: [opts.providerPin], allow_fallbacks: false } : undefined;
+    const routing = resolveRouting(config, opts.providerPin, this.privacyConfig().level);
+    const pin = routing.pin;
     const coverage = this.coverage(sourceJobId);
 
     const included: SynthesisInputItem[] = [];
     const unusable: SynthesisUnusable[] = [];
-    const blockers: string[] = [];
+    const blockers: string[] = [...routing.blockers];
     for (const e of coverage.entries) {
       const label = sourceLabel(e.root);
       if (e.usable) {

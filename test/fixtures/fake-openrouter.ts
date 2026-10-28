@@ -86,6 +86,10 @@ export function validateSubmission(bodyText: string): { status: number; message:
   }
   const keys = Object.keys(body);
   if (keys[keys.length - 1] !== "requests") return { status: 400, message: "requests must come after endpoint/model/provider/completion_window" };
+  // Batch accepts only provider.only and provider.allow_fallbacks; sync preferences are rejected.
+  const provider = body.provider as Record<string, unknown> | undefined;
+  const unsupported = provider ? Object.keys(provider).filter((k) => k !== "only" && k !== "allow_fallbacks") : [];
+  if (unsupported.length) return { status: 400, message: `provider preferences not supported for batch: ${unsupported.join(", ")}` };
   const requests = body.requests as Array<{ custom_id?: unknown; body?: { model?: unknown } }>;
   if (!Array.isArray(requests) || requests.length === 0) return { status: 400, message: "requests must contain at least one item" };
   const seen = new Set<string>();

@@ -4,8 +4,8 @@ import { canonicalJson, sha256Hex } from "../fsutil.js";
 import type { BatchRequestItem, ChatMessage, ProviderPin } from "../openrouter/types.js";
 import type { ItemSource } from "../types.js";
 import { quoteBoundaryToken } from "../workflows/synthesis.js";
-import { PROPOSAL_SCHEMA, PROPOSAL_SCHEMA_V2, evidenceHash, identityKey, promptEvidence, tableEvidenceProblems, type TableEvidence } from "./contract.js";
-import { CLASSIFICATIONS, COLUMN_TYPES, hasUcPrefix, medallionLayer, type MetadataStandards } from "./standards.js";
+import { PROPOSAL_SCHEMA, PROPOSAL_SCHEMA_V2, evidenceHash, identityKey, promptEvidence, tableEvidenceProblems, usesV2Evidence, type TableEvidence } from "./contract.js";
+import { CLASSIFICATIONS, COLUMN_TYPES, domainPrefixMatches, evidenceLayer, hasUcPrefix, medallionLayer, type MetadataStandards } from "./standards.js";
 
 /**
  * Planning for the built-in `databricks-metadata` workflow: one Databricks table
@@ -57,6 +57,18 @@ export const METADATA_STANDARDS_INSTRUCTIONS = [
   "Do not propose data_domain, uc_prefix, medallion_layer or a table-level pii tag: they are derived outside this request.",
 ];
 
+/**
+ * Added only when a table's evidence uses contract v2 fields, so v1 prompts (and their
+ * request hashes) are unchanged.
+ */
+export const METADATA_V2_INSTRUCTIONS = [
+  "Some evidence is a profile computed inside Databricks instead of raw values. A column's profile.disclosure_tier says how much was disclosed: 0 = reference values may appear in sample_values; 1 = shape only (format_masks use A for an upper-case letter, a for a lower-case letter, 9 for a digit, other characters literally; len_min/len_max); 2 = numeric shape only (numeric_sign, magnitude_order as a power of ten, decimal_places); 3 = a semantic_label only.",
+  "Values were withheld deliberately. Never guess, reconstruct or invent example values, codes, names, ranges or identities that are not in the evidence.",
+  "Use layer, grain_candidates, upstream_tables, writer_logic, view_definition, join_hints, is_candidate_key and semantic_label to explain meaning, grain and relationships. A join hint means many values also occur in the named column; it is evidence, not proof, of a key relationship.",
+  "When a column has a profile.column_family_id, keep its meaning consistent with that family's entry in the domain context's column-family glossary, and add only what is specific to this table's layer (bronze: as received from the source; silver: cleansed and conformed; gold: business-ready).",
+  "Do not mention disclosure tiers, profiles, percentages or other profiling statistics in the comments themselves; write business documentation.",
+];
+
 export interface MetadataPlanInput {
   context: { relPath: string; bytes: Buffer; text: string };
   input: { relPath: string; bytes: Buffer; text: string };
@@ -90,6 +102,8 @@ export interface MetadataPlan {
   items: MetadataPlanItem[];
   tables: number;
   tablesWithSamples: number;
+  /** Tables whose evidence uses contract v2 fields. */
+  tablesV2: number;
   blankLines: number;
   totalCharacters: number;
   largest?: { characters: number; table: string };
@@ -144,8 +158,11 @@ export function parseTables(text: string): { records: Array<{ line: number; evid
 /** The exact user prompt for one table. In standards mode, audit columns are left out and the v2 schema applies. */
 export function renderMetadataPrompt(context: string, evidence: TableEvidence, standards?: MetadataStandards): string {
   const ctx = context.replace(/\r\n/g, "\n").replace(/\n+$/, "");
-  const ev = JSON.stringify(promptEvidence(evidence, standards), null, 2);
-  const instructions = standards ? [...METADATA_INSTRUCTIONS, ...METADATA_STANDARDS_INSTRUCTIONS] : METADATA_INSTRUCTIONS;
+  // Contract v2 guidance (from the evidence as sent: audit columns, and their profiles, are already left out in
+  // standards mode) and the standards instructions are independent; either, both or neither may apply.
+  const sent = promptEvidence(evidence, standards);
+  const ev = JSON.stringify(sent, null, 2);
+  const instructions = [...METADATA_INSTRUCTIONS, ...(usesV2Evidence(sent) ? METADATA_V2_INSTRUCTIONS : []), ...(standards ? METADATA_STANDARDS_INSTRUCTIONS : [])];
   const token = quoteBoundaryToken([ctx, ev]);
   return [
     heading("METADATA GENERATION INSTRUCTIONS"),
@@ -199,8 +216,21 @@ export function planMetadataRun(input: MetadataPlanInput): MetadataPlan {
     // R3: Pi blocks tables outside the domain prefix; the layer comes from the schema name (R1).
     const outside = parsed.records.filter((r) => !hasUcPrefix(r.evidence.table, standards.ucPrefix)).map((r) => `line ${r.line}: ${r.evidence.table}`);
     if (outside.length) blockers.push(listed(`tables whose name does not start with the uc prefix ${standards.ucPrefix} (standards mode)`, outside));
-    const noLayer = parsed.records.filter((r) => medallionLayer(r.evidence.table) === null).map((r) => `line ${r.line}: ${r.evidence.table}`);
+    // Contract v2 evidence (MetadataWorkflowInfo.version 2 is standards mode; the evidence's own
+    // contract_version is unrelated): its `layer` is the medallion layer, and must agree with the
+    // schema name; "other" is no medallion layer. Its `domain_prefix` must match --uc-prefix.
+    const other = parsed.records.filter((r) => r.evidence.layer === "other").map((r) => `line ${r.line}: ${r.evidence.table}`);
+    if (other.length) blockers.push(listed('tables whose evidence layer is "other", not a medallion layer (standards mode)', other));
+    const disagree = parsed.records
+      .filter((r) => r.evidence.layer !== undefined && r.evidence.layer !== "other" && medallionLayer(r.evidence.table) !== null && medallionLayer(r.evidence.table) !== r.evidence.layer)
+      .map((r) => `line ${r.line}: ${r.evidence.table} (evidence layer ${r.evidence.layer}, schema name ${medallionLayer(r.evidence.table)})`);
+    if (disagree.length) blockers.push(listed("tables whose evidence layer disagrees with the medallion layer in the schema name (standards mode)", disagree));
+    const noLayer = parsed.records.filter((r) => r.evidence.layer === undefined && evidenceLayer(r.evidence) === null).map((r) => `line ${r.line}: ${r.evidence.table}`);
     if (noLayer.length) blockers.push(listed("tables whose schema names no medallion layer (bronze, silver or gold) (standards mode)", noLayer));
+    const wrongDomain = parsed.records
+      .filter((r) => r.evidence.domain_prefix !== undefined && !domainPrefixMatches(r.evidence.domain_prefix, standards.ucPrefix))
+      .map((r) => `line ${r.line}: ${r.evidence.table} (domain_prefix ${r.evidence.domain_prefix})`);
+    if (wrongDomain.length) blockers.push(listed(`tables whose evidence domain_prefix does not match the uc prefix ${standards.ucPrefix} (standards mode)`, wrongDomain));
   }
 
   const items: MetadataPlanItem[] = [];
@@ -257,6 +287,7 @@ export function planMetadataRun(input: MetadataPlanInput): MetadataPlan {
     items,
     tables: parsed.records.length,
     tablesWithSamples: items.filter((it) => it.hasSamples).length,
+    tablesV2: items.filter((it) => usesV2Evidence(promptEvidence(it.evidence, standards))).length,
     blankLines: parsed.blankLines,
     totalCharacters,
     ...(largestItem ? { largest: { characters: largestItem.characters, table: largestItem.evidence.table } } : {}),

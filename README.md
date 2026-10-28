@@ -973,6 +973,13 @@ jobs keep working. The web UI's **UC Metadata** studio tab offers the same optio
 A table whose name does not start with the prefix, or whose schema has no `bronze`/`silver`/`gold` layer, blocks the
 plan and is listed.
 
+With [contract v2](#contract-v2-profile-evidence-phase-2) evidence, a table's `layer` is its medallion layer. It must agree
+with the layer in the schema name, and `layer: "other"` blocks the table. A `domain_prefix` must equal `--uc-prefix`
+without its trailing `_` (case-insensitive; `PNPT` matches `PNPT_`). Each mismatch blocks the plan and lists the table.
+The evidence's `contract_version` is unrelated to the job's workflow `version: 2` (standards mode). Both kinds of
+guidance can appear in one prompt. Audit columns are left out with their profiles, and the review can show both the
+**Tier** and the **PII** columns. Tables and columns may also carry optional `existing_tags`, which standards mode uses.
+
 **Description and comment rules.**
 - A table description has the lines `GRAIN:`, `PURPOSE:`, `SOURCE:`, `REFRESH:`, `OWNER:` and `CLASSIFICATION:`, in
   that order, and is at least 30 characters. Use a team name on the `OWNER:` line: an email address there is flagged as
@@ -1013,6 +1020,78 @@ and metadata stripped before sending, so nothing from cell outputs reaches the p
 
 **Privacy.** Tables that carry `sample_values` put real data in the request. The preview warns when that happens at
 `standard`; use `zdr` for such tables.
+
+### Contract v2: profile evidence (Phase 2)
+
+`tables.jsonl` also accepts **contract v2**, a strict superset of v1. It carries evidence that Databricks has
+already computed and obfuscated, so the model can describe a column without seeing its values. The schema
+mirrors the Databricks side's `contract/tables.v2.schema.json` field for field (a test checks this).
+
+- **v1 lines are unchanged.** Every v1 line is a valid v2 line, its `input_sha256` is the same, and its prompt
+  is byte-identical.
+- **Opting in:** `"contract_version": "2"` requires a `profile` on every column.
+- **Table-level fields:** `layer` (bronze, silver, gold, other), `domain_prefix`, `object_type`,
+  `row_count_band`, `write_cadence`, `grain_candidates`, `upstream_tables`, and sanitised `writer_logic` /
+  `view_definition`.
+- **Column `profile`:** `disclosure_tier` and `tier_reason` (required), `column_family_id`, `pct_null`,
+  `pct_unique`, `is_candidate_key`, `format_masks`, `len_min`/`len_max`, `numeric_sign`, `magnitude_order`,
+  `decimal_places`, `join_hints` and `semantic_label`.
+- **Tier rules, enforced by the schema:**
+  - 0 = reference values may appear in `sample_values`;
+  - 1 = shape only;
+  - 2 = numeric shape only (no masks or lengths);
+  - 3 = a semantic label only.
+  - `sample_values` are rejected on any column whose tier is 1–3.
+
+```json
+{"table": "c.lighthouse_gold.PNPT_vw_location_data", "existing_description": null, "contract_version": "2",
+ "layer": "gold", "object_type": "VIEW", "upstream_tables": ["c.lighthouse_silver.PNPT_location_data"],
+ "columns": [{"name": "Sector", "data_type": "STRING", "nullable": true, "existing_comment": null,
+              "sample_values": ["Beverages", "Foods"],
+              "profile": {"disclosure_tier": 0, "tier_reason": "low-cardinality reference value",
+                          "column_family_id": "sector", "pct_null": 0.4}}]}
+```
+
+When a table uses any v2 field, its prompt gets extra guidance:
+- values were withheld on purpose, so never guess them;
+- what each tier and the mask letters mean (`A`, `a`, `9`);
+- use layer, grain, lineage and join hints;
+- keep `column_family_id` columns consistent with the context's column-family glossary;
+- keep profiling statistics out of the comments.
+
+The preview counts v2 tables. The review shows each table's layer and object type, and adds a **Tier** column.
+
+### Provider routing and account privacy
+
+The Batch API accepts only `provider.only` and `provider.allow_fallbacks`. Sync preferences such as `order`,
+`sort`, `zdr` and `data_collection` are rejected ([batch quickstart](https://openrouter.ai/docs/batch-quickstart),
+checked 2026-10-21). So:
+
+- `routing.allowedProviders` becomes `provider.only` on **every** batch: an allow-list.
+  - `routing.allowFallbacks` controls fallback **within** that list.
+  - An explicit `--provider` pin must be in the list, or planning is blocked.
+- **Zero data retention and data-collection rules cannot be sent with a batch.** Enforce them in the OpenRouter
+  account's privacy settings, or with a guardrail on the API key.
+  - Set `routing.requireZdr` and/or `routing.requireNoDataCollection` to make them local policy.
+  - Planning is then blocked until you attest that the account enforces them, with `routing.accountZdrEnforced` /
+    `routing.accountDataCollectionDenied`.
+  - The tool cannot verify the account setting. The attestation is yours.
+  - OpenRouter publishes its ZDR endpoints at `https://openrouter.ai/api/v1/endpoints/zdr`.
+
+The metadata preview shows the effective pin, the privacy level and the account-privacy policy.
+
+**How `routing.*` relates to [privacy levels](#privacy-levels-and-free-models).** Both apply to every job.
+- **At `standard` and `no-training`**, `routing.allowedProviders` is the pin as described above.
+- **At `zdr`**, the job is pinned to the model's ZDR endpoints that the allow-list admits, always without fallbacks.
+  - An entry admits a ZDR endpoint tag equal to it, or one whose base provider it names (`azure` admits `azure/eu`).
+  - `routing.allowFallbacks` is ignored at this level.
+  - If no ZDR endpoint is left, the job is refused: `Privacy level zdr: no ZDR provider for <model> within routing.allowedProviders (…)`.
+- **The account requirements can be met by the level:**
+  - `routing.requireZdr` is met by `routing.accountZdrEnforced`, or by an effective level of `zdr` (the job is pinned to ZDR endpoints).
+  - `routing.requireNoDataCollection` is met by `routing.accountDataCollectionDenied`, or by `no-training` or `zdr`.
+    On the batch route, `no-training` already needs the no-training attestation.
+  - On the immediate route (free models in batch chat), `no-training` and `zdr` send `data_collection: "deny"` / `zdr: true` per request.
+  - Planning checks this with the project level. Job creation checks it again with the effective level, including a chat thread's own level.
 
 ## What happens to your data
 
@@ -1127,7 +1206,8 @@ Invalid values fall back to the default and are reported. Legacy keys (`defaultP
   "injection": { "maxCharacters": 30000, "includeObjective": true, "includeArtefactPaths": true },
   "submission": { "showPreview": true, "requireConfirmation": false },
   "workflows": { "maxRequestsPerBatch": 100, "maxCharactersPerItem": 500000, "maxTotalCharacters": 5000000, "maxSynthesisCharacters": 1000000, "maxRowsPerRun": 1000, "maxDatasetBytes": 20000000 },
-  "privacy": { "level": "standard", "accountNoTraining": false, "deleteRemoteBatches": true, "noticeShown": false }
+  "privacy": { "level": "standard", "accountNoTraining": false, "deleteRemoteBatches": true, "noticeShown": false },
+  "routing": { "allowedProviders": [], "allowFallbacks": true, "requireZdr": false, "accountZdrEnforced": false, "requireNoDataCollection": false, "accountDataCollectionDenied": false }
 }
 ```
 
@@ -1135,7 +1215,8 @@ These are application defaults (local policy), not OpenRouter limits. OpenRouter
 payload limit and no maximum request count. Setting `excludePatterns` replaces the whole list. The
 `workflows` section is optional; Release 1 configuration files keep working unchanged. For dataset workflows,
 `maxRowsPerRun` caps the selected rows (each row is one request) and `maxDatasetBytes` the dataset file size.
-A workflow's own `limits` can only lower these.
+A workflow's own `limits` can only lower these. The `routing` section is described in
+[Provider routing and account privacy](#provider-routing-and-account-privacy); with its defaults nothing changes.
 
 The `privacy` section is described in [Privacy levels and free models](#privacy-levels-and-free-models). `/batch privacy attest` also writes `privacy.attestedAt` (an ISO time) next to `accountNoTraining`.
 

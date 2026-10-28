@@ -7,6 +7,7 @@ import { isUsable, itemText, jobItems } from "../items.js";
 import { nullLogger, type Logger } from "../logger.js";
 import { normalizeBatchModelSlug } from "../models.js";
 import { immediateRouteAllowed, immediateRouteRefusal } from "../models/catalog.js";
+import { allowedProviders } from "../openrouter/routing.js";
 import {
   effectiveLevel as effectiveLevelOf,
   normaliseModelSlug,
@@ -312,7 +313,7 @@ export class ChatService {
     const level = effectiveLevelOf(privacy.level, thread.privacyLevel);
     const catalog = level === "zdr" ? await this.deps.batch.catalog?.whenLoaded(config.polling.requestTimeoutSeconds * 1000) : undefined;
     if (route === "batch") {
-      const d = resolveBatchProvider({ level, model: to, userPin: thread.providerPin, catalog, accountNoTraining: privacy.accountNoTraining });
+      const d = resolveBatchProvider({ level, model: to, userPin: thread.providerPin, catalog, accountNoTraining: privacy.accountNoTraining, allowedProviders: allowedProviders(config) });
       if (!d.ok) throw new Error(d.reason);
     } else if (level === "zdr") {
       const base = normaliseModelSlug(to);

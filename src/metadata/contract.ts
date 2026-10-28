@@ -4,7 +4,7 @@ import { formatErrors } from "../workflows/structured.js";
 import { BOOLEAN_TAG, CLASSIFICATIONS, PII_TYPES, SENSITIVITIES, columnCommentProblems, descriptionProblems, isAuditColumn, piiTextProblems, type MetadataStandards, type PiiTags } from "./standards.js";
 
 /**
- * Phase 1 Databricks metadata enrichment: the data contracts.
+ * Databricks metadata enrichment: the data contracts.
  *
  *   tables.jsonl   one Databricks table per line (exported by Databricks)
  *   proposal       what the model must return for one table
@@ -13,6 +13,16 @@ import { BOOLEAN_TAG, CLASSIFICATIONS, PII_TYPES, SENSITIVITIES, columnCommentPr
  * All three are validated strictly: unknown fields are rejected, nothing is
  * coerced or defaulted. Only descriptions and column comments are in scope, plus
  * (in opt-in standards mode, see standards.ts) the classification and column PII tags.
+ *
+ * tables.jsonl contract v2 is a strict superset of v1: it adds optional,
+ * already-obfuscated evidence computed inside Databricks (a per-column `profile`
+ * and table-level layer/grain/lineage fields). Every v1 line is a valid v2 line and
+ * hashes exactly as before. The schema mirrors the Databricks side's
+ * `contract/tables.v2.schema.json` field for field (checked by test).
+ *
+ * Pi also accepts optional `existing_tags` (ungoverned UC tags) on tables and columns,
+ * used by standards mode; it is not part of the Databricks v2 contract file (see
+ * PI_TABLE_EVIDENCE_SCHEMA).
  */
 
 /** catalog.schema.table: three non-empty parts without whitespace, dots or control characters. */
@@ -24,6 +34,26 @@ const MAX_SAMPLES = 20;
 /** Ungoverned UC tags: key to string value. Key order is significant in the handoff. */
 export type TagMap = Record<string, string>;
 
+/** 0 open (reference values), 1 shape, 2 statistics, 3 label only. */
+export type DisclosureTier = 0 | 1 | 2 | 3;
+
+export interface ColumnProfile {
+  disclosure_tier: DisclosureTier;
+  tier_reason: string;
+  column_family_id?: string;
+  pct_null?: number;
+  pct_unique?: number;
+  is_candidate_key?: boolean;
+  format_masks?: Array<{ mask: string; pct: number }>;
+  len_min?: number;
+  len_max?: number;
+  numeric_sign?: "positive" | "negative" | "mixed" | "zero";
+  magnitude_order?: number;
+  decimal_places?: number;
+  join_hints?: Array<{ target_table: string; target_column: string; pct_overlap: number }>;
+  semantic_label?: string;
+}
+
 export interface ColumnEvidence {
   name: string;
   data_type: string;
@@ -31,6 +61,8 @@ export interface ColumnEvidence {
   existing_comment: string | null;
   existing_tags?: TagMap;
   sample_values?: Array<string | number | boolean | null>;
+  /** v2 only. */
+  profile?: ColumnProfile;
 }
 
 export interface TableEvidence {
@@ -38,6 +70,24 @@ export interface TableEvidence {
   existing_description: string | null;
   existing_tags?: TagMap;
   columns: ColumnEvidence[];
+  /** v2 only: "2" makes a profile required on every column. */
+  contract_version?: "2";
+  layer?: "bronze" | "silver" | "gold" | "other";
+  domain_prefix?: string;
+  object_type?: "MANAGED" | "EXTERNAL" | "VIEW" | "MATERIALIZED_VIEW" | "STREAMING_TABLE";
+  row_count_band?: "0" | "1-1K" | "1K-100K" | "100K-10M" | ">10M";
+  write_cadence?: "daily" | "weekly" | "monthly" | "adhoc" | "unknown";
+  grain_candidates?: string[][];
+  upstream_tables?: string[];
+  writer_logic?: string;
+  view_definition?: string;
+}
+
+const V2_TABLE_FIELDS = ["contract_version", "layer", "domain_prefix", "object_type", "row_count_band", "write_cadence", "grain_candidates", "upstream_tables", "writer_logic", "view_definition"] as const;
+
+/** True when a record uses any v2 field (table-level or a column profile). */
+export function usesV2Evidence(t: TableEvidence): boolean {
+  return V2_TABLE_FIELDS.some((k) => t[k] !== undefined) || t.columns.some((c) => c.profile !== undefined);
 }
 
 export interface ColumnProposal {
@@ -92,33 +142,122 @@ export interface ApprovedRow {
 const nullableText = { anyOf: [{ type: "string", minLength: 1, maxLength: 4000 }, { type: "null" }] };
 const tagMap = { type: "object", maxProperties: 50, propertyNames: { minLength: 1, maxLength: 255 }, additionalProperties: { type: "string", maxLength: 1000 } };
 
+/**
+ * tables.jsonl line, contract v2 (strict superset of v1). Tier rules are schema-enforced:
+ * sample_values only at tier 0 (or without a profile); no masks/lengths at tiers 2-3;
+ * no numeric shape at tier 3; contract_version "2" requires a profile on every column.
+ */
 export const TABLE_EVIDENCE_SCHEMA = {
   type: "object",
   additionalProperties: false,
   required: ["table", "existing_description", "columns"],
-  properties: {
-    table: { type: "string", pattern: TABLE_NAME_PATTERN, maxLength: 765 },
-    existing_description: nullableText,
-    existing_tags: tagMap,
-    columns: {
-      type: "array",
-      minItems: 1,
-      maxItems: 2000,
-      items: {
-        type: "object",
-        additionalProperties: false,
-        required: ["name", "data_type", "nullable", "existing_comment"],
-        properties: {
-          name: { type: "string", minLength: 1, maxLength: 255 },
-          data_type: { type: "string", minLength: 1, maxLength: 1000 },
-          nullable: { type: "boolean" },
-          existing_comment: nullableText,
-          existing_tags: tagMap,
-          sample_values: { type: "array", maxItems: MAX_SAMPLES, items: { anyOf: [{ type: "string", maxLength: 500 }, { type: "number" }, { type: "boolean" }, { type: "null" }] } },
+  definitions: {
+    tableName: { type: "string", pattern: TABLE_NAME_PATTERN, maxLength: 765 },
+    nullableText,
+    pct: { type: "number", minimum: 0, maximum: 100 },
+    profile: {
+      type: "object",
+      additionalProperties: false,
+      required: ["disclosure_tier", "tier_reason"],
+      properties: {
+        disclosure_tier: { type: "integer", minimum: 0, maximum: 3 },
+        tier_reason: { type: "string", minLength: 1, maxLength: 500 },
+        column_family_id: { type: "string", pattern: "^[a-z0-9_]{1,64}$" },
+        pct_null: { $ref: "#/definitions/pct" },
+        pct_unique: { $ref: "#/definitions/pct" },
+        is_candidate_key: { type: "boolean" },
+        format_masks: {
+          type: "array",
+          maxItems: 5,
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["mask", "pct"],
+            properties: {
+              mask: { type: "string", minLength: 1, maxLength: 64, pattern: "^[Aa9 ._/:,()#+\\-]+$" },
+              pct: { $ref: "#/definitions/pct" },
+            },
+          },
         },
+        len_min: { type: "integer", minimum: 0 },
+        len_max: { type: "integer", minimum: 0 },
+        numeric_sign: { enum: ["positive", "negative", "mixed", "zero"] },
+        magnitude_order: { type: "integer", minimum: -12, maximum: 18 },
+        decimal_places: { type: "integer", minimum: 0, maximum: 38 },
+        join_hints: {
+          type: "array",
+          maxItems: 5,
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["target_table", "target_column", "pct_overlap"],
+            properties: {
+              target_table: { $ref: "#/definitions/tableName" },
+              target_column: { type: "string", minLength: 1, maxLength: 255 },
+              pct_overlap: { $ref: "#/definitions/pct" },
+            },
+          },
+        },
+        semantic_label: { type: "string", minLength: 1, maxLength: 200 },
       },
+      allOf: [
+        {
+          if: { properties: { disclosure_tier: { minimum: 2 } } },
+          then: { not: { anyOf: [{ required: ["format_masks"] }, { required: ["len_min"] }, { required: ["len_max"] }] } },
+        },
+        {
+          if: { properties: { disclosure_tier: { const: 3 } } },
+          then: { not: { anyOf: [{ required: ["numeric_sign"] }, { required: ["magnitude_order"] }, { required: ["decimal_places"] }] } },
+        },
+      ],
+    },
+    column: {
+      type: "object",
+      additionalProperties: false,
+      required: ["name", "data_type", "nullable", "existing_comment"],
+      properties: {
+        name: { type: "string", minLength: 1, maxLength: 255 },
+        data_type: { type: "string", minLength: 1, maxLength: 1000 },
+        nullable: { type: "boolean" },
+        existing_comment: { $ref: "#/definitions/nullableText" },
+        sample_values: { type: "array", maxItems: MAX_SAMPLES, items: { anyOf: [{ type: "string", maxLength: 500 }, { type: "number" }, { type: "boolean" }, { type: "null" }] } },
+        profile: { $ref: "#/definitions/profile" },
+      },
+      if: { required: ["profile"], properties: { profile: { required: ["disclosure_tier"], properties: { disclosure_tier: { minimum: 1 } } } } },
+      then: { not: { required: ["sample_values"] } },
     },
   },
+  properties: {
+    table: { $ref: "#/definitions/tableName" },
+    existing_description: { $ref: "#/definitions/nullableText" },
+    columns: { type: "array", minItems: 1, maxItems: 2000, items: { $ref: "#/definitions/column" } },
+    contract_version: { const: "2" },
+    layer: { enum: ["bronze", "silver", "gold", "other"] },
+    domain_prefix: { type: "string", pattern: "^[A-Z0-9]{4}$" },
+    object_type: { enum: ["MANAGED", "EXTERNAL", "VIEW", "MATERIALIZED_VIEW", "STREAMING_TABLE"] },
+    row_count_band: { enum: ["0", "1-1K", "1K-100K", "100K-10M", ">10M"] },
+    write_cadence: { enum: ["daily", "weekly", "monthly", "adhoc", "unknown"] },
+    grain_candidates: { type: "array", maxItems: 5, items: { type: "array", minItems: 1, maxItems: 8, items: { type: "string", minLength: 1, maxLength: 255 } } },
+    upstream_tables: { type: "array", maxItems: 50, items: { $ref: "#/definitions/tableName" } },
+    writer_logic: { type: "string", minLength: 1, maxLength: 8000 },
+    view_definition: { type: "string", minLength: 1, maxLength: 8000 },
+  },
+  if: { required: ["contract_version"] },
+  then: { properties: { columns: { items: { required: ["profile"] } } } },
+} as const;
+
+/**
+ * What Pi validates tables.jsonl lines against: the Databricks contract above (kept a verbatim
+ * mirror) plus the optional `existing_tags` on the table and on each column (standards mode).
+ * Both are optional, so v1 and v2 lines validate and hash exactly as before.
+ */
+export const PI_TABLE_EVIDENCE_SCHEMA = {
+  ...TABLE_EVIDENCE_SCHEMA,
+  definitions: {
+    ...TABLE_EVIDENCE_SCHEMA.definitions,
+    column: { ...TABLE_EVIDENCE_SCHEMA.definitions.column, properties: { ...TABLE_EVIDENCE_SCHEMA.definitions.column.properties, existing_tags: tagMap } },
+  },
+  properties: { ...TABLE_EVIDENCE_SCHEMA.properties, existing_tags: tagMap },
 } as const;
 
 const confidenceProp = { enum: [...CONFIDENCE] };
@@ -236,8 +375,10 @@ const APPROVED_PROVENANCE = {
 /** The published approved.jsonl schema: tag keys allowed; validateApprovedText requires or rejects them by job version. */
 export const APPROVED_SCHEMA = approvedSchema("optional");
 
-const ajv = new Ajv({ allErrors: true, strict: true, strictTypes: false, coerceTypes: false, useDefaults: false, removeAdditional: false, logger: false });
-const tableValidator = ajv.compile(TABLE_EVIDENCE_SCHEMA);
+// strictRequired is off because the v2 tier rules use `if: { required: [...] }` conditionals
+// (an authoring check only; validation is unchanged).
+const ajv = new Ajv({ allErrors: true, strict: true, strictTypes: false, strictRequired: false, coerceTypes: false, useDefaults: false, removeAdditional: false, logger: false });
+const tableValidator = ajv.compile(PI_TABLE_EVIDENCE_SCHEMA);
 const proposalValidator = ajv.compile(PROPOSAL_SCHEMA);
 const proposalValidatorV2 = ajv.compile(PROPOSAL_SCHEMA_V2);
 const approvedValidatorV1 = ajv.compile(approvedSchema("none"));

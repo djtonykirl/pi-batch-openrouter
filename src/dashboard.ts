@@ -1,6 +1,7 @@
 import type { Component } from "@earendil-works/pi-tui";
 import { matchesKey, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { ACTIVE_STATUSES, TERMINAL_STATUSES as TERMINAL, type LocalStatus } from "./state.js";
+import { formatPin } from "./openrouter/routing.js";
 import { RETENTION_DELETED, RETENTION_KEPT } from "./privacy/policy.js";
 import { formatIsoShort } from "./time.js";
 import { sourceLabel } from "./items.js";
@@ -188,7 +189,7 @@ export function describeJob(job: JobManifest, storageDir?: string): string[] {
     ["Objective", job.objective.replace(/\s+/g, " ")],
     ["Model", job.model],
     ["Account", job.account],
-    ["Provider pin", job.providerPin ? `${job.providerPin.only.join(",")} (fallbacks ${job.providerPin.allow_fallbacks === false ? "off" : "on"})` : undefined],
+    ["Provider pin", job.providerPin ? formatPin(job.providerPin) : undefined],
     ["Parent job", job.parentJobId],
     ["Retry count", job.retryCount || undefined],
     ["Kind", job.kind && job.kind !== "goal" ? job.kind : undefined],
