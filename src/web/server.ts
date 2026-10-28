@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { ArtifactService } from "../artifacts/service.js";
 import { ArtifactStore } from "../artifacts/store.js";
-import { prepareAttachments, type AttachmentRequestInput, type UploadedFileInput } from "../attachments.js";
+import { isPdfPath, MAX_PDF_BYTES, prepareAttachments, type AttachmentRequestInput, type UploadedFileInput } from "../attachments.js";
 import { exportMarkdown, formatCost } from "../chat/commands.js";
 import { conversationOrder, estimateTokens } from "../chat/request.js";
 import { ChatService, PROJECT_INSTRUCTIONS_FILE } from "../chat/service.js";
@@ -233,10 +233,12 @@ export function inspectWorkspaceFiles(workspaceRoot: string, config: BatchConfig
       e.rule = cm.pattern;
       continue;
     }
-    if ((e.bytes ?? 0) > config.context.maxFileBytes) {
+    // A selected PDF is read as a PDF (text extracted), so its own limit applies.
+    const limit = isPdfPath(e.relPath) ? MAX_PDF_BYTES : config.context.maxFileBytes;
+    if ((e.bytes ?? 0) > limit) {
       e.selectable = false;
       e.excludedLayer = "too-large";
-      e.rule = `> ${config.context.maxFileBytes} B`;
+      e.rule = `> ${limit} B`;
     }
   }
   // The project's own batch configuration is never offered as an attachment (buildContextPackage's rules are unchanged).

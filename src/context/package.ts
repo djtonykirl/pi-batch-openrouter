@@ -61,6 +61,11 @@ export interface ContextPackage {
   /** The user message text exactly as it will be submitted. */
   contextText: string;
   characters: number;
+  /**
+   * Explicitly selected files that `passthrough` claimed: every path and exclusion rule was applied, but they were not
+   * read, size-checked or scanned here (the caller does that, e.g. PDF text extraction). Empty without `passthrough`.
+   */
+  passthrough: Array<{ relPath: string; absPath: string }>;
 }
 
 export interface PackageInput {
@@ -82,6 +87,12 @@ export interface PackageInput {
    * secret scan) still runs.
    */
   renderPackage?: boolean;
+  /**
+   * Claims explicitly selected (`files`) paths the caller reads itself, such as PDFs: they pass every path and
+   * exclusion rule, then go to `passthrough` instead of the text checks. Files found by expanding a context directory
+   * are never claimed.
+   */
+  passthrough?: (relPath: string) => boolean;
 }
 
 const KNOWN_TEXT_EXTENSIONS = new Set(
@@ -291,7 +302,12 @@ export function buildContextPackage(input: PackageInput): ContextPackage {
 
   // ---- 3. read, size/binary checks ----
   const files: SelectedFile[] = [];
+  const passthrough: ContextPackage["passthrough"] = [];
   for (const c of accepted) {
+    if (c.explicit && c.selectedBy === "file" && input.passthrough?.(c.relPath)) {
+      passthrough.push({ relPath: c.relPath, absPath: c.absPath });
+      continue;
+    }
     const notebook = isNotebookPath(c.relPath);
     let buf: Buffer;
     try {
@@ -354,7 +370,7 @@ export function buildContextPackage(input: PackageInput): ContextPackage {
     });
   }
 
-  if (input.contexts.length > 0 && files.length === 0 && problems.length === 0) {
+  if (input.contexts.length > 0 && files.length === 0 && passthrough.length === 0 && problems.length === 0) {
     warnings.push("context selection produced no files after exclusions");
   }
 
@@ -385,6 +401,7 @@ export function buildContextPackage(input: PackageInput): ContextPackage {
     warnings,
     contextText,
     characters: contextText.length,
+    passthrough,
   };
 }
 

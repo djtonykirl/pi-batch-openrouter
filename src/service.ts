@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { prepareAttachments, type ChatAttachmentMeta, type UploadedFileInput } from "./attachments.js";
+import { isPdfPath, prepareAttachments, type ChatAttachmentMeta, type UploadedFileInput } from "./attachments.js";
 import type { BatchConfig } from "./config.js";
 import { buildContextPackage, SYSTEM_PROMPT, type ContextPackage, type PackageInput } from "./context/package.js";
 import { formatSecretFindings, scanForSecrets } from "./context/secrets.js";
@@ -449,10 +449,12 @@ export class BatchService {
     const routing = resolveRouting(config, options.providerPin, this.privacyConfig().level);
     const pin = routing.pin;
     const knownSecrets = await this.knownSecrets(account);
+    // Selected workspace PDFs take the attachment PDF path (text extraction), like an uploaded PDF.
+    const pdfFiles = options.files.filter(isPdfPath);
     const pkg = buildContextPackage({
       workspaceRoot: this.deps.workspaceRoot,
       objective,
-      files: options.files,
+      files: options.files.filter((f) => !isPdfPath(f)),
       contexts: options.contexts,
       includeInstructions: options.includeInstructions,
       format: options.format,
@@ -469,12 +471,13 @@ export class BatchService {
     let uploadsMeta: ChatAttachmentMeta[] | undefined;
     let userText = pkg.contextText;
     let userParts: ChatMessage["parts"];
-    if (options.uploads && options.uploads.length > 0) {
+    if ((options.uploads && options.uploads.length > 0) || pdfFiles.length > 0) {
       const up = await prepareAttachments({
         workspaceRoot: this.deps.workspaceRoot,
         config,
         knownSecrets,
-        input: { uploads: options.uploads },
+        input: { files: pdfFiles, uploads: options.uploads ?? [] },
+        gitIgnored: this.deps.gitIgnored,
       });
       uploadsMeta = up.attachments;
       pkg.warnings.push(...up.warnings);

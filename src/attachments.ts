@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as path from "node:path";
 import { Worker } from "node:worker_threads";
@@ -74,7 +75,7 @@ export interface PreparedAttachments {
 
 const IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"]);
 const MAX_IMAGE_BYTES = 5_000_000;
-const MAX_PDF_BYTES = 10_000_000;
+export const MAX_PDF_BYTES = 10_000_000;
 /** Text extraction limits: one decompressed stream, and all streams of one PDF together. */
 const MAX_PDF_STREAM_OUTPUT = 16 * 1024 * 1024;
 const MAX_PDF_DECODED_TOTAL = 32 * 1024 * 1024;
@@ -373,6 +374,38 @@ export function formatAttachedFileBlock(label: string, content: string): string 
   return [heading(`FILE: ${label}`), "", body, "", "END FILE"].join("\n");
 }
 
+/** A `.pdf` path or name, case-insensitively. */
+export function isPdfPath(name: string): boolean {
+  return /\.pdf$/i.test(name);
+}
+
+/**
+ * A PDF in text mode: the text extracted locally (pdf-lib runs in a worker), scanned for secrets, as one inlined block.
+ * Never falls back to the raw file: a PDF without a text layer could not be scanned, so it is refused.
+ */
+async function pdfTextAttachment(
+  name: string,
+  buf: Buffer,
+  opts: { config: BatchConfig; knownSecrets: string[] },
+): Promise<{ ok: true; meta: Omit<ChatAttachmentMeta, "source">; block: string; findings: SecretFinding[] } | { ok: false; blocker: string }> {
+  const extracted = await extractPdfText(buf);
+  if (!extracted.ok) return { ok: false, blocker: `PDF "${name}": ${extracted.message}` };
+  if (!extracted.text) {
+    return {
+      ok: false,
+      blocker:
+        `PDF "${name}" has no extractable text layer (for example a scanned PDF), so it cannot be scanned for secrets. ` +
+        "It was not sent. To send the file itself, attach it in multimodal mode and confirm sending it unscanned.",
+    };
+  }
+  return {
+    ok: true,
+    meta: { kind: "pdf", name, mimeType: "application/pdf", bytes: buf.length, sha256: sha256Hex(buf), characters: extracted.text.length, mode: "text" },
+    block: formatAttachedFileBlock(`${name} (PDF, ${extracted.pages} page(s))`, extracted.text),
+    findings: opts.config.security.scanSecrets ? scanForSecrets(extracted.text, name, opts.knownSecrets) : [],
+  };
+}
+
 export async function prepareAttachments(opts: {
   workspaceRoot: string;
   config: BatchConfig;
@@ -406,6 +439,8 @@ export async function prepareAttachments(opts: {
       knownSecrets,
       gitIgnored: opts.gitIgnored,
       renderPackage: false,
+      // Selected PDFs pass every path and exclusion rule there, then take the upload PDF path below (text mode).
+      passthrough: isPdfPath,
     });
     excludedCount += pkg.excluded.length;
     warnings.push(...pkg.warnings);
@@ -422,6 +457,30 @@ export async function prepareAttachments(opts: {
         characters: f.characters,
       });
       textBlocks.push(formatAttachedFileBlock(f.relPath, f.content));
+    }
+    // Workspace PDFs: the same size limit and text extraction (worker) as an uploaded PDF in its default text mode.
+    // Multimodal stays an upload-only, per-file opt-in, so a workspace PDF is never sent unscanned.
+    for (const f of pkg.passthrough) {
+      let buf: Buffer;
+      try {
+        const size = fs.statSync(f.absPath).size;
+        if (size > MAX_PDF_BYTES) {
+          blockers.push(`PDF "${f.relPath}" is ${size} bytes (limit ${MAX_PDF_BYTES})`);
+          continue;
+        }
+        buf = fs.readFileSync(f.absPath);
+      } catch (err) {
+        blockers.push(`cannot read ${f.relPath}: ${(err as Error).message}`);
+        continue;
+      }
+      const r = await pdfTextAttachment(f.relPath, buf, { config, knownSecrets });
+      if (!r.ok) {
+        blockers.push(r.blocker);
+        continue;
+      }
+      secretFindings.push(...r.findings);
+      attachments.push({ ...r.meta, source: "workspace", name: path.posix.basename(f.relPath), path: f.relPath });
+      textBlocks.push(r.block);
     }
   }
 
@@ -514,33 +573,14 @@ export async function prepareAttachments(opts: {
       }
 
       // Default mode === "text": extract text locally, scan for secrets, and inline
-      const extracted = await extractPdfText(buf);
-      if (!extracted.ok) {
-        blockers.push(`PDF "${name}": ${extracted.message}`);
+      const r = await pdfTextAttachment(name, buf, { config, knownSecrets });
+      if (!r.ok) {
+        blockers.push(r.blocker);
         continue;
       }
-      if (!extracted.text) {
-        // Never fall back to sending the raw file: it could not be scanned for secrets.
-        blockers.push(
-          `PDF "${name}" has no extractable text layer (for example a scanned PDF), so it cannot be scanned for secrets. ` +
-            "It was not sent. To send the file itself, attach it in multimodal mode and confirm sending it unscanned.",
-        );
-        continue;
-      }
-      if (config.security.scanSecrets) {
-        secretFindings.push(...scanForSecrets(extracted.text, name, knownSecrets));
-      }
-      attachments.push({
-        source: "upload",
-        kind: "pdf",
-        name,
-        mimeType: "application/pdf",
-        bytes: buf.length,
-        sha256,
-        characters: extracted.text.length,
-        mode: "text",
-      });
-      textBlocks.push(formatAttachedFileBlock(`${name} (PDF, ${extracted.pages} page(s))`, extracted.text));
+      secretFindings.push(...r.findings);
+      attachments.push({ ...r.meta, source: "upload" });
+      textBlocks.push(r.block);
       continue;
     }
 
