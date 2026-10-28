@@ -66,10 +66,15 @@ const DAILY_PATTERN = /daily|per[\s_-]?day|free-models-per-day/i;
 /** A 200 body's error object that is really a rate limit (e.g. "… is temporarily rate-limited upstream. Please retry shortly"). */
 const RATE_LIMIT_MESSAGE_PATTERN = /rate-limited upstream|rate limit/i;
 
-/** Whether an error object in a 200 body is a rate limit: code 429 (number or string), or a rate-limit message. */
+/**
+ * Whether an error object in a 200 body is a rate limit: code 429 (number or string), or a rate-limit message when the
+ * code is absent or 5xx. Any other code (e.g. 400 "… exceeds the rate limit field …") is the error it says it is.
+ */
 export function isRateLimitErrorObject(err: Record<string, unknown>): boolean {
-  if (err.code === 429 || err.code === "429") return true;
-  return typeof err.message === "string" && RATE_LIMIT_MESSAGE_PATTERN.test(err.message);
+  const code = typeof err.code === "string" && /^[0-9]+$/.test(err.code) ? Number(err.code) : err.code;
+  if (code === 429) return true;
+  const codeAllows = code === undefined || code === null || (typeof code === "number" && code >= 500 && code <= 599);
+  return codeAllows && typeof err.message === "string" && RATE_LIMIT_MESSAGE_PATTERN.test(err.message);
 }
 
 /** The synthetic batch ID of an immediate job's final response (never a provider batch ID). */
@@ -181,14 +186,14 @@ async function callOnce(
     if (body && err && !Array.isArray(body.choices)) {
       const message = typeof err.message === "string" && err.message ? err.message : JSON.stringify(err).slice(0, 500);
       // An upstream rate limit can arrive as a 200 with an error object: reschedule it exactly like an HTTP 429.
-      if (isRateLimitErrorObject(err)) return rateLimited(job, raw.bodyText, 0, message, now, raw.bodyText);
+      if (isRateLimitErrorObject(err)) return rateLimited(job, raw.bodyText, 0, message, now, raw.status, raw.bodyText);
       return { item: { state: "failed", at: at(), code: "provider_error", message, status: raw.status, bodyText: raw.bodyText } };
     }
     return { item: { state: "completed", at: at(), status: raw.status, bodyText: raw.bodyText } };
   } catch (e) {
     if (e instanceof OpenRouterError && e.httpStatus === 429) {
       const c = classify429({ status: 429, bodyText: e.rawBody ?? e.detail, ...(e.retryAfter !== undefined ? { headers: { "retry-after": e.retryAfter } } : {}) });
-      return rateLimited(job, e.rawBody ?? e.detail, c.retryAfterMs, `HTTP 429 (rate limited): ${e.detail}`, now, e.rawBody);
+      return rateLimited(job, e.rawBody ?? e.detail, c.retryAfterMs, `HTTP 429 (rate limited): ${e.detail}`, now, 429, e.rawBody);
     }
     if (e instanceof OpenRouterError && e.httpStatus !== undefined) {
       // A definite HTTP rejection: the request was not answered.
@@ -211,10 +216,12 @@ function rateLimited(
   retryAfterMs: number,
   reason: string,
   now: () => Date,
+  /** The real HTTP status (429, or 200 for an error object in a 200 body). */
+  status: number,
   bodyText?: string,
 ): { item: ImmediateItemState } | { retry: Extract<ImmediateOutcome, { kind: "retry" }> } {
   const at = now().toISOString();
-  const extra = { status: 429, ...(bodyText ? { bodyText } : {}) };
+  const extra = { status, ...(bodyText ? { bodyText } : {}) };
   if (DAILY_PATTERN.test(text)) return { item: { state: "failed", at, code: "rate_limited_daily", message: DAILY_LIMIT_MESSAGE, ...extra } };
   const previous = job.consecutivePollFailures ?? 0;
   if (previous + 1 > MAX_CONSECUTIVE_429) return { item: { state: "failed", at, code: "rate_limited", message: RATE_LIMITED_MESSAGE, ...extra } };

@@ -8,7 +8,7 @@ import type { BatchConfig } from "../src/config.js";
 import { atomicWriteJson } from "../src/fsutil.js";
 import { itemText, jobItems } from "../src/items.js";
 import { OpenRouterBatchClient } from "../src/openrouter/client.js";
-import { classify429, immediateResultId, runImmediateJob } from "../src/openrouter/immediate.js";
+import { classify429, immediateResultId, isRateLimitErrorObject, runImmediateJob } from "../src/openrouter/immediate.js";
 import { normaliseBatchResult } from "../src/openrouter/normalise-result.js";
 import type { BatchService } from "../src/service.js";
 import type { JobManifest } from "../src/types.js";
@@ -415,3 +415,39 @@ test("runImmediateJob builds a final response normaliseBatchResult accepts", asy
   assert.equal(n.items[0]!.text, "one");
   assert.deepEqual(n.warnings, []);
 });
+
+test("isRateLimitErrorObject: the message counts only when the code is absent, 429 or 5xx", () => {
+  assert.equal(isRateLimitErrorObject({ message: "Model is temporarily rate-limited upstream. Please retry shortly" }), true);
+  assert.equal(isRateLimitErrorObject({ code: 429, message: "Too many requests" }), true);
+  assert.equal(isRateLimitErrorObject({ code: "429", message: "x" }), true);
+  assert.equal(isRateLimitErrorObject({ code: 503, message: "upstream rate limit" }), true);
+  assert.equal(isRateLimitErrorObject({ code: 400, message: "max_tokens exceeds the rate limit tier for this key" }), false);
+  assert.equal(isRateLimitErrorObject({ code: 404, message: "No endpoints found" }), false);
+  assert.equal(isRateLimitErrorObject({ message: "Internal error" }), false);
+});
+
+test(
+  "a 200 error with code 400 that mentions a rate limit fails as provider_error, not rescheduled",
+  withService("standard", async ({ service, fake }) => {
+    fake.chatReplies = [{ status: 200, body: { error: { code: 400, message: "Request exceeds the rate limit tier for this key" } } }];
+    const job = await chatJob(service);
+    assert.equal(job.localStatus, "failed");
+    assert.equal(job.error?.code, "provider_error");
+  }),
+);
+
+test(
+  "a code-less 'temporarily rate-limited upstream' 200 is rescheduled; after the cap it fails with the real status (200)",
+  withService("standard", async ({ service, fake }) => {
+    fake.chatReplies = [{ status: 200, body: { error: { message: "x/y:free is temporarily rate-limited upstream. Please retry shortly" } } }];
+    const job = await chatJob(service);
+    assert.equal(service.registry.read(job.localId).localStatus === "failed", false);
+    for (let i = 0; i < 7; i++) await service.reconcile(job.localId, { force: true });
+    const r = await service.reconcile(job.localId, { force: true });
+    assert.equal(r.status, "failed");
+    const m = service.registry.read(job.localId);
+    assert.equal(m.error?.code, "rate_limited");
+    const progress = JSON.parse(fs.readFileSync(service.registry.artefact(job.localId, "immediateProgress"), "utf8")) as Record<string, { status?: number }>;
+    assert.ok(Object.values(progress).some((s) => s.status === 200), "the recorded status is the real HTTP status");
+  }),
+);
