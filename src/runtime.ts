@@ -1,6 +1,6 @@
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { loadConfig, type LoadedConfig } from "./config.js";
+import { loadConfig, readPrivacyConfig, type LoadedConfig } from "./config.js";
 import { FileLogger, type Logger } from "./logger.js";
 import { discoverBatchModels, resolveApiKeyForProvider } from "./models.js";
 import { BatchPoller } from "./poller.js";
@@ -92,11 +92,15 @@ export class BatchRuntime {
       this.catalogFile = catalogFile;
       this.catalog = new ModelCatalog({ file: catalogFile, logger: this.logger, fetch: () => this.fetchCatalog() });
     }
+    const cwd = this.cwd;
+    // Privacy decisions read the config files fresh: another process may have raised the level since this snapshot.
+    const getPrivacy = () => readPrivacyConfig(cwd);
     this.service = new BatchService({
       registry,
       catalog: this.catalog,
       workspaceRoot: this.cwd,
       getConfig: () => this.loaded.config,
+      getPrivacy,
       resolveApiKey: (account) => this.resolveApiKey(account),
       logger: this.logger,
       onSettled: (job) => this.onSettled(job),
@@ -113,6 +117,7 @@ export class BatchRuntime {
       batch: this.service,
       workspaceRoot: this.cwd,
       getConfig: () => this.loaded.config,
+      getPrivacy,
       logger: this.logger,
     });
     if (this.loaded.errors.length > 0) {

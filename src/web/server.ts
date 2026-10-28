@@ -10,7 +10,7 @@ import { exportMarkdown, formatCost } from "../chat/commands.js";
 import { conversationOrder, estimateTokens } from "../chat/request.js";
 import { ChatService, PROJECT_INSTRUCTIONS_FILE } from "../chat/service.js";
 import { ThreadStore } from "../chat/store.js";
-import { loadConfig, saveConfigUpdate, type BatchConfig } from "../config.js";
+import { loadConfig, readPrivacyConfig, saveConfigUpdate, type BatchConfig } from "../config.js";
 import { IgnoreMatcher, hardDenyMatcher } from "../context/ignore.js";
 import { buildContextPackage, gitCheckIgnore, toPosix } from "../context/package.js";
 import { formatSecretFindings, scanForSecrets } from "../context/secrets.js";
@@ -321,11 +321,14 @@ export class BatchWebServer {
         return { models: models.models, zdr: zdr.endpoints };
       },
     });
+    // Privacy decisions read the config files fresh: another process may have raised the level since this snapshot.
+    const getPrivacy = () => readPrivacyConfig(workspaceRoot);
     const service = new BatchService({
       registry,
       catalog,
       workspaceRoot,
       getConfig: () => loaded.config,
+      getPrivacy,
       resolveApiKey: keys.resolve,
       logger,
       onSettled: (job) => {
@@ -351,6 +354,7 @@ export class BatchWebServer {
       batch: service,
       workspaceRoot,
       getConfig: () => loaded.config,
+      getPrivacy,
       logger,
     });
     const poller = new BatchPoller(
@@ -538,7 +542,7 @@ export class BatchWebServer {
   }
 
   private privacyState(): Record<string, unknown> {
-    const p = this.deps.getConfig().privacy;
+    const p = this.deps.service.privacyConfig();
     return {
       level: p.level,
       source: levelSource(this.deps.workspaceRoot),
@@ -1032,7 +1036,7 @@ export class BatchWebServer {
       if (method === "POST" && pathname === "/api/privacy") {
         const body = await this.readJson<{ level?: string }>(req);
         if (!isPrivacyLevel(body.level)) throw new Error("Unknown privacy level. Use standard, no-training or zdr.");
-        const { update, showNotice } = levelUpdate(this.deps.getConfig().privacy, body.level);
+        const { update, showNotice } = levelUpdate(this.deps.service.privacyConfig(), body.level);
         this.savePrivacy(update);
         this.broadcast({ type: "privacy" });
         this.sendJson(res, 200, { ...this.privacyState(), ...(showNotice ? { notice: PRIVACY_NOTICE } : {}) });
@@ -1058,13 +1062,14 @@ export class BatchWebServer {
 
       if (method === "GET" && pathname === "/api/models") {
         const config = this.deps.getConfig();
+        const privacy = this.deps.service.privacyConfig();
         const threadParam = parsedUrl.searchParams.get("threadId");
-        const level: PrivacyLevel = threadParam ? this.deps.chat.effectiveLevel(this.deps.chatStore.resolve(threadParam)) : config.privacy.level;
+        const level: PrivacyLevel = threadParam ? this.deps.chat.effectiveLevel(this.deps.chatStore.resolve(threadParam)) : privacy.level;
         const known = this.deps.getKnownModels?.() ?? [];
         const batchModels = known.length > 0 ? known : [config.defaultModel, ...DEFAULT_FALLBACK_MODELS];
         this.sendJson(res, 200, {
           level,
-          entries: pickerEntries(this.deps.catalog?.snapshot(), batchModels, level, config.privacy.accountNoTraining),
+          entries: pickerEntries(this.deps.catalog?.snapshot(), batchModels, level, privacy.accountNoTraining),
           catalog: this.catalogInfo(),
         });
         return;

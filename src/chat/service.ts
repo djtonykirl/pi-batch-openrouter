@@ -71,6 +71,8 @@ export interface ChatServiceDeps {
   batch: BatchService;
   workspaceRoot: string;
   getConfig: () => BatchConfig;
+  /** The `privacy` section read fresh at each decision (`readPrivacyConfig`). Defaults to `getConfig().privacy`. */
+  getPrivacy?: () => BatchConfig["privacy"];
   logger?: Logger;
 }
 
@@ -122,6 +124,13 @@ export class ChatService {
 
   constructor(private readonly deps: ChatServiceDeps) {
     this.logger = deps.logger ?? nullLogger;
+    // Items an immediate job sends later must honour a level raised on its thread in the meantime.
+    deps.batch.setThreadLevelLookup?.((threadId) => this.store.read(threadId).privacyLevel);
+  }
+
+  /** The privacy settings as they are now; every privacy decision reads them through here. */
+  private privacy(): BatchConfig["privacy"] {
+    return this.deps.getPrivacy?.() ?? this.deps.getConfig().privacy;
   }
 
   private get store(): ThreadStore {
@@ -262,13 +271,13 @@ export class ChatService {
 
   /** The stricter of the project level and the thread's own level. */
   public effectiveLevel(threadId: string): PrivacyLevel {
-    return effectiveLevelOf(this.deps.getConfig().privacy.level, this.store.read(threadId).privacyLevel);
+    return effectiveLevelOf(this.privacy().level, this.store.read(threadId).privacyLevel);
   }
 
   /** Raises the thread's level. Only a level stricter than both the thread's and the project's is accepted. */
   public raisePrivacy(threadId: string, level: PrivacyLevel): void {
     if (!PRIVACY_LEVELS.includes(level)) throw new Error(`Unknown privacy level "${level}". Use ${PRIVACY_LEVELS.join(", ")}.`);
-    const project = this.deps.getConfig().privacy.level;
+    const project = this.privacy().level;
     this.store.update(threadId, (t, append) => {
       const current = effectiveLevelOf(project, t.privacyLevel);
       if (PRIVACY_LEVELS.indexOf(level) <= PRIVACY_LEVELS.indexOf(current)) {
@@ -282,7 +291,7 @@ export class ChatService {
   /** The batch-retention line for `/batch chat context`. */
   public batchRetentionLine(threadId: string): string {
     const strict = this.effectiveLevel(threadId) !== "standard";
-    return strict && this.deps.getConfig().privacy.deleteRemoteBatches
+    return strict && this.privacy().deleteRemoteBatches
       ? "Batch jobs are held at OpenRouter until finished; deleted after retrieval"
       : "Batch jobs are kept up to 30 days";
   }
@@ -296,11 +305,12 @@ export class ChatService {
     if (!to) throw new Error("Model slug is empty.");
     const route = routeForModel(to, opts.route);
     const config = this.deps.getConfig();
+    const privacy = this.privacy();
     const thread = this.store.read(threadId);
-    const level = effectiveLevelOf(config.privacy.level, thread.privacyLevel);
+    const level = effectiveLevelOf(privacy.level, thread.privacyLevel);
     const catalog = level === "zdr" ? await this.deps.batch.catalog?.whenLoaded(config.polling.requestTimeoutSeconds * 1000) : undefined;
     if (route === "batch") {
-      const d = resolveBatchProvider({ level, model: to, userPin: thread.providerPin, catalog, accountNoTraining: config.privacy.accountNoTraining });
+      const d = resolveBatchProvider({ level, model: to, userPin: thread.providerPin, catalog, accountNoTraining: privacy.accountNoTraining });
       if (!d.ok) throw new Error(d.reason);
     } else if (level === "zdr") {
       const base = normaliseModelSlug(to);
@@ -431,7 +441,7 @@ export class ChatService {
         model: thread.model,
         account: thread.account,
         route: thread.route ?? routeForModel(thread.model),
-        privacyLevel: effectiveLevelOf(this.deps.getConfig().privacy.level, thread.privacyLevel),
+        privacyLevel: effectiveLevelOf(this.privacy().level, thread.privacyLevel),
         ...(thread.providerPin ? { pin: thread.providerPin } : {}),
         main: buildTurnMessages(thread, entries, claim.throughSeq, prompt),
         ...(retitle ? { title: buildTitleMessages(thread, entries, claim.throughSeq) } : {}),
@@ -735,7 +745,7 @@ export class ChatService {
         model: thread.model,
         account: thread.account,
         route: thread.route ?? routeForModel(thread.model),
-        privacyLevel: effectiveLevelOf(this.deps.getConfig().privacy.level, thread.privacyLevel),
+        privacyLevel: effectiveLevelOf(this.privacy().level, thread.privacyLevel),
         ...(thread.providerPin ? { pin: thread.providerPin } : {}),
         main: buildCompactionMessages(thread, entries, claim.throughSeq, prompt, claim.instructions),
         ...(!thread.titleLocked ? { title: buildTitleMessages(thread, entries, Number.MAX_SAFE_INTEGER) } : {}),

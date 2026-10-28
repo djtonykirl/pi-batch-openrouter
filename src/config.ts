@@ -249,6 +249,31 @@ export function loadConfig(cwd?: string, globalFile = GLOBAL_CONFIG_FILE): Loade
   return { config: validated.config, errors: [...errors, ...validated.errors] };
 }
 
+/** The last privacy section read from a readable set of files, per workspace (see `readPrivacyConfig`). */
+const lastGoodPrivacy = new Map<string, BatchConfig["privacy"]>();
+
+/**
+ * The `privacy` section, read fresh from the config files on every call. Every privacy decision uses this rather than
+ * the per-process snapshot: the level may have been raised since by another Pi session, the standalone web UI or a
+ * hand edit, and the extension never sends anything less strict than the effective level.
+ * A layer that can't be read or parsed at this moment (a hand edit in progress) never relaxes the level: the last
+ * section read without such a problem is used instead, when there is one.
+ */
+export function readPrivacyConfig(cwd: string | undefined, globalFile = GLOBAL_CONFIG_FILE): BatchConfig["privacy"] {
+  const key = `${path.resolve(globalFile)}|${cwd ? path.resolve(cwd) : ""}`;
+  const errors: string[] = [];
+  let merged: Json = {};
+  merged = deepMerge(merged, readLayer(globalFile, errors));
+  if (cwd) {
+    merged = deepMerge(merged, readLayer(legacyProjectConfigPath(cwd), errors));
+    merged = deepMerge(merged, readLayer(projectConfigPath(cwd), errors));
+  }
+  const privacy = validateConfig(merged).config.privacy;
+  if (errors.length > 0) return lastGoodPrivacy.get(key) ?? privacy;
+  lastGoodPrivacy.set(key, privacy);
+  return privacy;
+}
+
 /**
  * Persist a partial update into one layer (global or project), preserving any
  * other keys already in that file. Top-level scalar settings are written, and `privacy` fields are merged into the existing section.

@@ -239,6 +239,11 @@ export interface ServiceDeps {
   gitIgnored?: PackageInput["gitIgnored"];
   /** Session model catalog; required for `zdr` batch jobs (without it they are refused). */
   catalog?: ModelCatalog;
+  /**
+   * The `privacy` section read fresh at each decision (`readPrivacyConfig`), so a level raised by another process is
+   * honoured. Defaults to `getConfig().privacy`.
+   */
+  getPrivacy?: () => BatchConfig["privacy"];
 }
 
 export interface ReconcileOutcome {
@@ -304,6 +309,7 @@ export const CHECK_LOCK_WAIT_MS = 10_000;
 
 export class BatchService {
   private readonly logger: Logger;
+  private threadLevel: ((threadId: string) => PrivacyLevel | undefined) | undefined;
 
   constructor(private readonly deps: ServiceDeps) {
     this.logger = deps.logger ?? nullLogger;
@@ -319,6 +325,19 @@ export class BatchService {
 
   public get workspaceRoot(): string {
     return this.deps.workspaceRoot;
+  }
+
+  /** The privacy settings as they are now (fresh from the config files when wired so); used at every privacy decision. */
+  public privacyConfig(): BatchConfig["privacy"] {
+    return this.deps.getPrivacy?.() ?? this.deps.getConfig().privacy;
+  }
+
+  /**
+   * Batch chat registers how to read a thread's own (raised) level, so items sent later (after a 429 or a crash) go
+   * out at a level raised on the thread in the meantime.
+   */
+  public setThreadLevelLookup(lookup: (threadId: string) => PrivacyLevel | undefined): void {
+    this.threadLevel = lookup;
   }
 
   private client(apiKey: string): OpenRouterBatchClient {
@@ -578,7 +597,8 @@ export class BatchService {
    */
   private async decidePrivacy(draft: JobDraft): Promise<{ pin?: ProviderPin; route: Route; privacy: NonNullable<JobManifest["privacy"]> }> {
     const config = this.deps.getConfig();
-    const level = effectiveLevel(config.privacy.level, draft.privacyLevel);
+    const privacy = this.privacyConfig();
+    const level = effectiveLevel(privacy.level, draft.privacyLevel);
     const route = routeForModel(draft.model, draft.route);
     if (route === "immediate") {
       // Spec non-goal (v1): immediate requests outside batch chat need a rate-paced queue.
@@ -588,7 +608,7 @@ export class BatchService {
       return { route, privacy: { level, route, enforcement } };
     }
     const catalog = level === "zdr" ? await this.deps.catalog?.whenLoaded(config.polling.requestTimeoutSeconds * 1000) : undefined;
-    const decision = resolveBatchProvider({ level, model: draft.model, userPin: draft.pin, catalog, accountNoTraining: config.privacy.accountNoTraining });
+    const decision = resolveBatchProvider({ level, model: draft.model, userPin: draft.pin, catalog, accountNoTraining: privacy.accountNoTraining });
     if (!decision.ok) {
       this.logger.log("warn", "privacy_refused", { kind: draft.kind, level, model: draft.model });
       throw new SubmissionBlockedError(decision.reason);
@@ -957,7 +977,7 @@ export class BatchService {
     const contentSha256 = contentHash(buildSubmitBody({ model, provider: pin, requests: plan.items.map((it) => ({ custom_id: "{custom_id}", body: it.body })) }));
     // R7: metadata jobs have no thread, so the project level is the effective level. A warning, not a blocker.
     const warnings = [...plan.warnings];
-    if (plan.tablesWithSamples > 0 && effectiveLevel(config.privacy.level) === "standard") warnings.push("sample values will be sent at privacy level standard; consider /batch privacy zdr");
+    if (plan.tablesWithSamples > 0 && effectiveLevel(this.privacyConfig().level) === "standard") warnings.push("sample values will be sent at privacy level standard; consider /batch privacy zdr");
     return { ...base, plan, context: { relPath: context.relPath, bytes: context.bytes.length, text: context.text }, input: { relPath: input.relPath, bytes: input.bytes.length }, objective: `Databricks metadata proposals for ${plan.tables} table(s) from ${input.relPath}`, contentSha256, warnings };
   }
 
@@ -1056,10 +1076,17 @@ export class BatchService {
         throw new Error(`Job ${localId} is ${job.localStatus}; only previewed jobs can be submitted.`);
       }
       // A preview made at a lower level (or before privacy levels) was never pinned for the current one.
-      const current = this.deps.getConfig().privacy.level;
+      const fresh = this.privacyConfig();
+      const current = fresh.level;
       const recorded = job.privacy?.level ?? "standard";
       if (current !== recorded && stricter(current, recorded) === current) {
         throw new SubmissionBlockedError(`Privacy level ${current}: ${localId} was prepared at ${recorded}; cancel it and create it again`);
+      }
+      // A no-training batch job was allowed only on the account's attestation; it is not sent once that is withdrawn.
+      if (recorded === "no-training" && job.route !== "immediate" && !fresh.accountNoTraining) {
+        throw new SubmissionBlockedError(
+          `Privacy level no-training: ${localId} was prepared on your account's no-training attestation, but the attestation was removed; attest again (/batch privacy attest) or cancel it`,
+        );
       }
       if (!opts.skipDuplicateCheck && job.contentSha256) {
         const dup = this.findActiveDuplicate(job.contentSha256, localId);
@@ -1389,7 +1416,7 @@ export class BatchService {
     } catch (err) {
       return this.recordPollError(job, err);
     }
-    const level = job.privacy?.level ?? "standard";
+    const level = this.immediateSendLevel(job);
     const outcome = await runImmediateJob(job, body.requests, this.client(apiKey), level, undefined, {
       progress: this.immediateProgress(localId),
       inFlightMs: config.polling.requestTimeoutSeconds * 1000 + IMMEDIATE_IN_FLIGHT_MARGIN_MS,
@@ -1444,6 +1471,33 @@ export class BatchService {
     job = this.saveFinalAndFinish(localId, outcome.finalResponseText, { route: "immediate" });
     if (TERMINAL_STATUSES.has(job.localStatus)) this.deps.onSettled?.(job);
     return { localId, status: job.localStatus, polled: true };
+  }
+
+  /**
+   * The level an immediate item is sent at now: the stricter of the job's recorded level, the project level and the
+   * linked thread's own level. Never below the recorded level; an escalation is recorded as an event (once per level).
+   */
+  private immediateSendLevel(job: JobManifest): PrivacyLevel {
+    const recorded = job.privacy?.level ?? "standard";
+    let level = stricter(recorded, this.privacyConfig().level);
+    const threadId = job.chat?.threadId;
+    if (threadId && this.threadLevel) {
+      try {
+        const own = this.threadLevel(threadId);
+        if (own) level = stricter(level, own);
+      } catch (err) {
+        // A thread that can't be read (removed) leaves the recorded and project levels in force.
+        this.logger.log("warn", "thread_level_unreadable", { localId: job.localId, threadId, message: (err as Error).message });
+      }
+    }
+    if (level !== recorded) {
+      const already = this.registry.events(job.localId).some((e) => e.eventType === "privacy_escalated" && e.details?.level === level);
+      if (!already) {
+        this.registry.update(job.localId, (u) => u.note("privacy_escalated", { recorded, level }));
+        this.logger.log("info", "privacy_escalated", { localId: job.localId, recorded, level });
+      }
+    }
+    return level;
   }
 
   private normalise(job: JobManifest, rawText: string): NormalisedBatchResult {
@@ -1550,7 +1604,7 @@ export class BatchService {
       const ownLevel = m.privacy?.level;
       if (
         (ownLevel === "no-training" || ownLevel === "zdr") &&
-        this.deps.getConfig().privacy.deleteRemoteBatches &&
+        this.privacyConfig().deleteRemoteBatches &&
         m.route !== "immediate" &&
         m.providerBatchId &&
         !m.remoteDeletion
