@@ -117,13 +117,14 @@ export function formatPrivacyPolicy(config: BatchConfig, privacy?: { level: Priv
   const r = config.routing;
   const level = privacy?.level;
   const part = (required: boolean, attested: boolean, byLevel: boolean, what: string, note = "") =>
-    required ? `${what} required (${attested ? "account-enforced, attested" : byLevel ? `satisfied by privacy level ${level}` : "NOT attested"})${note}` : `${what} not required`;
+    // Names the setting, so "off" never reads as a privacy claim at a strict level.
+    required ? `${what}: on (${attested ? "account-enforced, attested" : byLevel ? `satisfied by privacy level ${level}` : "NOT attested"})${note}` : `${what}: off`;
   const ntUnattested = level === "no-training" && !privacy?.accountNoTraining;
-  return `${part(r.requireZdr, r.accountZdrEnforced, level === "zdr", "ZDR")}; ${part(
+  return `${part(r.requireZdr, r.accountZdrEnforced, level === "zdr", "routing.requireZdr")}; ${part(
     r.requireNoDataCollection,
     r.accountDataCollectionDenied,
     level === "zdr" || (level === "no-training" && !ntUnattested),
-    "no data collection",
+    "routing.requireNoDataCollection",
     ntUnattested && !r.accountDataCollectionDenied ? " (needs /batch privacy attest)" : "",
   )}`;
 }

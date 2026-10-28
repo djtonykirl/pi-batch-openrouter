@@ -175,7 +175,7 @@ export class ChatService {
    * otherwise it stays queued. A secret refuses the message before anything is written (ChatBlockedError), and a
    * held thread lock propagates as ThreadBusyError with nothing written.
    */
-  public async send(threadId: string, text: string, attachments?: AttachmentRequestInput): Promise<{ queued: boolean; jobId?: string; warnings?: string[] }> {
+  public async send(threadId: string, text: string, attachments?: AttachmentRequestInput): Promise<{ queued: boolean; jobId?: string; error?: string; warnings?: string[] }> {
     const hasAtt = Boolean((attachments?.files?.length ?? 0) + (attachments?.contexts?.length ?? 0) + (attachments?.uploads?.length ?? 0));
     if (text.trim() === "" && !hasAtt) return { queued: true };
     const thread = this.store.read(threadId);
@@ -205,7 +205,8 @@ export class ChatService {
     const warned = warnings.length > 0 ? { warnings } : {};
     if (!claim) return { queued: true, ...warned };
     const r = await this.submitTurn(threadId, claim, prompt);
-    return { queued: false, ...(r.jobId ? { jobId: r.jobId } : {}), ...warned };
+    // A turn that was not submitted (refused, rejected) says why; the failure is also recorded on the thread.
+    return { queued: false, ...(r.jobId ? { jobId: r.jobId } : { error: r.error ?? "the turn was not submitted" }), ...warned };
   }
 
   /**

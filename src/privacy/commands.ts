@@ -58,7 +58,29 @@ export function pickerEntries(
     }
     out.push(entry);
   }
-  return out;
+  // Selectable first, then alphabetical within each group.
+  return out.sort((a, b) => Number(!!a.blocked) - Number(!!b.blocked) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+}
+
+/**
+ * The batch model candidates for a picker: `sources` (Pi's known models, the default model, models in use) plus every
+ * catalog model with a `:batch` variant (listed by its base ID), deduplicated in first-seen order.
+ */
+export function batchModelCandidates(catalog: CatalogSnapshot | undefined, sources: Iterable<string>): string[] {
+  const out = new Set<string>();
+  for (const id of sources) if (id) out.add(id);
+  for (const m of catalog?.models ?? []) if (m.id.endsWith(":batch")) out.add(normaliseModelSlug(m.id));
+  return [...out];
+}
+
+/**
+ * The model a new thread starts on when the default is refused at `level`: the first selectable batch entry (a ZDR-labelled
+ * one first at zdr), else the first selectable free entry. Undefined when nothing is selectable.
+ */
+export function fallbackPickerEntry(entries: readonly PickerEntry[], level: PrivacyLevel): PickerEntry | undefined {
+  const open = entries.filter((e) => !e.blocked);
+  const batch = open.filter((e) => e.route === "batch");
+  return (level === "zdr" ? batch.find((e) => e.labels.includes("ZDR")) : undefined) ?? batch[0] ?? open.find((e) => e.route === "immediate");
 }
 
 export function catalogStateLine(snapshot: CatalogSnapshot | undefined): string {

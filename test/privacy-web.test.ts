@@ -339,8 +339,8 @@ test(
     const p = (await (await get("/api/privacy")).json()) as Record<string, any>;
     assert.deepEqual(p.routing.allowedProviders, ["groq"]);
     assert.equal(p.routing.pin, "groq (no fallbacks)");
-    assert.equal(p.routing.policy, "ZDR required (NOT attested); no data collection not required");
-    assert.match(p.routing.summary, /^Provider allow-list: groq \(no fallbacks\); ZDR required/);
+    assert.equal(p.routing.policy, "routing.requireZdr: on (NOT attested); routing.requireNoDataCollection: off");
+    assert.match(p.routing.summary, /^Provider allow-list: groq \(no fallbacks\); routing.requireZdr: on/);
     cfg.privacy.level = "zdr";
     const m = (await (await get("/api/models")).json()) as { entries: Array<{ id: string; blocked?: string }> };
     assert.equal(m.entries.find((e) => e.id === "y/model")!.blocked, "Privacy level zdr: no ZDR provider for y/model within routing.allowedProviders (groq)");

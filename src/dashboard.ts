@@ -2,7 +2,7 @@ import type { Component } from "@earendil-works/pi-tui";
 import { matchesKey, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { ACTIVE_STATUSES, TERMINAL_STATUSES as TERMINAL, type LocalStatus } from "./state.js";
 import { formatPin } from "./openrouter/routing.js";
-import { RETENTION_DELETED, RETENTION_KEPT } from "./privacy/policy.js";
+import { neverReachedOpenRouter, RETENTION_DELETED, RETENTION_KEPT, RETENTION_NOT_APPLICABLE } from "./privacy/policy.js";
 import { formatIsoShort } from "./time.js";
 import { sourceLabel } from "./items.js";
 import { isDatasetWorkflow, isMetadataWorkflow, type JobManifest } from "./types.js";
@@ -246,6 +246,7 @@ function remoteDeletionCell(job: JobManifest): string | undefined {
  */
 export function retentionLine(job: JobManifest, deleteRemoteBatches: boolean): string | undefined {
   if ((job.route ?? "batch") !== "batch" || job.remoteDeletion) return undefined;
+  if (neverReachedOpenRouter(job)) return RETENTION_NOT_APPLICABLE;
   const strict = job.privacy?.level === "no-training" || job.privacy?.level === "zdr";
   return strict && deleteRemoteBatches && !TERMINAL.has(job.localStatus) ? RETENTION_DELETED : RETENTION_KEPT;
 }
