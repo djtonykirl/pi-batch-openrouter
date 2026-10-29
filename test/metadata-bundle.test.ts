@@ -114,3 +114,58 @@ test("inboxPath builds the Volumes path", () => {
     "/Volumes/uc_dev_global_rnd_mdip_01/lighthouse_governance/metadata/inbox/PNPT/r1/approved.jsonl",
   );
 });
+
+test("dot run_ids are refused", () => {
+  for (const run_id of [".", ".."]) assert.ok(!checkBundle(bundle({ run_id }), OPTS).ok, run_id);
+});
+
+test("duplicate manifest entry is refused", () => {
+  const e = { path: "tables.jsonl", sha256: sha256Hex(TABLES), bytes: TABLES.length };
+  const c = { path: "context.md", sha256: sha256Hex(CONTEXT), bytes: CONTEXT.length };
+  assert.ok(!checkBundle(bundle({ files: [e, e, c] }), OPTS).ok);
+});
+
+test("negative, fractional, or wrongly typed numbers and fields are refused", () => {
+  const c = { path: "context.md", sha256: sha256Hex(CONTEXT), bytes: CONTEXT.length };
+  const t = (bytes: unknown) => ({ path: "tables.jsonl", sha256: sha256Hex(TABLES), bytes });
+  assert.ok(!checkBundle(bundle({ files: [t(-1), c] }), OPTS).ok);
+  assert.ok(!checkBundle(bundle({ files: [t(1.5), c] }), OPTS).ok);
+  assert.ok(!checkBundle(bundle({ files: [t("16"), c] }), OPTS).ok);
+  assert.ok(!checkBundle(bundle({ table_count: -1 }), OPTS).ok);
+  assert.ok(!checkBundle(bundle({ table_count: 1.5 }), OPTS).ok);
+  assert.ok(!checkBundle(bundle({ table_count: "2" }), OPTS).ok);
+  assert.ok(!checkBundle(bundle({ run_id: 5 }), OPTS).ok);
+  assert.ok(!checkBundle(bundle({ contract_version: 1 }), OPTS).ok);
+  assert.ok(!checkBundle(bundle({ created_ts: null }), OPTS).ok);
+});
+
+test("array or null manifest is refused", () => {
+  for (const text of ["[]", "null"]) {
+    const files = bundle();
+    files[2] = { name: "manifest.json", bytes: Buffer.from(text) };
+    assert.ok(!checkBundle(files, OPTS).ok, text);
+  }
+});
+
+test("manifest entry for manifest.json or a third file is refused", () => {
+  const e = { path: "tables.jsonl", sha256: sha256Hex(TABLES), bytes: TABLES.length };
+  const c = { path: "context.md", sha256: sha256Hex(CONTEXT), bytes: CONTEXT.length };
+  const x = { path: "manifest.json", sha256: "0".repeat(64), bytes: 1 };
+  assert.ok(!checkBundle(bundle({ files: [e, c, x] }), OPTS).ok);
+  assert.ok(!checkBundle(bundle({ files: [e, c, { ...x, path: "other.txt" }] }), OPTS).ok);
+});
+
+test("uploaded names with folder prefixes (either slash) are matched by base name", () => {
+  const files = bundle();
+  files[0] = { name: "export\\tables.jsonl", bytes: TABLES };
+  files[1] = { name: "export/context.md", bytes: CONTEXT };
+  const r = checkBundle(files, OPTS);
+  assert.ok(r.ok);
+  if (r.ok) assert.deepEqual(Object.keys(r.manifest).sort(), ["contract_version", "created_ts", "domain_prefix", "files", "run_id", "table_count"]);
+});
+
+test("maxBytes problem names the file", () => {
+  const r = checkBundle(bundle(), { maxBytes: 10 });
+  assert.ok(!r.ok);
+  if (!r.ok) assert.ok(r.problems.some((p) => p.includes("tables.jsonl") && p.includes("larger")));
+});

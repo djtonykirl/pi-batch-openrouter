@@ -18,8 +18,12 @@ const PREFIX = /^[A-Z0-9]{4}$/;
 const DATA_FILES = ["tables.jsonl", "context.md"] as const;
 const MANIFEST = "manifest.json";
 
+function isCount(v: unknown): v is number {
+  return typeof v === "number" && Number.isInteger(v) && v >= 0;
+}
+
 function baseName(p: string): string {
-  const parts = p.split(/[\/]/);
+  const parts = p.split(/[\\/]/);
   return parts[parts.length - 1] ?? "";
 }
 
@@ -53,10 +57,10 @@ export function checkBundle(
     return { ok: false, problems };
   }
   const m = raw as Record<string, unknown>;
-  if (typeof m.run_id !== "string" || !RUN_ID.test(m.run_id)) problems.push("manifest run_id is missing or invalid");
+  if (typeof m.run_id !== "string" || !RUN_ID.test(m.run_id) || /^\.+$/.test(m.run_id)) problems.push("manifest run_id is missing or invalid");
   if (typeof m.domain_prefix !== "string" || !PREFIX.test(m.domain_prefix)) problems.push("manifest domain_prefix is missing or invalid");
   if (typeof m.contract_version !== "string") problems.push("manifest contract_version is missing");
-  if (typeof m.table_count !== "number") problems.push("manifest table_count is missing");
+  if (!isCount(m.table_count)) problems.push("manifest table_count is missing");
   if (typeof m.created_ts !== "string") problems.push("manifest created_ts is missing");
   const entries = Array.isArray(m.files) ? (m.files as unknown[]) : null;
   if (!entries) problems.push("manifest files is missing");
@@ -64,7 +68,7 @@ export function checkBundle(
   const listed = new Map<string, { path: string; sha256: string; bytes: number }>();
   for (const e of entries ?? []) {
     const o = e as Record<string, unknown> | null;
-    if (!o || typeof o.path !== "string" || typeof o.sha256 !== "string" || typeof o.bytes !== "number") {
+    if (!o || typeof o.path !== "string" || typeof o.sha256 !== "string" || !isCount(o.bytes)) {
       problems.push("manifest files has a malformed entry");
       continue;
     }
@@ -88,7 +92,14 @@ export function checkBundle(
   }
   if (problems.length > 0) return { ok: false, problems };
 
-  const manifest = raw as BundleManifest;
+  const manifest: BundleManifest = {
+    run_id: m.run_id as string,
+    domain_prefix: m.domain_prefix as string,
+    contract_version: m.contract_version as string,
+    files: [...listed.values()],
+    table_count: m.table_count as number,
+    created_ts: m.created_ts as string,
+  };
   const dest = `metadata/${manifest.domain_prefix.toLowerCase()}/${manifest.run_id}`;
   return {
     ok: true,
