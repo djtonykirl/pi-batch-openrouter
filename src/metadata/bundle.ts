@@ -18,7 +18,7 @@ const PREFIX = /^[A-Z0-9]{4}$/;
 
 /** A run ID is a safe path segment: the allowed characters, 1-100 long, and not only dots ("." / ".."). */
 function validRunId(v: unknown): v is string {
-  return typeof v === "string" && RUN_ID.test(v) && !/^.+$/.test(v);
+  return typeof v === "string" && RUN_ID.test(v) && !/^\.+$/.test(v);
 }
 
 function validDomainPrefix(v: unknown): v is string {
@@ -66,7 +66,7 @@ export function checkBundle(
     return { ok: false, problems };
   }
   const m = raw as Record<string, unknown>;
-  if (typeof m.run_id !== "string" || !RUN_ID.test(m.run_id) || /^\.+$/.test(m.run_id)) problems.push("manifest run_id is missing or invalid");
+  if (!validRunId(m.run_id)) problems.push("manifest run_id is missing or invalid");
   if (!validDomainPrefix(m.domain_prefix)) problems.push("manifest domain_prefix is missing or invalid");
   if (typeof m.contract_version !== "string") problems.push("manifest contract_version is missing");
   if (!isCount(m.table_count)) problems.push("manifest table_count is missing");
@@ -135,8 +135,7 @@ export function manifestIds(text: string): Pick<BundleManifest, "run_id" | "doma
   }
   if (!m || typeof m !== "object" || Array.isArray(m)) return null;
   const o = m as Record<string, unknown>;
-  if (typeof o.run_id !== "string" || !RUN_ID.test(o.run_id) || /^\.+$/.test(o.run_id)) return null;
-  if (typeof o.domain_prefix !== "string" || !PREFIX.test(o.domain_prefix)) return null;
+  if (!validRunId(o.run_id) || !validDomainPrefix(o.domain_prefix)) return null;
   if (typeof o.contract_version !== "string" || !isCount(o.table_count)) return null;
   return { run_id: o.run_id, domain_prefix: o.domain_prefix, contract_version: o.contract_version, table_count: o.table_count };
 }
