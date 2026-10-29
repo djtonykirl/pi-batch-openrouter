@@ -1094,6 +1094,29 @@ When a table uses any v2 field, its prompt gets extra guidance:
 
 The preview counts v2 tables. The review shows each table's layer and object type, and adds a **Tier** column.
 
+### Working with the Databricks governance pipeline
+
+The governance pipeline exports a bundle per run: `tables.jsonl`, `context.md` and a `manifest.json` that gives
+the run ID, the domain prefix, the contract version and the SHA-256 and size of each file. The whole round trip
+can be done in the web UI (`/batch web`):
+
+1. **Import the export.** In **New Batch Job Studio → UC Metadata**, click **Import Databricks export** and pick
+   the three files. They are checked against the manifest; a missing, extra or altered file refuses the whole
+   import and nothing is written. The files are saved byte for byte under
+   `metadata/<prefix lowercase>/<run_id>/`, and the Context and Tables fields are filled in. If the run was already
+   imported, the page asks before replacing its files. An empty UC prefix is set to `<PREFIX>_`; add the domain slug
+   for standards mode, or clear the prefix for plain proposals. The three files together must be under about
+   22 MB (the web request limit is 30 MB after base64 encoding); larger exports are refused with a message.
+2. **Plan, review and approve** as usual: dry-run, submit, then on the finished job use the **UC Metadata
+   handoff** card to write `review.md` and `approved.jsonl`, edit the approved values, and validate the file.
+3. **Download `approved.jsonl`** from the same card. The button is enabled once the approved file exists.
+4. **Upload it to the inbox.** The card shows the Databricks inbox path,
+   `/Volumes/<catalog>/lighthouse_governance/metadata/inbox/<PREFIX>/<run_id>/approved.jsonl`, taking the IDs from
+   the imported `manifest.json` and the catalog you type (remembered in this browser). Upload the file there with
+   your usual Databricks tools; the governance pipeline validates and applies it.
+
+Pi never contacts Databricks: you carry the files both ways, and nothing is applied until the pipeline does it.
+
 ### Provider routing and account privacy
 
 The Batch API accepts only `provider.only` and `provider.allow_fallbacks`. Sync preferences such as `order`,

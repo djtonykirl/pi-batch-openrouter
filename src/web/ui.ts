@@ -3,6 +3,7 @@
  * Served locally from 127.0.0.1 with an injected per-session CSRF token.
  */
 
+import { inboxPath } from "../metadata/bundle.js";
 import { MAX_CONSECUTIVE_429 } from "../openrouter/immediate.js";
 import { neverReachedOpenRouter } from "../privacy/policy.js";
 
@@ -88,6 +89,31 @@ export function metadataWrittenText(
     (c ? "\n" + (typeof res.tables === "number" ? res.tables + " table(s); " : "") + "values: " + c.keptExisting + " existing kept, " + c.fromProposal + " from proposals, " + c.nullApproved + " null" : "") +
     "\nThis is a draft for review; edit approved_* values, then validate it. Nothing has been applied to Databricks."
   );
+}
+
+/**
+ * The handoff card's "Databricks inbox" line: where approved.jsonl goes on the Volume, from the IDs in the
+ * manifest.json beside the job's context file. Without them it says how to find the path. Plain text; an empty
+ * catalog shows as <catalog>. Calls inboxPath, whose source the page also embeds.
+ */
+export function metadataInboxText(info: { run_id?: string; domain_prefix?: string } | null | undefined, catalog: string): string {
+  const cat = String(catalog ?? "").trim() || "<catalog>";
+  if (info && info.run_id && info.domain_prefix) {
+    return "Databricks inbox: " + inboxPath({ run_id: info.run_id, domain_prefix: info.domain_prefix }, cat);
+  }
+  return (
+    "Databricks inbox: no manifest.json next to this job's context file, so the run is unknown. Upload approved.jsonl to " +
+    inboxPath({ run_id: "<run_id>", domain_prefix: "<PREFIX>" }, cat) +
+    ", taking run_id and domain_prefix from the export's manifest.json."
+  );
+}
+
+/**
+ * The manifest IDs to show for a job whose context file is `contextPath`: the cached bundle-info answer only when it
+ * was read for that same context file, else null. Keeps one job's run_id and prefix off another job's card.
+ */
+export function bundleInfoFor<T>(cache: { contextPath: string; info: T } | null | undefined, contextPath: string): T | null {
+  return cache && contextPath && cache.contextPath === contextPath ? cache.info : null;
 }
 
 /**
@@ -1020,6 +1046,12 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         </div>
 
         <div id="jobFormMetadata" class="job-form-section" style="display:none;">
+          <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:10px;">
+            <button class="btn btn-sm" data-action="importMetadataBundle" data-args="[]">Import Databricks export</button>
+            <input type="file" id="metadataBundleInput" multiple accept=".jsonl,.md,.json" style="display:none;">
+            <span style="font-size:12px; color:var(--text-muted);">Pick the export's tables.jsonl, context.md and manifest.json; they are checked against the manifest and saved under metadata/&lt;prefix&gt;/&lt;run_id&gt;/.</span>
+          </div>
+          <div id="metadataImportStatus" style="margin-bottom:10px;"></div>
           <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
             <div>
               <label for="metadataContextInput" style="font-size:12px; color:var(--text-muted);">Context file (reviewed &lt;Domain&gt;_context.md)</label>
@@ -1167,6 +1199,9 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
     ${failureStates.toString()}
     ${inflightHeadline.toString()}
     ${metadataWrittenText.toString()}
+    ${inboxPath.toString()}
+    ${metadataInboxText.toString()}
+    ${bundleInfoFor.toString()}
     ${messageNumbers.toString()}
     const MAX_RATE_LIMITS = ${MAX_CONSECUTIVE_429};
     ${createCoalescer.toString()}
@@ -1232,6 +1267,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
       "quickAttachToChat", "inspectJobItem", "generateJobArtifact", "exportDatasetJob", "previewArtifactFrame",
       "submitPreviewedJob", "cancelBatchJob", "retryBatchJob", "synthesizeBatchJob", "setJobSubTab",
       "writeMetadataReview", "writeMetadataApproved", "validateMetadataApproved",
+      "importMetadataBundle", "confirmMetadataBundleOverwrite", "cancelMetadataBundleOverwrite", "downloadMetadataApproved",
       "openCompactForm", "submitCompact", "cancelCompact",
     ]);
     function act(name, ...args) {
@@ -1414,7 +1450,10 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
       const res = await fetch(path, { ...opts, headers });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        throw new Error(data.error || ("HTTP " + res.status));
+        const err = new Error(data.error || ("HTTP " + res.status));
+        err.status = res.status;
+        err.data = data;
+        throw err;
       }
       return data;
     }
@@ -2423,14 +2462,21 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         .join("");
 
       el.querySelectorAll("[data-job-id]").forEach((row) => {
-        row.addEventListener("click", () => selectJob(row.dataset.jobId));
-        onActivateKey(row, () => selectJob(row.dataset.jobId));
+        // A deliberate pick re-reads the manifest and approved file (live refreshes keep the caches).
+        const pick = () => {
+          clearMetadataHandoffCaches();
+          selectJob(row.dataset.jobId);
+        };
+        row.addEventListener("click", pick);
+        onActivateKey(row, pick);
       });
     }
 
     document.getElementById("jobStatusFilter").addEventListener("change", renderJobList);
 
     async function selectJob(localId) {
+      // Another job's approved-file check and manifest IDs never carry over.
+      if (localId !== state.selectedJobId) clearMetadataHandoffCaches();
       state.selectedJobId = localId;
       renderJobList();
       const detail = await api("/api/jobs/" + encodeURIComponent(localId));
@@ -2567,6 +2613,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         metadataActionsCard(j) +
         subContent +
         "</div>";
+      refreshMetadataHandoff(j);
     }
 
     function metadataActionsCard(j) {
@@ -2579,13 +2626,14 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
       // Restored after a live refresh: what the user typed and ticked, and the last result.
       const saved = state.metadataCard && state.metadataCard.jobId === j.localId ? state.metadataCard : null;
       const checked = (on) => (on ? " checked" : "");
+      const approvedValue = saved && saved.approved !== undefined ? saved.approved : dir + "approved.jsonl";
       return (
         '<div class="msg-card" style="max-width:none; display:flex; flex-direction:column; gap:10px;">' +
         "<strong>UC Metadata handoff</strong>" +
         '<div style="font-size:12px; color:var(--text-muted);">Writes files into the workspace through the artifact system. Proposals only: nothing is applied to Databricks.</div>' +
         '<div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">' +
         field("metadataReviewOut", "Review file (.md)", saved && saved.review !== undefined ? saved.review : dir + "review.md") +
-        field("metadataApprovedOut", "Approved file (.jsonl)", saved && saved.approved !== undefined ? saved.approved : dir + "approved.jsonl") +
+        field("metadataApprovedOut", "Approved file (.jsonl)", approvedValue) +
         "</div>" +
         '<div style="display:flex; gap:14px; flex-wrap:wrap; font-size:12px;">' +
         '<label><input type="checkbox" id="metadataOverwrite"' + checked(saved && saved.overwrite) + "> Overwrite existing file</label>" +
@@ -2595,11 +2643,154 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         '<button class="btn btn-sm btn-primary" ' + act("writeMetadataReview", j.localId) + ">Write review.md</button>" +
         '<button class="btn btn-sm btn-primary" ' + act("writeMetadataApproved", j.localId) + ">Write approved.jsonl</button>" +
         '<button class="btn btn-sm" ' + act("validateMetadataApproved", j.localId) + ">Validate approved file</button>" +
+        '<button class="btn btn-sm" id="metadataDownloadBtn" ' + act("downloadMetadataApproved") + (approvedKnownToExist(approvedValue) ? "" : " disabled") +
+        ' title="Enabled once the approved file exists">Download approved.jsonl</button>' +
+        "</div>" +
+        '<div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; font-size:12px;">' +
+        '<label for="metadataCatalogInput" style="color:var(--text-muted);">Catalog</label>' +
+        '<input type="text" id="metadataCatalogInput" placeholder="catalog" value="' + escapeHtml(loadMetadataCatalog()) + '" style="width:160px; font-family:var(--mono);">' +
+        '<span id="metadataInboxLine" style="font-family:var(--mono); word-break:break-all;">' + escapeHtml(inboxLineFor(j, loadMetadataCatalog())) + "</span>" +
         "</div>" +
         '<div id="metadataActionOutput">' + (saved ? saved.html : "") + "</div>" +
         "</div>"
       );
     }
+
+    // ---- Download approved.jsonl and the Databricks inbox line ----
+    // The Databricks catalog is remembered per browser; storage can be unavailable (private mode, blocked site data).
+    const METADATA_CATALOG_KEY = "piBatch.metadataCatalog";
+    function loadMetadataCatalog() {
+      try {
+        return localStorage.getItem(METADATA_CATALOG_KEY) || "";
+      } catch {
+        return "";
+      }
+    }
+    function saveMetadataCatalog(v) {
+      try {
+        localStorage.setItem(METADATA_CATALOG_KEY, v);
+      } catch {
+        // Not remembered; the line still uses the typed value.
+      }
+    }
+    // Cached per path so a live refresh re-renders the card without refetching. Only definite answers are cached
+    // (a network error is retried on the next render), and both are cleared when a job is selected.
+    state.metadataApprovedCheck = null; // { path, exists }
+    state.metadataBundleInfo = null; // { contextPath, info }
+    function clearMetadataHandoffCaches() {
+      state.metadataApprovedCheck = null;
+      state.metadataBundleInfo = null;
+    }
+    function approvedFieldPath() {
+      return ((document.getElementById("metadataApprovedOut") || {}).value || "").trim();
+    }
+    function approvedKnownToExist(p) {
+      const c = state.metadataApprovedCheck;
+      return !!(c && c.exists && c.path === String(p || "").trim());
+    }
+    function jobContextPath(j) {
+      return j && j.workflow && j.workflow.context ? j.workflow.context.path : "";
+    }
+    function displayedJob() {
+      const d = state.selectedJobDetail;
+      return d && d.job && d.job.localId === state.selectedJobId ? d.job : null;
+    }
+    // The inbox line for job j: the cached manifest IDs only when they were read for j's own context file.
+    function inboxLineFor(j, catalog) {
+      return metadataInboxText(bundleInfoFor(state.metadataBundleInfo, jobContextPath(j)), catalog);
+    }
+    function renderInboxLine(j) {
+      const line = document.getElementById("metadataInboxLine");
+      if (!line || !j || j.localId !== state.selectedJobId) return;
+      const catalog = ((document.getElementById("metadataCatalogInput") || {}).value || "").trim();
+      line.textContent = inboxLineFor(j, catalog);
+    }
+    // Asks the server whether path p is a downloadable approved file: true, false, or null when the request itself
+    // failed (no definite answer).
+    async function probeApproved(p) {
+      if (!p.toLowerCase().endsWith(".jsonl")) return false;
+      try {
+        await api("/api/metadata/approved-file?check=1&path=" + encodeURIComponent(p));
+        return true;
+      } catch (err) {
+        return err && typeof err.status === "number" ? false : null;
+      }
+    }
+    async function checkApprovedExists(force) {
+      const btn = document.getElementById("metadataDownloadBtn");
+      if (!btn) return;
+      const p = approvedFieldPath();
+      const c = state.metadataApprovedCheck;
+      if (!force && c && c.path === p) {
+        btn.disabled = !c.exists;
+        return;
+      }
+      const exists = await probeApproved(p);
+      if (exists !== null) state.metadataApprovedCheck = { path: p, exists };
+      // The field may have changed while the check ran; only the current path decides the button.
+      const now = document.getElementById("metadataDownloadBtn");
+      if (now) now.disabled = !(exists === true && approvedFieldPath() === p);
+    }
+    async function loadBundleInfo(j) {
+      const ctx = jobContextPath(j);
+      if (!ctx || (state.metadataBundleInfo && state.metadataBundleInfo.contextPath === ctx)) {
+        renderInboxLine(j);
+        return;
+      }
+      let info;
+      try {
+        info = await api("/api/metadata/bundle-info?contextPath=" + encodeURIComponent(ctx));
+      } catch (err) {
+        // A definite refusal means no manifest IDs; a network error is not cached and is retried on the next render.
+        if (!(err && typeof err.status === "number")) return;
+        info = {};
+      }
+      state.metadataBundleInfo = { contextPath: ctx, info };
+      // The user may have switched jobs while this ran: never render job A's IDs on job B's card.
+      if (state.selectedJobId !== j.localId) return;
+      renderInboxLine(j);
+    }
+    // Called after the job pane is rendered: fills the card's live parts.
+    function refreshMetadataHandoff(j) {
+      if (!document.getElementById("metadataDownloadBtn")) return;
+      checkApprovedExists(false);
+      loadBundleInfo(j);
+    }
+    let approvedCheckTimer = null;
+    document.addEventListener("input", (ev) => {
+      const id = ev.target && ev.target.id;
+      if (id === "metadataApprovedOut") {
+        const btn = document.getElementById("metadataDownloadBtn");
+        if (btn) btn.disabled = true;
+        clearTimeout(approvedCheckTimer);
+        approvedCheckTimer = setTimeout(() => checkApprovedExists(true), 300);
+      } else if (id === "metadataCatalogInput") {
+        saveMetadataCatalog(ev.target.value.trim());
+        renderInboxLine(displayedJob());
+      }
+    });
+
+    // Re-checks first, so a file that vanished since the button was enabled never saves an error body as the file.
+    window.downloadMetadataApproved = async () => {
+      const p = approvedFieldPath();
+      if (!p) return;
+      const exists = await probeApproved(p);
+      if (exists !== true) {
+        if (exists === false) {
+          state.metadataApprovedCheck = { path: p, exists: false };
+          const btn = document.getElementById("metadataDownloadBtn");
+          if (btn) btn.disabled = true;
+        }
+        showToast(exists === false ? "The approved file is no longer there: " + p : "Could not reach the server to check " + p, "error");
+        return;
+      }
+      const a = document.createElement("a");
+      a.href = "/api/metadata/approved-file?path=" + encodeURIComponent(p);
+      a.download = p.split("/").pop() || "approved.jsonl";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    };
 
     // The card is rebuilt by every live refresh (writing a file broadcasts artifact_created), so its fields and the last
     // result are kept in state and restored by metadataActionsCard; otherwise the success line vanished at once.
@@ -2651,6 +2842,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
           '<div class="alert-box alert-success" role="status">' + escapeHtml(metadataWrittenText("approved", res)) + "</div>" + metadataProblems(res.problems),
         );
         showToast("Wrote " + res.path);
+        checkApprovedExists(true);
       } catch (err) {
         metadataOutput('<div class="alert-box alert-danger">' + escapeHtml(err.message) + "</div>");
       }
@@ -2802,6 +2994,89 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         document.getElementById("jobUploadLabel").style.display = state.jobStudioKind === "ask" ? "inline-flex" : "none";
       });
     });
+
+    // ---- Import Databricks export (UC Metadata tab) ----
+    // The picked files are kept until the import succeeds or is cancelled, so an overwrite retry resends the same bytes.
+    let pendingMetadataBundle = null;
+    function metadataImportStatus(html) {
+      document.getElementById("metadataImportStatus").innerHTML = html;
+    }
+    window.importMetadataBundle = () => {
+      const input = document.getElementById("metadataBundleInput");
+      input.value = "";
+      input.click();
+    };
+    document.getElementById("metadataBundleInput").addEventListener("change", async (ev) => {
+      const list = Array.from(ev.target.files || []);
+      ev.target.value = "";
+      if (list.length === 0) return;
+      try {
+        // The server's request body limit is 30 MB and base64 adds about a third, so refuse early with a clear message.
+        const totalBytes = list.reduce((n, f) => n + f.size, 0);
+        if (Math.ceil(totalBytes * 4 / 3) > 30_000_000) {
+          throw new Error("These files total " + (totalBytes / 1048576).toFixed(1) + " MB; an import is limited to about 22 MB in total (30 MB request limit after encoding). Trim the export or import a smaller run.");
+        }
+        const files = [];
+        for (const file of list) {
+          const dataUrl = await new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(String(reader.result));
+            reader.onerror = () => reject(new Error("Could not read " + file.name));
+            reader.readAsDataURL(file);
+          });
+          files.push({ name: file.name, contentBase64: dataUrl.slice(dataUrl.indexOf(",") + 1) });
+        }
+        pendingMetadataBundle = files;
+        await postMetadataBundle(false);
+      } catch (err) {
+        metadataImportStatus('<div class="alert-box alert-danger">' + escapeHtml(err.message) + "</div>");
+      }
+    });
+    async function postMetadataBundle(overwrite) {
+      if (!pendingMetadataBundle) return;
+      metadataImportStatus('<div style="font-size:12px; color:var(--text-muted);">Importing…</div>');
+      try {
+        const res = await api("/api/metadata/import-bundle", { method: "POST", body: { files: pendingMetadataBundle, overwrite } });
+        pendingMetadataBundle = null;
+        document.getElementById("metadataContextInput").value = res.contextPath;
+        document.getElementById("metadataTablesInput").value = res.inputPath;
+        const m = res.manifest;
+        const prefix = document.getElementById("metadataPrefixInput");
+        if (!prefix.value.trim()) prefix.value = m.domain_prefix + "_";
+        // Standards mode needs both fields; say so rather than let the dry run fail on it.
+        const needsDomain = !document.getElementById("metadataDomainInput").value.trim();
+        metadataImportStatus(
+          '<div class="alert-box alert-success" role="status">' +
+            escapeHtml("Imported run " + m.run_id + " (" + m.table_count + " tables, contract v" + m.contract_version + ")") +
+            (needsDomain ? "<br>" + escapeHtml("Enter the domain slug to use UC standards mode, or clear the UC prefix for plain proposals.") : "") +
+            "</div>",
+        );
+      } catch (err) {
+        if (err.status === 409) {
+          // In-page confirmation: the same files, resent with overwrite on "Overwrite".
+          metadataImportStatus(
+            '<div class="alert-box alert-danger">' + escapeHtml(err.message) + "</div>" +
+              '<div style="display:flex; gap:8px; margin-top:6px;">' +
+              '<button class="btn btn-sm btn-danger" ' + act("confirmMetadataBundleOverwrite") + ">Overwrite the run's files</button>" +
+              '<button class="btn btn-sm" ' + act("cancelMetadataBundleOverwrite") + ">Cancel</button>" +
+              "</div>",
+          );
+          return;
+        }
+        pendingMetadataBundle = null;
+        const problems = err.data && Array.isArray(err.data.problems) && err.data.problems.length ? err.data.problems : null;
+        metadataImportStatus(
+          '<div class="alert-box alert-danger">' +
+            (problems ? "Bundle refused; nothing was written:<ul>" + problems.map((p) => "<li>" + escapeHtml(p) + "</li>").join("") + "</ul>" : escapeHtml(err.message)) +
+            "</div>",
+        );
+      }
+    }
+    window.confirmMetadataBundleOverwrite = () => postMetadataBundle(true);
+    window.cancelMetadataBundleOverwrite = () => {
+      pendingMetadataBundle = null;
+      metadataImportStatus('<div style="font-size:12px; color:var(--text-muted);">Import cancelled; nothing was written.</div>');
+    };
 
     async function runJobStudio(mode) {
       // mode: "dryrun" | "preview" | "submit"
