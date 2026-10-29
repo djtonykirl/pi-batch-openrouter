@@ -12,6 +12,7 @@ import { BatchPoller } from "../src/poller.js";
 import { JobRegistry } from "../src/registry.js";
 import { BatchService } from "../src/service.js";
 import { BatchWebServer } from "../src/web/server.js";
+import { metadataInboxText } from "../src/web/ui.js";
 import { FAKE_KEY, FakeOpenRouter, makeConfig } from "./fixtures/fake-openrouter.js";
 import { metadataWorkspace } from "./fixtures/metadata.js";
 import { rm } from "./helpers.js";
@@ -178,3 +179,127 @@ test(
     assert.equal(r.status, 400);
   }),
 );
+
+const GOV = join("test", "fixtures", "governance");
+
+/** A bundle from the governance contract's v1 fixtures, with their real sha256 and sizes. */
+function governanceBundle() {
+  const tables = readFileSync(join(GOV, "tables.v1.valid.jsonl"));
+  const context = readFileSync(join(GOV, "context.v1.fixture.md"));
+  const manifest = Buffer.from(
+    JSON.stringify({
+      run_id: "r1",
+      domain_prefix: "PNPT",
+      contract_version: "1",
+      files: [
+        { path: "tables.jsonl", sha256: sha256Hex(tables), bytes: tables.length },
+        { path: "context.md", sha256: sha256Hex(context), bytes: context.length },
+      ],
+      table_count: tables.toString("utf8").trim().split("\n").length,
+      created_ts: "2026-10-29T00:00:00Z",
+    }),
+    "utf8",
+  );
+  const b64 = (name: string, b: Buffer) => ({ name, contentBase64: b.toString("base64") });
+  return [b64("tables.jsonl", tables), b64("context.md", context), b64("manifest.json", manifest)];
+}
+
+test(
+  "the page has the Import Databricks export and Download approved.jsonl controls, wired by data-action",
+  withWeb({}, async ({ get }) => {
+    const html = await (await get("/")).text();
+    assert.equal(/\son(click|change|input|submit|load|error)\s*=/i.test(html), false);
+    assert.match(html, /<button[^>]*data-action="importMetadataBundle"[^>]*>Import Databricks export<\/button>/);
+    assert.match(html, /<input type="file" id="metadataBundleInput" multiple/);
+    for (const needle of [
+      '"importMetadataBundle"',
+      '"downloadMetadataApproved"',
+      '"confirmMetadataBundleOverwrite"',
+      '"cancelMetadataBundleOverwrite"',
+      'act("downloadMetadataApproved"',
+      ">Download approved.jsonl<",
+      "/api/metadata/import-bundle",
+      "/api/metadata/approved-file",
+      "/api/metadata/bundle-info",
+      "metadataCatalogInput",
+    ]) {
+      assert.ok(html.includes(needle), `page mentions ${needle}`);
+    }
+    assert.equal(/window\.confirm\s*\(/.test(html), false);
+  }),
+);
+
+test(
+  "bundle-info needs a session and refuses a foreign origin",
+  withWeb({}, async ({ anon, get }) => {
+    assert.equal((await anon("/api/metadata/bundle-info?contextPath=a.md")).status, 401);
+    assert.equal((await get("/api/metadata/bundle-info?contextPath=a.md", { Origin: "http://evil.example" })).status, 403);
+  }),
+);
+
+test(
+  "bundle-info returns the IDs for an imported bundle and {} otherwise",
+  withWeb({ "metadata/plain/context.md": "# ctx\n", "metadata/bad/context.md": "# ctx\n","metadata/bad/manifest.json": "SECRET-NOT-JSON" }, async ({ get, post }) => {
+    assert.equal((await post("/api/metadata/import-bundle", { files: bundle().files })).status, 201);
+    const info = (p: string) => get(`/api/metadata/bundle-info?contextPath=${encodeURIComponent(p)}`);
+    const r = await info(`${D}/context.md`);
+    assert.equal(r.status, 200);
+    assert.deepEqual(await json(r), { run_id: "r1", domain_prefix: "PNPT", contract_version: "1", table_count: 2 });
+
+    const none = await info("metadata/plain/context.md");
+    assert.equal(none.status, 200);
+    assert.deepEqual(await json(none), {});
+    const bad = await info("metadata/bad/context.md");
+    assert.equal(bad.status, 200);
+    const badText = await bad.text();
+    assert.deepEqual(JSON.parse(badText), {});
+    assert.equal(badText.includes("SECRET"), false);
+
+    assert.equal((await get("/api/metadata/bundle-info")).status, 400);
+    const outside = await info("../outside.md");
+    assert.equal(outside.status, 400);
+  }),
+);
+
+test(
+  "approved-file check=1 reports existence without sending the file",
+  withWeb({}, async ({ root, get, post }) => {
+    await post("/api/metadata/import-bundle", { files: bundle().files });
+    const p = `${D}/approved.jsonl`;
+    const missing = await get(`/api/metadata/approved-file?check=1&path=${encodeURIComponent(p)}`);
+    assert.equal(missing.status, 400);
+    writeFileSync(join(root, p), '{"a":1}\n');
+    const ok = await get(`/api/metadata/approved-file?check=1&path=${encodeURIComponent(p)}`);
+    assert.equal(ok.status, 200);
+    assert.equal(ok.headers.get("content-disposition"), null);
+    assert.deepEqual(await json(ok), { path: p, bytes: 8 });
+  }),
+);
+
+test(
+  "a dry run of the imported governance fixtures returns no blockers",
+  withWeb({}, async ({ post }) => {
+    const imp = await post("/api/metadata/import-bundle", { files: governanceBundle() });
+    assert.equal(imp.status, 201);
+    const { contextPath, inputPath, manifest } = await json(imp);
+    assert.equal(manifest.table_count, 3);
+    const r = await post("/api/jobs/metadata", { context: contextPath, input: inputPath, mode: "dryrun" });
+    const out = await json(r);
+    assert.equal(r.status, 200, String(out.error));
+    assert.deepEqual(out.blockers, []);
+  }),
+);
+
+test("metadataInboxText shows the inbox path from the manifest, or explains how to find it", () => {
+  assert.equal(
+    metadataInboxText({ run_id: "r1", domain_prefix: "PNPT" }, "dev_catalog"),
+    "Databricks inbox: /Volumes/dev_catalog/lighthouse_governance/metadata/inbox/PNPT/r1/approved.jsonl",
+  );
+  assert.equal(
+    metadataInboxText({ run_id: "r1", domain_prefix: "PNPT" }, "  "),
+    "Databricks inbox: /Volumes/<catalog>/lighthouse_governance/metadata/inbox/PNPT/r1/approved.jsonl",
+  );
+  const none = metadataInboxText({}, "dev_catalog");
+  assert.match(none, /no manifest\.json/i);
+  assert.match(none, /\/Volumes\/dev_catalog\/lighthouse_governance\/metadata\/inbox\/<PREFIX>\/<run_id>\/approved\.jsonl/);
+});

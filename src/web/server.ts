@@ -32,7 +32,7 @@ import { JobRegistry } from "../registry.js";
 import { BatchService } from "../service.js";
 import { isChatJob, type JobManifest } from "../types.js";
 import { discoverWorkflows } from "../workflows/definition.js";
-import { checkBundle } from "../metadata/bundle.js";
+import { checkBundle, manifestIds } from "../metadata/bundle.js";
 import { resolveWorkspaceInput } from "../workspace-paths.js";
 import { renderWebUiHtml } from "./ui.js";
 
@@ -1385,6 +1385,27 @@ export class BatchWebServer {
         return;
       }
 
+      if (method === "GET" && pathname === "/api/metadata/bundle-info") {
+        // The IDs of the manifest.json beside an imported context file, for the handoff card's Databricks inbox
+        // line. Read-only; no manifest (or an invalid one) is {}. Never echoes the manifest's contents.
+        const rel = parsedUrl.searchParams.get("contextPath")?.trim() ?? "";
+        if (!rel) {
+          this.sendJson(res, 400, { error: "Missing ?contextPath= parameter" });
+          return;
+        }
+        const config = this.deps.getConfig();
+        const ctx = resolveWorkspaceInput(this.deps.workspaceRoot, rel, config, { what: "context file", maxBytes: Number.MAX_SAFE_INTEGER });
+        if (!ctx.ok) {
+          this.sendJson(res, 400, { error: ctx.message });
+          return;
+        }
+        const manifestRel = path.posix.join(path.posix.dirname(ctx.relPath), "manifest.json");
+        const m = resolveWorkspaceInput(this.deps.workspaceRoot, manifestRel, config, { what: "manifest", maxBytes: 64 * 1024 });
+        const ids = m.ok ? manifestIds(fs.readFileSync(m.absPath, "utf8")) : null;
+        this.sendJson(res, 200, ids ?? {});
+        return;
+      }
+
       if (method === "GET" && pathname === "/api/metadata/approved-file") {
         const rel = parsedUrl.searchParams.get("path")?.trim() ?? "";
         if (!rel) {
@@ -1408,6 +1429,11 @@ export class BatchWebServer {
         }
         if (!r.absPath.toLowerCase().endsWith(".jsonl")) {
           this.sendJson(res, 400, { error: "Only .jsonl files can be downloaded here." });
+          return;
+        }
+        if (parsedUrl.searchParams.get("check") === "1") {
+          // Existence check for the Download button: the same checks as a download, without the bytes.
+          this.sendJson(res, 200, { path: r.relPath, bytes: r.bytes });
           return;
         }
         const bytes = fs.readFileSync(r.absPath);

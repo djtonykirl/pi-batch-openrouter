@@ -113,6 +113,25 @@ export function checkBundle(
   };
 }
 
-export function inboxPath(manifest: BundleManifest, catalog: string): string {
+/**
+ * The IDs of a manifest.json already on disk (the one next to an imported context.md), or null when it is not
+ * valid JSON or its run_id / domain_prefix / contract_version / table_count are missing or malformed.
+ */
+export function manifestIds(text: string): Pick<BundleManifest, "run_id" | "domain_prefix" | "contract_version" | "table_count"> | null {
+  let m: unknown;
+  try {
+    m = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!m || typeof m !== "object" || Array.isArray(m)) return null;
+  const o = m as Record<string, unknown>;
+  if (typeof o.run_id !== "string" || !RUN_ID.test(o.run_id) || /^\.+$/.test(o.run_id)) return null;
+  if (typeof o.domain_prefix !== "string" || !PREFIX.test(o.domain_prefix)) return null;
+  if (typeof o.contract_version !== "string" || !isCount(o.table_count)) return null;
+  return { run_id: o.run_id, domain_prefix: o.domain_prefix, contract_version: o.contract_version, table_count: o.table_count };
+}
+
+export function inboxPath(manifest: Pick<BundleManifest, "run_id" | "domain_prefix">, catalog: string): string {
   return `/Volumes/${catalog}/lighthouse_governance/metadata/inbox/${manifest.domain_prefix}/${manifest.run_id}/approved.jsonl`;
 }
