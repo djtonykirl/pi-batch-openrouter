@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import test, { type TestContext } from "node:test";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import test, { mock, type TestContext } from "node:test";
 import { ArtifactService } from "../src/artifacts/service.js";
 import { ArtifactStore } from "../src/artifacts/store.js";
 import { ChatService } from "../src/chat/service.js";
@@ -12,7 +14,7 @@ import { BatchPoller } from "../src/poller.js";
 import { JobRegistry } from "../src/registry.js";
 import { BatchService } from "../src/service.js";
 import { BatchWebServer } from "../src/web/server.js";
-import { metadataInboxText } from "../src/web/ui.js";
+import { bundleInfoFor, metadataInboxText } from "../src/web/ui.js";
 import { FAKE_KEY, FakeOpenRouter, makeConfig } from "./fixtures/fake-openrouter.js";
 import { metadataWorkspace } from "./fixtures/metadata.js";
 import { rm } from "./helpers.js";
@@ -303,3 +305,52 @@ test("metadataInboxText shows the inbox path from the manifest, or explains how 
   assert.match(none, /no manifest\.json/i);
   assert.match(none, /\/Volumes\/dev_catalog\/lighthouse_governance\/metadata\/inbox\/<PREFIX>\/<run_id>\/approved\.jsonl/);
 });
+
+test(
+  "bundle-info falls back to {} when the manifest cannot be read",
+  withWeb({}, async ({ get, post }) => {
+    assert.equal((await post("/api/metadata/import-bundle", { files: bundle().files })).status, 201);
+    const orig = fs.readFileSync;
+    const m = mock.method(fs, "readFileSync", ((...a: Parameters<typeof fs.readFileSync>) => {
+      if (String(a[0]).endsWith("manifest.json")) throw Object.assign(new Error("EACCES: denied secret-path"), { code: "EACCES" });
+      return orig(...a);
+    }) as typeof fs.readFileSync);
+    syncBuiltinESMExports();
+    try {
+      const r = await get(`/api/metadata/bundle-info?contextPath=${encodeURIComponent(`${D}/context.md`)}`);
+      assert.equal(r.status, 200);
+      assert.deepEqual(await json(r), {});
+    } finally {
+      m.mock.restore();
+      syncBuiltinESMExports();
+    }
+  }),
+);
+
+test("bundleInfoFor uses cached manifest IDs only for the same context file", () => {
+  const cache = { contextPath: "metadata/pnpt/r1/context.md", info: { run_id: "r1", domain_prefix: "PNPT" } };
+  assert.deepEqual(bundleInfoFor(cache, "metadata/pnpt/r1/context.md"), cache.info);
+  assert.equal(bundleInfoFor(cache, "metadata/abcd/r2/context.md"), null);
+  assert.equal(bundleInfoFor(cache, ""), null);
+  assert.equal(bundleInfoFor(null, "metadata/pnpt/r1/context.md"), null);
+  // Another job's IDs never reach this job's inbox line.
+  assert.match(metadataInboxText(bundleInfoFor(cache, "metadata/abcd/r2/context.md"), "cat"), /no manifest\.json/);
+});
+
+test(
+  "the handoff card keeps the inbox line on the displayed job and re-checks before downloading",
+  withWeb({}, async ({ get }) => {
+    const html = await (await get("/")).text();
+    const handoff = html.slice(html.indexOf("// ---- Download approved.jsonl and the Databricks inbox line ----"));
+    // The download action carries no job ID, and the page embeds the same bundleInfoFor the tests run.
+    assert.ok(html.includes('act("downloadMetadataApproved")'));
+    assert.ok(html.includes(bundleInfoFor.toString()));
+    // A late bundle-info answer for another job is not rendered; selecting a job clears both caches.
+    assert.ok(handoff.includes("if (state.selectedJobId !== j.localId) return;"));
+    assert.ok(html.includes("if (localId !== state.selectedJobId) clearMetadataHandoffCaches();"));
+    assert.ok(handoff.includes("renderInboxLine(displayedJob())"));
+    // The download probes first and only then creates the link.
+    const dl = handoff.slice(handoff.indexOf("window.downloadMetadataApproved"));
+    assert.ok(dl.indexOf("probeApproved(p)") > 0 && dl.indexOf("probeApproved(p)") < dl.indexOf('createElement("a")'));
+  }),
+);

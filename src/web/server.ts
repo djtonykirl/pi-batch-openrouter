@@ -1401,7 +1401,14 @@ export class BatchWebServer {
         }
         const manifestRel = path.posix.join(path.posix.dirname(ctx.relPath), "manifest.json");
         const m = resolveWorkspaceInput(this.deps.workspaceRoot, manifestRel, config, { what: "manifest", maxBytes: 64 * 1024 });
-        const ids = m.ok ? manifestIds(fs.readFileSync(m.absPath, "utf8")) : null;
+        let ids: ReturnType<typeof manifestIds> = null;
+        if (m.ok) {
+          try {
+            ids = manifestIds(fs.readFileSync(m.absPath, "utf8"));
+          } catch {
+            ids = null; // unreadable (permissions, raced removal): treated as no manifest
+          }
+        }
         this.sendJson(res, 200, ids ?? {});
         return;
       }

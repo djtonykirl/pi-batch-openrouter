@@ -109,6 +109,14 @@ export function metadataInboxText(info: { run_id?: string; domain_prefix?: strin
 }
 
 /**
+ * The manifest IDs to show for a job whose context file is `contextPath`: the cached bundle-info answer only when it
+ * was read for that same context file, else null. Keeps one job's run_id and prefix off another job's card.
+ */
+export function bundleInfoFor<T>(cache: { contextPath: string; info: T } | null | undefined, contextPath: string): T | null {
+  return cache && contextPath && cache.contextPath === contextPath ? cache.info : null;
+}
+
+/**
  * The in-flight banner's headline for a thread's pending turn or compaction. A poll problem (`lastPollError`) comes
  * first, for every kind and route, with the next retry time. Otherwise a free-model (immediate) turn that OpenRouter
  * rate-limited says when it retries (local time) and how many rate limits so far out of `maxRateLimits` (after which
@@ -1193,6 +1201,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
     ${metadataWrittenText.toString()}
     ${inboxPath.toString()}
     ${metadataInboxText.toString()}
+    ${bundleInfoFor.toString()}
     ${messageNumbers.toString()}
     const MAX_RATE_LIMITS = ${MAX_CONSECUTIVE_429};
     ${createCoalescer.toString()}
@@ -2453,14 +2462,21 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         .join("");
 
       el.querySelectorAll("[data-job-id]").forEach((row) => {
-        row.addEventListener("click", () => selectJob(row.dataset.jobId));
-        onActivateKey(row, () => selectJob(row.dataset.jobId));
+        // A deliberate pick re-reads the manifest and approved file (live refreshes keep the caches).
+        const pick = () => {
+          clearMetadataHandoffCaches();
+          selectJob(row.dataset.jobId);
+        };
+        row.addEventListener("click", pick);
+        onActivateKey(row, pick);
       });
     }
 
     document.getElementById("jobStatusFilter").addEventListener("change", renderJobList);
 
     async function selectJob(localId) {
+      // Another job's approved-file check and manifest IDs never carry over.
+      if (localId !== state.selectedJobId) clearMetadataHandoffCaches();
       state.selectedJobId = localId;
       renderJobList();
       const detail = await api("/api/jobs/" + encodeURIComponent(localId));
@@ -2627,13 +2643,13 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         '<button class="btn btn-sm btn-primary" ' + act("writeMetadataReview", j.localId) + ">Write review.md</button>" +
         '<button class="btn btn-sm btn-primary" ' + act("writeMetadataApproved", j.localId) + ">Write approved.jsonl</button>" +
         '<button class="btn btn-sm" ' + act("validateMetadataApproved", j.localId) + ">Validate approved file</button>" +
-        '<button class="btn btn-sm" id="metadataDownloadBtn" ' + act("downloadMetadataApproved", j.localId) + (approvedKnownToExist(approvedValue) ? "" : " disabled") +
+        '<button class="btn btn-sm" id="metadataDownloadBtn" ' + act("downloadMetadataApproved") + (approvedKnownToExist(approvedValue) ? "" : " disabled") +
         ' title="Enabled once the approved file exists">Download approved.jsonl</button>' +
         "</div>" +
         '<div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; font-size:12px;">' +
         '<label for="metadataCatalogInput" style="color:var(--text-muted);">Catalog</label>' +
         '<input type="text" id="metadataCatalogInput" placeholder="catalog" value="' + escapeHtml(loadMetadataCatalog()) + '" style="width:160px; font-family:var(--mono);">' +
-        '<span id="metadataInboxLine" style="font-family:var(--mono); word-break:break-all;">' + escapeHtml(inboxLineFor(j)) + "</span>" +
+        '<span id="metadataInboxLine" style="font-family:var(--mono); word-break:break-all;">' + escapeHtml(inboxLineFor(j, loadMetadataCatalog())) + "</span>" +
         "</div>" +
         '<div id="metadataActionOutput">' + (saved ? saved.html : "") + "</div>" +
         "</div>"
@@ -2657,9 +2673,14 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         // Not remembered; the line still uses the typed value.
       }
     }
-    // Cached per path so a live refresh re-renders the card without refetching.
+    // Cached per path so a live refresh re-renders the card without refetching. Only definite answers are cached
+    // (a network error is retried on the next render), and both are cleared when a job is selected.
     state.metadataApprovedCheck = null; // { path, exists }
     state.metadataBundleInfo = null; // { contextPath, info }
+    function clearMetadataHandoffCaches() {
+      state.metadataApprovedCheck = null;
+      state.metadataBundleInfo = null;
+    }
     function approvedFieldPath() {
       return ((document.getElementById("metadataApprovedOut") || {}).value || "").trim();
     }
@@ -2667,17 +2688,33 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
       const c = state.metadataApprovedCheck;
       return !!(c && c.exists && c.path === String(p || "").trim());
     }
-    function inboxLineFor(j) {
-      const ctx = j.workflow && j.workflow.context ? j.workflow.context.path : "";
-      const b = state.metadataBundleInfo;
-      return metadataInboxText(b && b.contextPath === ctx ? b.info : null, loadMetadataCatalog());
+    function jobContextPath(j) {
+      return j && j.workflow && j.workflow.context ? j.workflow.context.path : "";
     }
-    function renderInboxLine() {
+    function displayedJob() {
+      const d = state.selectedJobDetail;
+      return d && d.job && d.job.localId === state.selectedJobId ? d.job : null;
+    }
+    // The inbox line for job j: the cached manifest IDs only when they were read for j's own context file.
+    function inboxLineFor(j, catalog) {
+      return metadataInboxText(bundleInfoFor(state.metadataBundleInfo, jobContextPath(j)), catalog);
+    }
+    function renderInboxLine(j) {
       const line = document.getElementById("metadataInboxLine");
-      if (!line) return;
-      const b = state.metadataBundleInfo;
+      if (!line || !j || j.localId !== state.selectedJobId) return;
       const catalog = ((document.getElementById("metadataCatalogInput") || {}).value || "").trim();
-      line.textContent = metadataInboxText(b ? b.info : null, catalog);
+      line.textContent = inboxLineFor(j, catalog);
+    }
+    // Asks the server whether path p is a downloadable approved file: true, false, or null when the request itself
+    // failed (no definite answer).
+    async function probeApproved(p) {
+      if (!p.toLowerCase().endsWith(".jsonl")) return false;
+      try {
+        await api("/api/metadata/approved-file?check=1&path=" + encodeURIComponent(p));
+        return true;
+      } catch (err) {
+        return err && typeof err.status === "number" ? false : null;
+      }
     }
     async function checkApprovedExists(force) {
       const btn = document.getElementById("metadataDownloadBtn");
@@ -2688,34 +2725,30 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         btn.disabled = !c.exists;
         return;
       }
-      let exists = false;
-      if (p.toLowerCase().endsWith(".jsonl")) {
-        try {
-          await api("/api/metadata/approved-file?check=1&path=" + encodeURIComponent(p));
-          exists = true;
-        } catch {
-          exists = false;
-        }
-      }
-      state.metadataApprovedCheck = { path: p, exists };
+      const exists = await probeApproved(p);
+      if (exists !== null) state.metadataApprovedCheck = { path: p, exists };
       // The field may have changed while the check ran; only the current path decides the button.
       const now = document.getElementById("metadataDownloadBtn");
-      if (now) now.disabled = !(exists && approvedFieldPath() === p);
+      if (now) now.disabled = !(exists === true && approvedFieldPath() === p);
     }
     async function loadBundleInfo(j) {
-      const ctx = j.workflow && j.workflow.context ? j.workflow.context.path : "";
+      const ctx = jobContextPath(j);
       if (!ctx || (state.metadataBundleInfo && state.metadataBundleInfo.contextPath === ctx)) {
-        renderInboxLine();
+        renderInboxLine(j);
         return;
       }
-      let info = {};
+      let info;
       try {
         info = await api("/api/metadata/bundle-info?contextPath=" + encodeURIComponent(ctx));
-      } catch {
+      } catch (err) {
+        // A definite refusal means no manifest IDs; a network error is not cached and is retried on the next render.
+        if (!(err && typeof err.status === "number")) return;
         info = {};
       }
       state.metadataBundleInfo = { contextPath: ctx, info };
-      renderInboxLine();
+      // The user may have switched jobs while this ran: never render job A's IDs on job B's card.
+      if (state.selectedJobId !== j.localId) return;
+      renderInboxLine(j);
     }
     // Called after the job pane is rendered: fills the card's live parts.
     function refreshMetadataHandoff(j) {
@@ -2733,13 +2766,24 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         approvedCheckTimer = setTimeout(() => checkApprovedExists(true), 300);
       } else if (id === "metadataCatalogInput") {
         saveMetadataCatalog(ev.target.value.trim());
-        renderInboxLine();
+        renderInboxLine(displayedJob());
       }
     });
 
-    window.downloadMetadataApproved = (jobId) => {
+    // Re-checks first, so a file that vanished since the button was enabled never saves an error body as the file.
+    window.downloadMetadataApproved = async () => {
       const p = approvedFieldPath();
       if (!p) return;
+      const exists = await probeApproved(p);
+      if (exists !== true) {
+        if (exists === false) {
+          state.metadataApprovedCheck = { path: p, exists: false };
+          const btn = document.getElementById("metadataDownloadBtn");
+          if (btn) btn.disabled = true;
+        }
+        showToast(exists === false ? "The approved file is no longer there: " + p : "Could not reach the server to check " + p, "error");
+        return;
+      }
       const a = document.createElement("a");
       a.href = "/api/metadata/approved-file?path=" + encodeURIComponent(p);
       a.download = p.split("/").pop() || "approved.jsonl";
