@@ -1105,7 +1105,8 @@ can be done in the web UI (`/batch web`):
    import and nothing is written. The files are saved byte for byte under
    `metadata/<prefix lowercase>/<run_id>/`, and the Context and Tables fields are filled in. If the run was already
    imported, the page asks before replacing its files. An empty UC prefix is set to `<PREFIX>_`; add the domain slug
-   for standards mode, or clear the prefix for plain proposals.
+   for standards mode, or clear the prefix for plain proposals. The three files together must be under about
+   22 MB (the web request limit is 30 MB after base64 encoding); larger exports are refused with a message.
 2. **Plan, review and approve** as usual: dry-run, submit, then on the finished job use the **UC Metadata
    handoff** card to write `review.md` and `approved.jsonl`, edit the approved values, and validate the file.
 3. **Download `approved.jsonl`** from the same card. The button is enabled once the approved file exists.

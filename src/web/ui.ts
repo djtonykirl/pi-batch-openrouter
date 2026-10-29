@@ -3011,6 +3011,11 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
       ev.target.value = "";
       if (list.length === 0) return;
       try {
+        // The server's request body limit is 30 MB and base64 adds about a third, so refuse early with a clear message.
+        const totalBytes = list.reduce((n, f) => n + f.size, 0);
+        if (Math.ceil(totalBytes * 4 / 3) > 30_000_000) {
+          throw new Error("These files total " + (totalBytes / 1048576).toFixed(1) + " MB; an import is limited to about 22 MB in total (30 MB request limit after encoding). Trim the export or import a smaller run.");
+        }
         const files = [];
         for (const file of list) {
           const dataUrl = await new Promise((resolve, reject) => {

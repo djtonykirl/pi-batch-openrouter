@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import test, { mock, type TestContext } from "node:test";
+import type { BatchConfig } from "../src/config.js";
 import { ArtifactService } from "../src/artifacts/service.js";
 import { ArtifactStore } from "../src/artifacts/store.js";
 import { ChatService } from "../src/chat/service.js";
@@ -26,13 +28,17 @@ interface Env {
   anon: (p: string, method?: string) => Promise<Response>;
 }
 
-function withWeb(extra: Record<string, string>, fn: (e: Env, t: TestContext) => Promise<void>): (t: TestContext) => Promise<void> {
+function withWeb(
+  extra: Record<string, string>,
+  fn: (e: Env, t: TestContext) => Promise<void>,
+  over?: (c: BatchConfig) => void,
+): (t: TestContext) => Promise<void> {
   return async (t) => {
     const root = metadataWorkspace(extra);
     let web: BatchWebServer | undefined;
     try {
       const fake = new FakeOpenRouter();
-      const cfg = makeConfig();
+      const cfg = makeConfig(over);
       const batch = new BatchService({
         registry: new JobRegistry(join(root, ".pi", "batches")),
         workspaceRoot: root,
@@ -118,8 +124,12 @@ test(
     assert.equal((await post("/api/metadata/import-bundle", { files: b.files })).status, 409);
     assert.equal(readFileSync(join(root, D, "context.md"), "utf8"), "changed");
 
+    writeFileSync(join(root, D, "tables.jsonl"), "tampered tables");
+    writeFileSync(join(root, D, "manifest.json"), "tampered manifest");
     assert.equal((await post("/api/metadata/import-bundle", { files: b.files, overwrite: true })).status, 201);
     assert.ok(readFileSync(join(root, D, "context.md")).equals(b.context));
+    assert.ok(readFileSync(join(root, D, "tables.jsonl")).equals(b.tables));
+    assert.ok(readFileSync(join(root, D, "manifest.json")).equals(b.manifest));
     assert.deepEqual(readdirSync(join(root, D)).sort(), ["context.md", "manifest.json", "tables.jsonl"]);
   }),
 );
@@ -353,4 +363,26 @@ test(
     const dl = handoff.slice(handoff.indexOf("window.downloadMetadataApproved"));
     assert.ok(dl.indexOf("probeApproved(p)") > 0 && dl.indexOf("probeApproved(p)") < dl.indexOf('createElement("a")'));
   }),
+);
+
+test(
+  "bundle-info returns {} for a context file and manifest outside the workspace",
+  withWeb(
+    {},
+    async ({ get }) => {
+      const outside = mkdtempSync(join(tmpdir(), "bundle-outside-"));
+      try {
+        writeFileSync(join(outside, "context.md"), "# ctx\n");
+        writeFileSync(join(outside, "manifest.json"), JSON.stringify({ run_id: "r1", domain_prefix: "PNPT", contract_version: "1", table_count: 2 }));
+        const r = await get(`/api/metadata/bundle-info?contextPath=${encodeURIComponent(join(outside, "context.md"))}`);
+        assert.equal(r.status, 200);
+        assert.deepEqual(await json(r), {});
+      } finally {
+        rm(outside);
+      }
+    },
+    (c) => {
+      c.security.allowOutsideWorkspace = true;
+    },
+  ),
 );

@@ -1404,7 +1404,10 @@ export class BatchWebServer {
         let ids: ReturnType<typeof manifestIds> = null;
         if (m.ok) {
           try {
-            ids = manifestIds(fs.readFileSync(m.absPath, "utf8"));
+            // Same realpath containment as approved-file: with security.allowOutsideWorkspace a context file or
+            // manifest outside the workspace (or a symlink out of it) reads as no manifest.
+            const rootReal = fs.realpathSync.native(path.resolve(this.deps.workspaceRoot));
+            if (isInside(rootReal, ctx.absPath) && isInside(rootReal, m.absPath)) ids = manifestIds(fs.readFileSync(m.absPath, "utf8"));
           } catch {
             ids = null; // unreadable (permissions, raced removal): treated as no manifest
           }

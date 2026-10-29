@@ -15,6 +15,15 @@ export type BundleCheck =
 
 const RUN_ID = /^[A-Za-z0-9._-]{1,100}$/;
 const PREFIX = /^[A-Z0-9]{4}$/;
+
+/** A run ID is a safe path segment: the allowed characters, 1-100 long, and not only dots ("." / ".."). */
+function validRunId(v: unknown): v is string {
+  return typeof v === "string" && RUN_ID.test(v) && !/^.+$/.test(v);
+}
+
+function validDomainPrefix(v: unknown): v is string {
+  return typeof v === "string" && PREFIX.test(v);
+}
 const DATA_FILES = ["tables.jsonl", "context.md"] as const;
 const MANIFEST = "manifest.json";
 
@@ -58,7 +67,7 @@ export function checkBundle(
   }
   const m = raw as Record<string, unknown>;
   if (typeof m.run_id !== "string" || !RUN_ID.test(m.run_id) || /^\.+$/.test(m.run_id)) problems.push("manifest run_id is missing or invalid");
-  if (typeof m.domain_prefix !== "string" || !PREFIX.test(m.domain_prefix)) problems.push("manifest domain_prefix is missing or invalid");
+  if (!validDomainPrefix(m.domain_prefix)) problems.push("manifest domain_prefix is missing or invalid");
   if (typeof m.contract_version !== "string") problems.push("manifest contract_version is missing");
   if (!isCount(m.table_count)) problems.push("manifest table_count is missing");
   if (typeof m.created_ts !== "string") problems.push("manifest created_ts is missing");
