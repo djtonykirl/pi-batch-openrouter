@@ -32,6 +32,7 @@ import { JobRegistry } from "../registry.js";
 import { BatchService } from "../service.js";
 import { isChatJob, type JobManifest } from "../types.js";
 import { discoverWorkflows } from "../workflows/definition.js";
+import { checkBundle } from "../metadata/bundle.js";
 import { resolveWorkspaceInput } from "../workspace-paths.js";
 import { renderWebUiHtml } from "./ui.js";
 
@@ -302,6 +303,70 @@ const UNAUTHORIZED_PAGE =
  * - Tokens are compared in constant time. Responses carry a CSP (a nonce for the one page script), nosniff and
  *   no-referrer.
  */
+type WriteTarget = { ok: true; abs: string; normRel: string } | { ok: false; error: string };
+
+/** Workspace containment, hard-deny and symlink refusal for a file the web UI is asked to write. */
+function checkWorkspaceWriteTarget(workspaceRoot: string, relPath: string): WriteTarget {
+  const rawRel = relPath.trim().replace(/\\/g, "/").replace(/^\/+/, "");
+  if (!rawRel) return { ok: false, error: "Destination file path cannot be empty." };
+  const rootReal = fs.realpathSync.native(path.resolve(workspaceRoot));
+  const abs = path.resolve(rootReal, ...rawRel.split("/"));
+  if (!isInside(rootReal, abs) || abs === rootReal) return { ok: false, error: `Refusing to write outside the workspace: ${rawRel}` };
+  const normRel = toPosix(path.relative(rootReal, abs));
+  const deny = hardDenyMatcher.match(normRel, false);
+  if (deny) return { ok: false, error: `Refusing to write to protected path "${normRel}" (matched hard-deny rule: ${deny.pattern})` };
+  // Reject writing through any existing symlink component inside the workspace
+  let cur = rootReal;
+  for (const seg of normRel.split("/")) {
+    cur = path.join(cur, seg);
+    if (fs.existsSync(cur) && fs.lstatSync(cur).isSymbolicLink()) return { ok: false, error: `Refusing to write through symbolic link: ${normRel}` };
+  }
+  return { ok: true, abs, normRel };
+}
+
+/**
+ * Write several files all or nothing: every temp file is written first, existing
+ * files are moved aside, then the temps are renamed into place. Any failure puts
+ * the originals back and removes everything it created.
+ */
+function writeFilesAllOrNothing(files: Array<{ abs: string; bytes: Buffer }>): void {
+  const suffix = `${process.pid}.${crypto.randomBytes(4).toString("hex")}`;
+  const temps: string[] = [];
+  const backups: Array<{ abs: string; bak: string }> = [];
+  const placed: string[] = [];
+  try {
+    for (const f of files) {
+      fs.mkdirSync(path.dirname(f.abs), { recursive: true });
+      const tmp = `${f.abs}.tmp.${suffix}`;
+      temps.push(tmp);
+      fs.writeFileSync(tmp, f.bytes, { flag: "wx" });
+    }
+    for (const f of files) {
+      if (fs.existsSync(f.abs)) {
+        const bak = `${f.abs}.bak.${suffix}`;
+        fs.renameSync(f.abs, bak);
+        backups.push({ abs: f.abs, bak });
+      }
+    }
+    for (const [i, f] of files.entries()) {
+      fs.renameSync(temps[i]!, f.abs);
+      placed.push(f.abs);
+    }
+  } catch (err) {
+    for (const p of placed) fs.rmSync(p, { force: true });
+    for (const b of backups) {
+      try {
+        fs.renameSync(b.bak, b.abs);
+      } catch {
+        // best-effort restore
+      }
+    }
+    for (const t of temps) fs.rmSync(t, { force: true });
+    throw err;
+  }
+  for (const b of backups) fs.rmSync(b.bak, { force: true });
+}
+
 export class BatchWebServer {
   public readonly csrfToken = crypto.randomBytes(24).toString("hex");
   private launchToken: string | null = null;
@@ -911,32 +976,12 @@ export class BatchWebServer {
 
       if (method === "POST" && pathname === "/api/workspace/write-file") {
         const body = await this.readJson<{ relPath?: string; content?: string; contentBase64?: string; overwrite?: boolean }>(req);
-        const rawRel = (body.relPath ?? "").trim().replace(/\\/g, "/").replace(/^\/+/, "");
-        if (!rawRel) {
-          this.sendJson(res, 400, { error: "Destination file path cannot be empty." });
+        const target = checkWorkspaceWriteTarget(this.deps.workspaceRoot, body.relPath ?? "");
+        if (!target.ok) {
+          this.sendJson(res, 400, { error: target.error });
           return;
         }
-        const rootReal = fs.realpathSync.native(path.resolve(this.deps.workspaceRoot));
-        const abs = path.resolve(rootReal, ...rawRel.split("/"));
-        if (!isInside(rootReal, abs) || abs === rootReal) {
-          this.sendJson(res, 400, { error: `Refusing to write outside the workspace: ${rawRel}` });
-          return;
-        }
-        const normRel = toPosix(path.relative(rootReal, abs));
-        const deny = hardDenyMatcher.match(normRel, false);
-        if (deny) {
-          this.sendJson(res, 400, { error: `Refusing to write to protected path "${normRel}" (matched hard-deny rule: ${deny.pattern})` });
-          return;
-        }
-        // Reject writing through any existing symlink component inside the workspace
-        let cur = rootReal;
-        for (const seg of normRel.split("/")) {
-          cur = path.join(cur, seg);
-          if (fs.existsSync(cur) && fs.lstatSync(cur).isSymbolicLink()) {
-            this.sendJson(res, 400, { error: `Refusing to write through symbolic link: ${normRel}` });
-            return;
-          }
-        }
+        const { abs, normRel } = target;
         let data: Buffer;
         if (body.contentBase64 !== undefined) {
           const rawB64 = body.contentBase64.includes(",")
@@ -1326,6 +1371,94 @@ export class BatchWebServer {
         this.deps.poller.updateBadge();
         this.broadcast({ type: "job_created", localId: job.localId });
         this.sendJson(res, 201, { job });
+        return;
+      }
+
+      if (method === "POST" && pathname === "/api/metadata/import-bundle") {
+        const body = await this.readJson<{ files?: UploadedFileInput[]; overwrite?: boolean }>(req);
+        const config = this.deps.getConfig();
+        const uploads = Array.isArray(body.files) ? body.files : [];
+        const files: Array<{ name: string; bytes: Buffer }> = [];
+        for (const f of uploads) {
+          if (!f || typeof f.name !== "string" || typeof f.contentBase64 !== "string") {
+            this.sendJson(res, 400, { error: "Each file needs a name and contentBase64.", problems: ["Each file needs a name and contentBase64."] });
+            return;
+          }
+          const b64 = f.contentBase64.includes(",") ? f.contentBase64.slice(f.contentBase64.indexOf(",") + 1) : f.contentBase64;
+          files.push({ name: f.name, bytes: Buffer.from(b64, "base64") });
+        }
+        const check = checkBundle(files, { maxBytes: config.workflows.maxDatasetBytes });
+        if (!check.ok) {
+          this.sendJson(res, 400, { error: `Bundle refused: ${check.problems.join("; ")}`, problems: check.problems });
+          return;
+        }
+        const targets: Array<{ abs: string; bytes: Buffer }> = [];
+        for (const w of check.writes) {
+          const t = checkWorkspaceWriteTarget(this.deps.workspaceRoot, w.relPath);
+          if (!t.ok) {
+            this.sendJson(res, 400, { error: t.error, problems: [t.error] });
+            return;
+          }
+          if (fs.existsSync(t.abs)) {
+            if (!fs.lstatSync(t.abs).isFile()) {
+              const msg = `Refusing to replace something that is not a regular file: ${t.normRel}`;
+              this.sendJson(res, 400, { error: msg, problems: [msg] });
+              return;
+            }
+            if (!body.overwrite) {
+              this.sendJson(res, 409, { error: `${t.normRel} already exists; nothing was written (re-import with overwrite to replace the run's files).` });
+              return;
+            }
+          }
+          targets.push({ abs: t.abs, bytes: w.bytes });
+        }
+        try {
+          writeFilesAllOrNothing(targets);
+        } catch (err) {
+          this.sendJson(res, 400, { error: `Could not write the bundle; nothing was replaced: ${err instanceof Error ? err.message : String(err)}` });
+          return;
+        }
+        const m = check.manifest;
+        this.sendJson(res, 201, {
+          dest: check.dest,
+          contextPath: `${check.dest}/context.md`,
+          inputPath: `${check.dest}/tables.jsonl`,
+          manifest: { run_id: m.run_id, domain_prefix: m.domain_prefix, contract_version: m.contract_version, table_count: m.table_count },
+        });
+        return;
+      }
+
+      if (method === "GET" && pathname === "/api/metadata/approved-file") {
+        const rel = parsedUrl.searchParams.get("path")?.trim() ?? "";
+        if (!rel) {
+          this.sendJson(res, 400, { error: "Missing ?path= parameter" });
+          return;
+        }
+        if (!rel.toLowerCase().endsWith(".jsonl")) {
+          this.sendJson(res, 400, { error: "Only .jsonl files can be downloaded here." });
+          return;
+        }
+        const config = this.deps.getConfig();
+        const r = resolveWorkspaceInput(this.deps.workspaceRoot, rel, config, { what: "approved file", maxBytes: config.workflows.maxDatasetBytes });
+        if (!r.ok) {
+          this.sendJson(res, 400, { error: r.message });
+          return;
+        }
+        const rootReal = fs.realpathSync.native(path.resolve(this.deps.workspaceRoot));
+        if (!isInside(rootReal, r.absPath)) {
+          this.sendJson(res, 400, { error: "approved file is outside the workspace" });
+          return;
+        }
+        const bytes = fs.readFileSync(r.absPath);
+        const name = path.basename(r.absPath).replace(/[^A-Za-z0-9._-]/g, "_");
+        res.writeHead(200, {
+          "Content-Type": "application/x-ndjson",
+          "Content-Length": bytes.length,
+          "Content-Disposition": `attachment; filename="${name}"`,
+          "Cache-Control": "no-store",
+          "X-Content-Type-Options": "nosniff",
+        });
+        res.end(bytes);
         return;
       }
 
