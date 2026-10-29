@@ -25,6 +25,8 @@ const snap = (over: Partial<CatalogSnapshot> = {}): CatalogSnapshot => ({
   ],
   // a/batchy's batch endpoint is not on the ZDR list; b/zdrmodel's is.
   batchEndpoints: { "a/batchy": ["p9"], "b/zdrmodel": ["p1"] },
+  // c/free-one:free runs on p2, which is on the ZDR list; d/free-two:free runs on a host that is not.
+  freeEndpoints: { "c/free-one": ["p2"], "d/free-two": ["px"] },
   ...over,
 });
 
@@ -53,7 +55,7 @@ test("pickerEntries at zdr blocks models without a ZDR endpoint, with a reason",
   assert.equal(byId(e, "a/batchy")?.blocked, "Privacy level zdr: a/batchy has no batch endpoint on OpenRouter's ZDR list (its batch endpoints: p9; ZDR endpoints: none)");
   assert.equal(byId(e, "b/zdrmodel")?.blocked, undefined);
   assert.equal(byId(e, "c/free-one:free")?.blocked, undefined);
-  assert.match(byId(e, "d/free-two:free")?.blocked ?? "", /no ZDR provider/);
+  assert.equal(byId(e, "d/free-two:free")?.blocked, "Privacy level zdr: d/free-two:free has no free endpoint on OpenRouter's ZDR list (its free endpoints: px; ZDR endpoints: none)");
 });
 
 test("pickerEntries at zdr blocks everything when the catalog is stale or missing", () => {

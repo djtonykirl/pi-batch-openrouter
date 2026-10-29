@@ -4,6 +4,7 @@ import { OpenRouterBatchClient, type FetchLike } from "../../src/openrouter/clie
 import { JobRegistry } from "../../src/registry.js";
 import { BatchService } from "../../src/service.js";
 import type { JobManifest } from "../../src/types.js";
+import type { ModelCatalog } from "../../src/models/catalog.js";
 import { batchObject } from "./openrouter.js";
 
 export const FAKE_KEY = "sk-or-v1-" + "fa4e".repeat(16);
@@ -113,7 +114,7 @@ export function makeConfig(over: (c: BatchConfig) => void = () => {}): BatchConf
   return c;
 }
 
-export function makeService(root: string, fake: FakeOpenRouter, cfg = makeConfig(), settled: JobManifest[] = []): BatchService {
+export function makeService(root: string, fake: FakeOpenRouter, cfg = makeConfig(), settled: JobManifest[] = [], catalog?: ModelCatalog): BatchService {
   return new BatchService({
     registry: new JobRegistry(path.join(root, ".pi", "batches")),
     workspaceRoot: root,
@@ -122,6 +123,7 @@ export function makeService(root: string, fake: FakeOpenRouter, cfg = makeConfig
     createClient: (apiKey, timeoutMs) => new OpenRouterBatchClient({ apiKey, fetchImpl: fake.fetch, timeoutMs }),
     gitIgnored: () => new Set(),
     onSettled: (j) => settled.push(j),
+    ...(catalog ? { catalog } : {}),
   });
 }
 

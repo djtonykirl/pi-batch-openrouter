@@ -43,6 +43,11 @@ export interface BatchConfig {
     maxRowsPerRun: number;
     /** Dataset workflows: largest dataset file read. */
     maxDatasetBytes: number;
+    /**
+     * UC metadata standards mode: send the proposal schema as a structured output (response_format, strict). Every
+     * :batch model in the catalog reported structured_outputs support on 2026-10-28; set false for a model that rejects it.
+     */
+    metadataStructuredOutput: boolean;
   };
   /** Batch chat: persistent named threads. */
   chat: { autoCompact: boolean; autoCompactTokens: number; keepRecentExchanges: number; retitleAtTurn: number; systemPrompt: string };
@@ -62,6 +67,15 @@ export interface BatchConfig {
     accountDataCollectionDenied: boolean;
   };
 }
+
+/**
+ * Default for workflows.metadataStructuredOutput: off. A live standards batch on google/gemini-3.8-flash (2026-10-28) was
+ * rejected with "Invalid response_json_schema: schema at properties.columns.items.properties.pii_tags.anyOf.0.
+ * additionalProperties must be a boolean or an object" although the schema sent was valid JSON Schema: strict structured
+ * output depends on each provider's schema translation, and a rejection fails every item. Opt in per project once a
+ * model's batch endpoints are known to accept it.
+ */
+export const METADATA_STRUCTURED_OUTPUT_DEFAULT = false;
 
 export const DEFAULT_CONFIG: BatchConfig = {
   schemaVersion: 1,
@@ -91,6 +105,7 @@ export const DEFAULT_CONFIG: BatchConfig = {
     maxSynthesisCharacters: 1_000_000,
     maxRowsPerRun: 1_000,
     maxDatasetBytes: 20_000_000,
+    metadataStructuredOutput: METADATA_STRUCTURED_OUTPUT_DEFAULT,
   },
   chat: {
     autoCompact: true,
@@ -208,6 +223,7 @@ const SCHEMA: Record<string, Check | Record<string, Check>> = {
     maxSynthesisCharacters: posInt(),
     maxRowsPerRun: posInt(100_000),
     maxDatasetBytes: posInt(),
+    metadataStructuredOutput: bool,
   },
   chat: {
     autoCompact: bool,

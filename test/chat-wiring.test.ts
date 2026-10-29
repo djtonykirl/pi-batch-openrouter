@@ -32,3 +32,12 @@ test("poller onTick runs after a pass and a throwing onTick does not stop schedu
 test("badge still counts active chat jobs", () => {
   assert.equal(badgeText([job("B-1", "chat", "submitted")]), "📦 Batch: 1 active");
 });
+
+test("badge: settled chat jobs (applied to their thread) never count as ready, partial or attention", () => {
+  const withError = (j: JobManifest) => ({ ...j, lastPollError: { category: "network", message: "x", at: "2026-10-28T00:00:00.000Z" } }) as JobManifest;
+  const chat = [job("B-1", "chat", "ready"), job("B-2", "chat", "partial"), job("B-3", "chat", "corrupt"), withError(job("B-4", "chat", "polling"))];
+  assert.equal(badgeText(chat), "📦 Batch: 1 active", "only the in-flight chat job counts, as active");
+  const goals = [job("G-1", "goal", "ready"), job("G-2", "goal", "partial"), job("G-3", "goal", "corrupt"), withError(job("G-4", "goal", "polling"))];
+  assert.equal(badgeText([...goals, ...chat]), "📦 Batch: 2 active | 1 partial | 1 ready | 2 attention");
+  assert.equal(badgeText([job("B-9", "chat", "ready")]), undefined);
+});

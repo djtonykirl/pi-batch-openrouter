@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { ArtifactService } from "../artifacts/service.js";
 import { ArtifactStore } from "../artifacts/store.js";
-import { prepareAttachments, type AttachmentRequestInput, type UploadedFileInput } from "../attachments.js";
+import { isPdfPath, MAX_PDF_BYTES, prepareAttachments, type AttachmentRequestInput, type UploadedFileInput } from "../attachments.js";
 import { exportMarkdown, formatCost } from "../chat/commands.js";
 import { conversationOrder, estimateTokens } from "../chat/request.js";
 import { ChatService, PROJECT_INSTRUCTIONS_FILE } from "../chat/service.js";
@@ -19,6 +19,7 @@ import { atomicWriteFile, isInside, sha256Hex, writeFileAtomicExclusive } from "
 import { jobItems, sourceLabel } from "../items.js";
 import { formatMetadataPreview } from "../metadata-commands.js";
 import { writeApprovedDraft, writeMetadataReview } from "../metadata/outputs.js";
+import { webWording, webWordingPayload } from "./wording.js";
 import { validateApprovedText } from "../metadata/report.js";
 import { FileLogger } from "../logger.js";
 import { fetchCatalogData, immediateRouteAllowed, immediateRouteRefusal, ModelCatalog, type CatalogData } from "../models/catalog.js";
@@ -233,10 +234,12 @@ export function inspectWorkspaceFiles(workspaceRoot: string, config: BatchConfig
       e.rule = cm.pattern;
       continue;
     }
-    if ((e.bytes ?? 0) > config.context.maxFileBytes) {
+    // A selected PDF is read as a PDF (text extracted), so its own limit applies.
+    const limit = isPdfPath(e.relPath) ? MAX_PDF_BYTES : config.context.maxFileBytes;
+    if ((e.bytes ?? 0) > limit) {
       e.selectable = false;
       e.excludedLayer = "too-large";
-      e.rule = `> ${config.context.maxFileBytes} B`;
+      e.rule = `> ${limit} B`;
     }
   }
   // The project's own batch configuration is never offered as an attachment (buildContextPackage's rules are unchanged).
@@ -249,6 +252,11 @@ export function inspectWorkspaceFiles(workspaceRoot: string, config: BatchConfig
   }
 
   return entries;
+}
+
+/** The fallback notice shared by new threads and the job studio: "<id> [labels]: the default model … is refused …". */
+function modelFallbackNotice(pick: { id: string; labels: string[] }, model: string, level: PrivacyLevel, refusal: string): string {
+  return `${pick.id} [${pick.labels.join(", ")}]: the default model ${model} is refused at privacy level ${level} (${refusal}).`;
 }
 
 /** A route from a request body. `immediate` is accepted only for a free model (`:free`, or free in the catalog). */
@@ -592,15 +600,31 @@ export class BatchWebServer {
       // setModel decides again; if it refuses, the thread keeps the default and the reason is shown.
       return { warning: `The default model ${model} is refused at privacy level ${level} (${refusal}); switching to ${pick.id} was refused too: ${err instanceof Error ? err.message : String(err)}` };
     }
-    return { notice: `Started on ${pick.id} [${pick.labels.join(", ")}]: the default model ${model} is refused at privacy level ${level} (${refusal}).` };
+    return { notice: `Started on ${modelFallbackNotice(pick, model, level, refusal)}` };
+  }
+
+  /**
+   * The New Batch Job studio's model when the default is refused at the project level: the first selectable batch
+   * model (a ZDR-labelled one first at zdr), as for new threads; jobs never take a free model. The job is still decided
+   * when it is planned and submitted.
+   */
+  private jobModelFallback(level: PrivacyLevel, refusal: string): { id: string; notice: string } | undefined {
+    const privacy = this.deps.service.privacyConfig();
+    const config = this.deps.getConfig();
+    const model = normalizeBatchModelSlug(config.defaultModel);
+    const entries = pickerEntries(this.deps.catalog?.snapshot(), this.batchCandidates(), level, privacy.accountNoTraining, allowedProviders(config), config);
+    const pick = fallbackPickerEntry(entries.filter((e) => e.route === "batch"), level);
+    return pick ? { id: pick.id, notice: `Model set to ${modelFallbackNotice(pick, model, level, refusal)}` } : undefined;
   }
 
   private privacyState(): Record<string, unknown> {
     const p = this.deps.service.privacyConfig();
     const config = this.deps.getConfig();
     const defaultModelRefusal = this.modelRefusal(normalizeBatchModelSlug(config.defaultModel), p.level);
+    const jobModel = defaultModelRefusal ? this.jobModelFallback(p.level, defaultModelRefusal) : undefined;
     return {
       ...(defaultModelRefusal ? { defaultModelRefusal } : {}),
+      ...(jobModel ? { jobModelFallback: jobModel } : {}),
       level: p.level,
       source: levelSource(this.deps.workspaceRoot),
       accountNoTraining: p.accountNoTraining,
@@ -1007,8 +1031,10 @@ export class BatchWebServer {
         const action = threadMatch[2];
 
         if (method === "GET" && !action) {
-          const thread = this.deps.chatStore.read(threadId);
-          const entries = conversationOrder(this.deps.chatStore.transcript(threadId).entries);
+          const stored = this.deps.chatStore.read(threadId);
+          // Failure messages are stored with terminal hints (/batch chat retry); the page words them for its buttons.
+          const thread = stored.lastFailure ? { ...stored, lastFailure: { ...stored.lastFailure, message: webWording(stored.lastFailure.message) } } : stored;
+          const entries = conversationOrder(this.deps.chatStore.transcript(threadId).entries).map((e) => (e.type === "failure" ? { ...e, message: webWording(e.message) } : e));
           const estimate = this.deps.chat.nextRequestEstimate(threadId);
           const threadJobs = this.deps.service.registry.list().jobs.filter((j) => j.chat?.threadId === threadId);
           const pendingJob = thread.pending?.jobId ? this.safeReadJob(thread.pending.jobId) : undefined;
@@ -1326,9 +1352,9 @@ export class BatchWebServer {
         }
         const body = await this.readJson<{ out?: string; overwrite?: boolean; allowPartial?: boolean }>(req);
         if (!body.out?.trim()) throw new Error("out is required: the approved handoff is written to an explicit .jsonl path");
-        const { manifest, validation } = await writeApprovedDraft(this.deps.service, this.deps.artifacts, jobRef, { out: body.out, overwrite: body.overwrite === true, allowPartial: body.allowPartial === true });
+        const { manifest, validation, outcome } = await writeApprovedDraft(this.deps.service, this.deps.artifacts, jobRef, { out: body.out, overwrite: body.overwrite === true, allowPartial: body.allowPartial === true });
         this.broadcast({ type: "artifact_created", artifactId: manifest.artifactId });
-        this.sendJson(res, 200, { path: manifest.output!.path, artifactId: manifest.artifactId, sha256: manifest.output!.sha256, counts: validation.counts, problems: validation.problems });
+        this.sendJson(res, 200, { path: manifest.output!.path, artifactId: manifest.artifactId, sha256: manifest.output!.sha256, tables: outcome.tables.length, counts: validation.counts, problems: validation.problems });
         return;
       }
 
@@ -1522,6 +1548,8 @@ export class BatchWebServer {
   }
 
   private sendJson(res: http.ServerResponse, status: number, payload: unknown): void {
+    // Messages shown on the page (errors, refusals, warnings, notices) get page wording for their command hints.
+    payload = webWordingPayload(payload);
     const body = JSON.stringify(payload);
     res.writeHead(status, {
       "Content-Type": "application/json; charset=utf-8",

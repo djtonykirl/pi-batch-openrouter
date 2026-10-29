@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import { atomicWriteJson } from "../fsutil.js";
 import type { Logger } from "../logger.js";
-import { batchEndpointsPath, batchZdrView, normaliseModelSlug, routeForModel, type CatalogView, type ZdrEndpoint } from "../privacy/policy.js";
+import { batchZdrView, immediateHasZdr, normaliseModelSlug, routeForModel, variantEndpointsPath, type CatalogView, type EndpointVariant, type ZdrEndpoint } from "../privacy/policy.js";
 
 export interface CatalogModel {
   id: string;
@@ -25,10 +25,12 @@ export interface CatalogData {
   zdr: ZdrEndpoint[];
   /** Normalised model ID -> its `:batch` endpoint tags. Absent or missing a model: unknown for that model. */
   batchEndpoints?: Record<string, string[]>;
+  /** Normalised model ID -> its `:free` endpoint tags. Absent or missing a model: unknown for that model. */
+  freeEndpoints?: Record<string, string[]>;
 }
 
 export interface CatalogDeps {
-  /** Throws only when the core lists (/models, /endpoints/zdr) fail; per-model batch-endpoint failures leave that model out. */
+  /** Throws only when the core lists (/models, /endpoints/zdr) fail; per-model batch/free endpoint failures leave that model out. */
   fetch: () => Promise<CatalogData>;
   /** Last-known copy, used for display only. */
   file: string;
@@ -55,19 +57,31 @@ export const BATCH_ENDPOINT_CONCURRENCY = 8;
 /** Overall limit for loading the per-model `:batch` endpoints, so a slow API can't hold up the first zdr decision. */
 export const BATCH_ENDPOINTS_DEADLINE_MS = 20_000;
 
-/**
- * Loads the `:batch` endpoint tags of every `:batch` model in `models`, at most `concurrency` at a time, within
- * `deadlineMs`. A model whose request fails or is still pending at the deadline is listed in `failed` and has no entry
- * (unknown); it never fails the whole load. IDs with an unsafe path segment are never requested (also `failed`).
- */
-export async function loadBatchEndpoints(
+/** Loads the `:batch` endpoint tags of every `:batch` model in `models` (see loadVariantEndpoints). */
+export function loadBatchEndpoints(
   models: CatalogModel[],
   fetchOne: (batchModelId: string) => Promise<string[]>,
   concurrency = BATCH_ENDPOINT_CONCURRENCY,
   deadlineMs = BATCH_ENDPOINTS_DEADLINE_MS,
 ): Promise<{ endpoints: Record<string, string[]>; failed: string[] }> {
-  const all = [...new Set(models.map((m) => m.id).filter((id) => id.endsWith(":batch") && normaliseModelSlug(id) !== "__proto__"))];
-  const ids = all.filter((id) => batchEndpointsPath(id) !== undefined);
+  return loadVariantEndpoints(models, "batch", fetchOne, concurrency, deadlineMs);
+}
+
+/**
+ * Loads the endpoint tags of every `:{variant}` model in `models`, keyed by normalised ID, at most `concurrency` at a
+ * time, within `deadlineMs`. A model whose request fails or is still pending at the deadline is listed in `failed` and
+ * has no entry (unknown); it never fails the whole load. IDs with an unsafe path segment are never requested (also
+ * `failed`).
+ */
+export async function loadVariantEndpoints(
+  models: CatalogModel[],
+  variant: EndpointVariant,
+  fetchOne: (variantModelId: string) => Promise<string[]>,
+  concurrency = BATCH_ENDPOINT_CONCURRENCY,
+  deadlineMs = BATCH_ENDPOINTS_DEADLINE_MS,
+): Promise<{ endpoints: Record<string, string[]>; failed: string[] }> {
+  const all = [...new Set(models.map((m) => m.id).filter((id) => id.endsWith(`:${variant}`) && normaliseModelSlug(id) !== "__proto__"))];
+  const ids = all.filter((id) => variantEndpointsPath(id, variant) !== undefined);
   const endpoints: Record<string, string[]> = {};
   let timer: NodeJS.Timeout | undefined;
   const expired = new Promise<"expired">((resolve) => {
@@ -102,14 +116,20 @@ export interface CatalogClient {
   listModels(): Promise<{ models: CatalogModel[] }>;
   listZdrEndpoints(): Promise<{ endpoints: ZdrEndpoint[] }>;
   listBatchEndpoints(model: string): Promise<{ tags: string[] }>;
+  listFreeEndpoints(model: string): Promise<{ tags: string[] }>;
 }
 
-/** The full catalog load: /models and /endpoints/zdr (which must succeed), then each `:batch` model's endpoints. */
+/** The full catalog load: /models and /endpoints/zdr (which must succeed), then each `:batch` and `:free` model's endpoints. */
 export async function fetchCatalogData(client: CatalogClient, logger?: Logger): Promise<CatalogData> {
   const [models, zdr] = await Promise.all([client.listModels(), client.listZdrEndpoints()]);
-  const batch = await loadBatchEndpoints(models.models, async (id) => (await client.listBatchEndpoints(id)).tags);
+  // Side by side, each with its own concurrency limit and deadline.
+  const [batch, free] = await Promise.all([
+    loadVariantEndpoints(models.models, "batch", async (id) => (await client.listBatchEndpoints(id)).tags),
+    loadVariantEndpoints(models.models, "free", async (id) => (await client.listFreeEndpoints(id)).tags),
+  ]);
   if (batch.failed.length) logger?.log("warn", "catalog.batch_endpoints_failed", { count: batch.failed.length, models: batch.failed.slice(0, 20) });
-  return { models: models.models, zdr: zdr.endpoints, batchEndpoints: batch.endpoints };
+  if (free.failed.length) logger?.log("warn", "catalog.free_endpoints_failed", { count: free.failed.length, models: free.failed.slice(0, 20) });
+  return { models: models.models, zdr: zdr.endpoints, batchEndpoints: batch.endpoints, freeEndpoints: free.endpoints };
 }
 
 /** Session model catalog: one deduplicated load at a time; `fresh` is true only after a successful network load. */
@@ -138,7 +158,7 @@ export class ModelCatalog {
    */
   public view(): (CatalogSnapshot & { loading?: true }) | undefined {
     if (!this.inFlight) return this.current;
-    return { ...(this.current ?? { fresh: false, zdr: [], models: [], batchEndpoints: {}, loadedAt: "" }), loading: true };
+    return { ...(this.current ?? { fresh: false, zdr: [], models: [], batchEndpoints: {}, freeEndpoints: {}, loadedAt: "" }), loading: true };
   }
 
   /** Waits for the in-flight load (if any) for up to `timeoutMs`; resolves `undefined` on timeout. */
@@ -160,18 +180,18 @@ export class ModelCatalog {
     const snap = this.current;
     if (!snap) return { free: false, zdr: false };
     const model = snap.models.find((m) => m.id === modelId) ?? snap.models.find((m) => normaliseModelSlug(m.id) === base && m.free);
-    // Batch route: ZDR only when one of its batch endpoints is on the ZDR list; immediate route: the sync ZDR endpoints.
-    const zdr = routeForModel(modelId) === "batch" ? batchZdrView(snap, base).pinnable.length > 0 : snap.zdr.some((z) => z.model === base);
+    // Batch route: ZDR only when one of its batch endpoints is on the ZDR list; `:free`: one of its free endpoints.
+    const zdr = routeForModel(modelId) === "batch" ? batchZdrView(snap, base).pinnable.length > 0 : immediateHasZdr(snap, modelId);
     return { free: !!model?.free, zdr };
   }
 
   private async doLoad(): Promise<CatalogSnapshot> {
     const now = (this.deps.now ?? (() => new Date()))();
     try {
-      const { models, zdr, batchEndpoints = {} } = await this.deps.fetch();
-      const snap: CatalogSnapshot = { fresh: true, models, zdr, batchEndpoints, loadedAt: now.toISOString() };
+      const { models, zdr, batchEndpoints = {}, freeEndpoints = {} } = await this.deps.fetch();
+      const snap: CatalogSnapshot = { fresh: true, models, zdr, batchEndpoints, freeEndpoints, loadedAt: now.toISOString() };
       try {
-        atomicWriteJson(this.deps.file, { models, zdr, batchEndpoints, loadedAt: snap.loadedAt });
+        atomicWriteJson(this.deps.file, { models, zdr, batchEndpoints, freeEndpoints, loadedAt: snap.loadedAt });
       } catch (err) {
         this.deps.logger?.log("warn", "catalog.save_failed", { error: errorText(err) });
       }
@@ -186,6 +206,7 @@ export class ModelCatalog {
         models: last?.models ?? [],
         zdr: last?.zdr ?? [],
         batchEndpoints: last?.batchEndpoints ?? {},
+        freeEndpoints: last?.freeEndpoints ?? {},
         loadedAt: last?.loadedAt ?? now.toISOString(),
         error,
       };
@@ -194,7 +215,7 @@ export class ModelCatalog {
     }
   }
 
-  private readLastKnown(): { models: CatalogModel[]; zdr: ZdrEndpoint[]; batchEndpoints: Record<string, string[]>; loadedAt?: string } | undefined {
+  private readLastKnown(): { models: CatalogModel[]; zdr: ZdrEndpoint[]; batchEndpoints: Record<string, string[]>; freeEndpoints: Record<string, string[]>; loadedAt?: string } | undefined {
     try {
       const j = JSON.parse(fs.readFileSync(this.deps.file, "utf8")) as Record<string, unknown>;
       if (!Array.isArray(j.models) || !Array.isArray(j.zdr)) return undefined;
@@ -202,7 +223,8 @@ export class ModelCatalog {
       return {
         models: j.models.filter(isCatalogModel),
         zdr: j.zdr.filter(isZdrEndpoint),
-        batchEndpoints: readBatchEndpoints(j.batchEndpoints),
+        batchEndpoints: readEndpointMap(j.batchEndpoints),
+        freeEndpoints: readEndpointMap(j.freeEndpoints),
         loadedAt: typeof j.loadedAt === "string" ? j.loadedAt : undefined,
       };
     } catch {
@@ -229,8 +251,8 @@ function isZdrEndpoint(v: unknown): v is ZdrEndpoint {
   return typeof e.model === "string" && e.model.length > 0 && typeof e.provider === "string" && e.provider.length > 0;
 }
 
-/** The disk copy's batch endpoints: entries that aren't a non-empty key with an array are dropped, and so are non-string or empty tags. */
-function readBatchEndpoints(v: unknown): Record<string, string[]> {
+/** The disk copy's batch or free endpoints: entries that aren't a non-empty key with an array are dropped, and so are non-string or empty tags. */
+function readEndpointMap(v: unknown): Record<string, string[]> {
   const out: Record<string, string[]> = {};
   if (typeof v !== "object" || v === null || Array.isArray(v)) return out;
   for (const [model, tags] of Object.entries(v as Record<string, unknown>)) {

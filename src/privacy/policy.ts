@@ -46,6 +46,11 @@ export interface CatalogView {
    * only on these, which are a different set from the sync endpoints that /endpoints/zdr lists. No entry: unknown.
    */
   batchEndpoints?: Record<string, string[]>;
+  /**
+   * Normalised model ID -> the endpoint tags of its `:free` model (GET /models/{id}:free/endpoints). A `:free` request
+   * runs only on these, which are usually not the paid endpoints /endpoints/zdr lists for the base model. No entry: unknown.
+   */
+  freeEndpoints?: Record<string, string[]>;
   /** A load is still in flight (only meaningful when not fresh): refusals say so rather than suggesting a refresh. */
   loading?: true;
 }
@@ -72,14 +77,61 @@ function batchZdrRefusal(slug: string, view: ReturnType<typeof batchZdrView>): s
   return view.pinnable.length === 0 ? noZdr() : undefined;
 }
 
+/** A model variant with its own endpoint list: `:batch` (Batch API) or `:free` (the free immediate route). */
+export type EndpointVariant = "batch" | "free";
+
 /**
- * The API path of a model's `:batch` endpoint list, each segment URL-encoded (`:` kept). Undefined for an ID with an
- * empty, "." or ".." segment, which is never requested.
+ * The API path of a model variant's endpoint list (`/models/{id}:{variant}/endpoints`), each segment URL-encoded (`:`
+ * kept). Undefined for an ID with an empty, "." or ".." segment, which is never requested.
  */
-export function batchEndpointsPath(model: string): string | undefined {
+export function variantEndpointsPath(model: string, variant: EndpointVariant): string | undefined {
   const segments = normaliseModelSlug(model).split("/");
   if (segments.some((s) => s === "" || s === "." || s === "..")) return undefined;
-  return `/models/${segments.map((s) => encodeURIComponent(s).replace(/%3A/gi, ":")).join("/")}:batch/endpoints`;
+  return `/models/${segments.map((s) => encodeURIComponent(s).replace(/%3A/gi, ":")).join("/")}:${variant}/endpoints`;
+}
+
+/** The API path of a model's `:batch` endpoint list (see variantEndpointsPath). */
+export function batchEndpointsPath(model: string): string | undefined {
+  return variantEndpointsPath(model, "batch");
+}
+
+/**
+ * The free-route ZDR view of one model: its ZDR endpoint tags, its `:free` endpoint tags (undefined when they were not
+ * loaded), and `qualifying`, the free endpoints whose exact tag is on the ZDR list (the batch rule, applied to `:free`).
+ */
+export function freeZdrView(catalog: CatalogView | undefined, model: string): { zdr: string[]; free?: string[]; qualifying: string[] } {
+  const slug = normaliseModelSlug(model);
+  const zdr = [...new Set((catalog?.zdr ?? []).filter((e) => e.model === slug).map((e) => e.provider))].sort();
+  const map = catalog?.freeEndpoints;
+  const free = map && Object.hasOwn(map, slug) && Array.isArray(map[slug]) ? [...new Set(map[slug])].sort() : undefined;
+  return { zdr, free, qualifying: free ? free.filter((t) => zdr.includes(t)) : [] };
+}
+
+/** Whether an immediate-route model counts as ZDR: a `:free` ID by its free endpoints, any other by the ZDR list. */
+export function immediateHasZdr(catalog: CatalogView | undefined, model: string): boolean {
+  const slug = normaliseModelSlug(model);
+  return model.endsWith(":free") ? freeZdrView(catalog, slug).qualifying.length > 0 : !!catalog?.zdr.some((e) => e.model === slug);
+}
+
+/**
+ * Why an immediate-route model can't be sent at zdr, or undefined. The catalog must be fresh. A `:free` ID runs only on
+ * its own free endpoints, so one of them must be on the ZDR list (unknown free endpoints are refused); a model free by
+ * price runs on the base model's endpoints, so a ZDR endpoint for it suffices. Requests still carry `zdr: true`.
+ */
+export function immediateZdrRefusal(catalog: CatalogView | undefined, model: string): string | undefined {
+  if (!catalog?.fresh) {
+    return catalog?.loading
+      ? "Privacy level zdr: the model catalog is still loading; try again in a moment"
+      : "Privacy level zdr: model catalog not loaded this session, so ZDR endpoints can't be verified (run /batch privacy refresh)";
+  }
+  const slug = normaliseModelSlug(model);
+  if (!model.endsWith(":free")) return catalog.zdr.some((e) => e.model === slug) ? undefined : `Privacy level zdr: no ZDR endpoint available for ${slug}`;
+  const view = freeZdrView(catalog, slug);
+  const noZdr = () =>
+    `Privacy level zdr: ${model} has no free endpoint on OpenRouter's ZDR list (its free endpoints: ${view.free ? view.free.join(", ") || "none" : "unknown"}; ZDR endpoints: ${view.zdr.join(", ") || "none"})`;
+  if (view.zdr.length === 0) return noZdr();
+  if (!view.free) return `Privacy level zdr: the free endpoints of ${model} could not be loaded this session (run /batch privacy refresh)`;
+  return view.qualifying.length === 0 ? noZdr() : undefined;
 }
 
 export type ProviderDecision =

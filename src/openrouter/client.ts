@@ -1,6 +1,6 @@
 import type { BatchSnapshot, SubmitBody } from "./types.js";
 import type { CatalogModel } from "../models/catalog.js";
-import { batchEndpointsPath, normaliseModelSlug, type ZdrEndpoint } from "../privacy/policy.js";
+import { batchEndpointsPath, normaliseModelSlug, variantEndpointsPath, type ZdrEndpoint } from "../privacy/policy.js";
 
 export interface HttpResponseLike {
   status: number;
@@ -178,6 +178,17 @@ export class OpenRouterBatchClient {
     const pathName = batchEndpointsPath(model);
     if (!pathName) throw new Error(`refusing to request the batch endpoints of ${JSON.stringify(model)}: unsafe model ID`);
     const raw = await this.request("GET", pathName, "batch_endpoints");
+    return { raw, tags: parseBatchEndpointTags(raw.bodyText) };
+  }
+
+  /**
+   * GET /models/{author}/{slug}:free/endpoints (public): the endpoint tags a `:free` request can run on. These are
+   * usually not the paid endpoints /endpoints/zdr lists for the base model.
+   */
+  public async listFreeEndpoints(model: string): Promise<{ raw: RawExchange; tags: string[] }> {
+    const pathName = variantEndpointsPath(model, "free");
+    if (!pathName) throw new Error(`refusing to request the free endpoints of ${JSON.stringify(model)}: unsafe model ID`);
+    const raw = await this.request("GET", pathName, "free_endpoints");
     return { raw, tags: parseBatchEndpointTags(raw.bodyText) };
   }
 

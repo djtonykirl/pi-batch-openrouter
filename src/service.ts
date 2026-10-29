@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { prepareAttachments, type ChatAttachmentMeta, type UploadedFileInput } from "./attachments.js";
+import { isPdfPath, prepareAttachments, type ChatAttachmentMeta, type UploadedFileInput } from "./attachments.js";
 import type { BatchConfig } from "./config.js";
 import { buildContextPackage, SYSTEM_PROMPT, type ContextPackage, type PackageInput } from "./context/package.js";
 import { formatSecretFindings, scanForSecrets } from "./context/secrets.js";
@@ -15,7 +15,7 @@ import { immediateResultId, runImmediateJob, type ImmediateItemState, type Immed
 import { normaliseBatchResult, type NormalisedBatchResult } from "./openrouter/normalise-result.js";
 import { accountRequirementBlockers, allowListPin, allowedProviders, pinOutsideAllowList, resolveRouting } from "./openrouter/routing.js";
 import { buildSubmitBody, messageText, submitBodyProblems, type BatchRequestItem, type ChatMessage, type ProviderPin, type SubmitBody } from "./openrouter/types.js";
-import { effectiveLevel, resolveBatchProvider, routeForModel, stricter, type CatalogView, type PrivacyLevel, type Route } from "./privacy/policy.js";
+import { effectiveLevel, immediateZdrRefusal, resolveBatchProvider, routeForModel, stricter, type CatalogView, type PrivacyLevel, type Route } from "./privacy/policy.js";
 import { compileOutputSchema, type OutputValidator } from "./workflows/structured.js";
 import { findWorkflow, formatDiagnostics, type WorkflowDefinition, type WorkflowEntry } from "./workflows/definition.js";
 import { planDatasetRun, type DatasetPlan, type EffectiveLimits } from "./workflows/dataset-run.js";
@@ -219,7 +219,7 @@ export type PrivacyDecision =
 /**
  * The privacy decision for a draft, without I/O: the effective level (stricter of config and draft), the routing.require*
  * checks, the immediate-route rules, routing.allowedProviders and the batch provider decision. `persistJob` applies it
- * before anything is written; `previewPrivacy` shows it in a dry run. `catalog` is only read at zdr on the batch route.
+ * before anything is written; `previewPrivacy` shows it in a dry run. `catalog` is only read at zdr.
  */
 export function decidePrivacyFor(input: {
   config: BatchConfig;
@@ -240,6 +240,12 @@ export function decidePrivacyFor(input: {
     // The allow-list is sent as provider.only with each call (immediateStep); a user pin must still be within it.
     const outsideList = pinOutsideAllowList(config, draft.pin);
     if (outsideList) return { ok: false, reason: outsideList, refusal: "policy" };
+    // At zdr a `:free` model must have a free endpoint on the ZDR list, checked locally before any request (OpenRouter
+    // would otherwise answer 404 "No endpoints found matching your data policy"). The request still carries zdr: true.
+    if (level === "zdr") {
+      const refusal = immediateZdrRefusal(catalog, draft.model);
+      if (refusal) return { ok: false, reason: refusal, refusal: "privacy" };
+    }
     const enforcement = level === "zdr" ? "immediate: zdr=true" : level === "no-training" ? "immediate: data_collection=deny" : "none";
     // The immediate body carries only the privacy fields, so a pin is never recorded as if it were sent.
     return { ok: true, route, privacy: { level, route, enforcement } };
@@ -443,10 +449,12 @@ export class BatchService {
     const routing = resolveRouting(config, options.providerPin, this.privacyConfig().level);
     const pin = routing.pin;
     const knownSecrets = await this.knownSecrets(account);
+    // Selected workspace PDFs take the attachment PDF path (text extraction), like an uploaded PDF.
+    const pdfFiles = options.files.filter(isPdfPath);
     const pkg = buildContextPackage({
       workspaceRoot: this.deps.workspaceRoot,
       objective,
-      files: options.files,
+      files: options.files.filter((f) => !isPdfPath(f)),
       contexts: options.contexts,
       includeInstructions: options.includeInstructions,
       format: options.format,
@@ -463,12 +471,13 @@ export class BatchService {
     let uploadsMeta: ChatAttachmentMeta[] | undefined;
     let userText = pkg.contextText;
     let userParts: ChatMessage["parts"];
-    if (options.uploads && options.uploads.length > 0) {
+    if ((options.uploads && options.uploads.length > 0) || pdfFiles.length > 0) {
       const up = await prepareAttachments({
         workspaceRoot: this.deps.workspaceRoot,
         config,
         knownSecrets,
-        input: { uploads: options.uploads },
+        input: { files: pdfFiles, uploads: options.uploads ?? [] },
+        gitIgnored: this.deps.gitIgnored,
       });
       uploadsMeta = up.attachments;
       pkg.warnings.push(...up.warnings);
@@ -667,7 +676,7 @@ export class BatchService {
     const config = this.deps.getConfig();
     const privacy = this.privacyConfig();
     const level = effectiveLevel(privacy.level, draft.privacyLevel);
-    const catalog = await this.privacyCatalog(level, routeForModel(draft.model, draft.route));
+    const catalog = await this.privacyCatalog(level);
     const decision = decidePrivacyFor({ config, privacy, draft, catalog });
     if (!decision.ok) {
       if (decision.refusal !== "policy") this.logger.log("warn", `${decision.refusal}_refused`, { kind: draft.kind, level, model: draft.model });
@@ -677,12 +686,13 @@ export class BatchService {
   }
 
   /**
-   * The catalog a privacy decision reads: only at zdr on the batch route. It waits for an in-flight load (up to the
+   * The catalog a privacy decision reads: only at zdr (either route). It waits for an in-flight load (up to the
    * request timeout); on a timeout the view says "still loading" (rather than "not loaded"). A snapshot loaded
    * successfully this session stays authoritative during a background refresh, exactly as when none runs.
    */
-  private async privacyCatalog(level: PrivacyLevel, route: Route): Promise<CatalogView | undefined> {
-    if (level !== "zdr" || route !== "batch") return undefined;
+  private async privacyCatalog(level: PrivacyLevel): Promise<CatalogView | undefined> {
+    // Both routes read it at zdr: the batch pin, and the `:free` endpoints check on the immediate route.
+    if (level !== "zdr") return undefined;
     const config = this.deps.getConfig();
     return (await this.deps.catalog?.whenLoaded(config.polling.requestTimeoutSeconds * 1000)) ?? this.deps.catalog?.view();
   }
@@ -694,7 +704,7 @@ export class BatchService {
   public async previewPrivacy(draft: PrivacyDraft): Promise<PrivacyPreview> {
     const config = this.deps.getConfig();
     const privacy = this.privacyConfig();
-    const catalog = await this.privacyCatalog(effectiveLevel(privacy.level, draft.privacyLevel), routeForModel(draft.model, draft.route));
+    const catalog = await this.privacyCatalog(effectiveLevel(privacy.level, draft.privacyLevel));
     return previewPrivacy({ config, privacy, draft, catalog });
   }
 
@@ -1058,7 +1068,7 @@ export class BatchService {
       maxTokens: config.request.maxTokens,
       limits: { maxRequests: config.workflows.maxRequestsPerBatch, maxRows: config.workflows.maxRowsPerRun, maxCharactersPerItem: config.workflows.maxCharactersPerItem, maxTotalCharacters: config.workflows.maxTotalCharacters },
       security: { scanSecrets: config.security.scanSecrets, blockOnSecret: config.security.blockOnSecret, knownSecrets: await this.knownSecrets(account) },
-      ...(mode.standards ? { standards: mode.standards } : {}),
+      ...(mode.standards ? { standards: mode.standards, structuredOutput: config.workflows.metadataStructuredOutput } : {}),
     });
     blockers.push(...plan.blockers);
     const contentSha256 = contentHash(buildSubmitBody({ model, provider: pin, requests: plan.items.map((it) => ({ custom_id: "{custom_id}", body: it.body })) }));

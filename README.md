@@ -158,6 +158,14 @@ most private value from what could be read, the last clean read and the settings
     endpoint on OpenRouter's ZDR list (its batch endpoints: …; ZDR endpoints: …)`), when its batch endpoints could not
     be loaded this session, when your own `--provider` pin or `routing.allowedProviders` leaves none, or when the
     catalog was not loaded successfully this session.
+  - **Free models follow the same rule.** A `:free` model runs only on its own free endpoints (from
+    `/api/v1/models/{model}:free/endpoints`), which are usually not the paid endpoints the ZDR list names for the base
+    model. At `zdr` it is allowed only when one of its free endpoint tags is on the ZDR list for that model; otherwise
+    it is refused locally, before any request (`Privacy level zdr: <model> has no free endpoint on OpenRouter's ZDR
+    list (its free endpoints: …; ZDR endpoints: …)`), and so is a model whose free endpoints could not be loaded. As
+    of 2026-10-28, `google/gemma-4-31b-it:free` (free endpoint `google-ai-studio`) does not qualify, and
+    `xingchen-agi/xing4.0-29b-a4b:free` (free endpoint `phala`, on the ZDR list) does. The request still carries
+    `provider: { zdr: true }`.
 - **Immediate route.** Models with the `:free` suffix run through `POST /chat/completions` and carry the
   `data_collection` or `zdr` field above. Items sent later (after a per-minute 429 or a crash) go out at the stricter
   of the job's recorded level, the current project level and the thread's own level; an escalation is recorded as a
@@ -205,7 +213,7 @@ expired or cancelled) is deleted too; one OpenRouter reports gone (HTTP 410) is 
 The extension loads `/api/v1/models` and `/api/v1/endpoints/zdr` once on every Pi `session_start`, web server start
 and web workspace switch. `/api/v1/models` also lists the batch models (IDs ending in `:batch`); for each of them the
 extension then loads `/api/v1/models/{model}:batch/endpoints` (all public), at most 8 at a time and within 20 seconds
-in all. A model whose batch endpoints fail to load in that time is treated as unknown: `zdr` refuses it ("the batch
+in all. The free models (IDs ending in `:free`) get the same treatment with `/api/v1/models/{model}:free/endpoints`. A model whose batch endpoints fail to load in that time is treated as unknown: `zdr` refuses it ("the batch
 endpoints of <model> could not be loaded this session") until a refresh loads them, while the rest of the catalog
 still counts as loaded, and `/batch privacy` shows how many are unknown. A model with no ZDR endpoint at all is
 refused outright, since a refresh can't change that. A `zdr` send made while the catalog is still loading waits for it
@@ -214,8 +222,8 @@ in a moment". Loads are deduplicated. A last-known copy is kept on disk **for di
 from disk is never used to authorise a `zdr` send. If the load fails, `zdr` batch sends are refused until
 `/batch privacy refresh` (or `/batch chat model --refresh`, or the web "Refresh models" button) succeeds; no restart is
 needed. The model picker labels models `batch`, `free` and `ZDR`, and hides the ones the level rules out. A batch
-model is labelled `ZDR` only when one of its batch endpoints is on the ZDR list; a free (immediate-route) model is
-labelled `ZDR` when it has any ZDR endpoint, since its requests carry `zdr: true`.
+model is labelled `ZDR` only when one of its batch endpoints is on the ZDR list, and a `:free` model only when one of
+its free endpoints is.
 
 ### Free models
 
@@ -224,7 +232,11 @@ Models ending in `:free` run immediately, not as a batch. They work **only in ba
 (/batch chat); /batch ask and workflows need a batch model". Each chat turn is still a job and settles through the
 usual retrieval path.
 - **Per-minute 429:** the request is rescheduled using `Retry-After`, or with exponential backoff capped at 15 minutes.
-- **Daily 429:** the job fails with "Free-model daily limit reached; try later or switch model".
+  A 200 response whose error object is a rate limit (code 429, or a message such as "temporarily rate-limited
+  upstream") is treated the same way. After 8 rate limits in a row the turn fails with `rate_limited` ("Free model is
+  rate-limited; try again later or switch model"). The web thread shows when the next attempt is due.
+- **Daily 429:** only a 429 that says it is the daily limit fails the job with "Free-model daily limit reached; try
+  later or switch model".
 - **Crashes:** an immediate request is never sent twice. If the outcome is unknown after a crash, the job becomes
   `submission_unknown` and you decide whether to retry.
 
@@ -1235,7 +1247,7 @@ Invalid values fall back to the default and are reported. Legacy keys (`defaultP
   "security": { "scanSecrets": true, "blockOnSecret": true, "allowOutsideWorkspace": false },
   "injection": { "maxCharacters": 30000, "includeObjective": true, "includeArtefactPaths": true },
   "submission": { "showPreview": true, "requireConfirmation": false },
-  "workflows": { "maxRequestsPerBatch": 100, "maxCharactersPerItem": 500000, "maxTotalCharacters": 5000000, "maxSynthesisCharacters": 1000000, "maxRowsPerRun": 1000, "maxDatasetBytes": 20000000 },
+  "workflows": { "maxRequestsPerBatch": 100, "maxCharactersPerItem": 500000, "maxTotalCharacters": 5000000, "maxSynthesisCharacters": 1000000, "maxRowsPerRun": 1000, "maxDatasetBytes": 20000000, "metadataStructuredOutput": false },
   "privacy": { "level": "standard", "accountNoTraining": false, "deleteRemoteBatches": true, "noticeShown": false },
   "routing": { "allowedProviders": [], "allowFallbacks": true, "requireZdr": false, "accountZdrEnforced": false, "requireNoDataCollection": false, "accountDataCollectionDenied": false }
 }
@@ -1245,6 +1257,14 @@ These are application defaults (local policy), not OpenRouter limits. OpenRouter
 payload limit and no maximum request count. Setting `excludePatterns` replaces the whole list. The
 `workflows` section is optional; Release 1 configuration files keep working unchanged. For dataset workflows,
 `maxRowsPerRun` caps the selected rows (each row is one request) and `maxDatasetBytes` the dataset file size.
+`metadataStructuredOutput` (UC metadata standards mode only, **off by default**) sends the proposal schema with each
+request as a strict structured output (`response_format`), which asks the provider to constrain the reply to that schema.
+Strict schemas depend on each provider's translation: on 2026-10-28 `google/gemini-3.8-flash` rejected the (valid)
+schema with "pii_tags.anyOf.0.additionalProperties must be a boolean or an object", and such a rejection fails every
+item of the batch. Turn it on only for a model whose batch endpoints are known to accept it; without it the prompt
+states the same structure. Version 1 metadata requests never carry it. The schema sent is a portable
+copy (no length limits, an explicit type on every enum); every reply is still validated locally against the full
+schema. The setting affects new plans only: a retry reuses the stored request bodies.
 A workflow's own `limits` can only lower these. The `routing` section is described in
 [Provider routing and account privacy](#provider-routing-and-account-privacy); with its defaults nothing changes.
 

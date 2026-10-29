@@ -3,6 +3,7 @@
  * Served locally from 127.0.0.1 with an injected per-session CSRF token.
  */
 
+import { MAX_CONSECUTIVE_429 } from "../openrouter/immediate.js";
 import { neverReachedOpenRouter } from "../privacy/policy.js";
 
 /*
@@ -34,6 +35,83 @@ export function failureStates(
     }
   });
   return out;
+}
+
+/**
+ * Message numbers for the chat view: only user and assistant messages are numbered (1, 2, …), so model switches,
+ * retitles and other events don't shift them. `of[seq]` is a message's number; `through(seq)` is the number of the
+ * last message at or before transcript seq `seq` (for "Compacted … through #n").
+ */
+export function messageNumbers(entries: ReadonlyArray<{ type: string; seq?: number }>): { of: Record<number, number>; through: (seq: number) => number } {
+  const of: Record<number, number> = {};
+  const numbered: Array<[number, number]> = [];
+  let n = 0;
+  for (const e of entries) {
+    if ((e.type === "user" || e.type === "assistant") && typeof e.seq === "number") {
+      of[e.seq] = ++n;
+      numbered.push([e.seq, n]);
+    }
+  }
+  const through = (seq: number): number => {
+    let last = 0;
+    for (const [s, k] of numbered) if (s <= seq && k > last) last = k;
+    return last;
+  };
+  return { of, through };
+}
+
+/**
+ * The metadata handoff card's success line after writing review.md or approved.jsonl, as the CLI reports it: the
+ * written path, the artifact ID and (approved) the table and value counts. Plain text.
+ */
+export function metadataWrittenText(
+  kind: "review" | "approved",
+  res: {
+    path: string;
+    artifactId: string;
+    gaps?: number;
+    sha256?: string;
+    tables?: number;
+    counts?: { keptExisting: number; fromProposal: number; nullApproved: number };
+  },
+): string {
+  if (kind === "review") {
+    return (
+      "✅ Review written: " + res.path + " (artifact " + res.artifactId + ")" +
+      (res.gaps ? "\n" + res.gaps + " table(s) without a usable proposal are listed in it" : "") +
+      "\nProposed metadata has not been applied to Databricks."
+    );
+  }
+  const c = res.counts;
+  return (
+    "✅ Draft handoff written: " + res.path + " (artifact " + res.artifactId + (res.sha256 ? ", sha256 " + res.sha256 : "") + ")" +
+    (c ? "\n" + (typeof res.tables === "number" ? res.tables + " table(s); " : "") + "values: " + c.keptExisting + " existing kept, " + c.fromProposal + " from proposals, " + c.nullApproved + " null" : "") +
+    "\nThis is a draft for review; edit approved_* values, then validate it. Nothing has been applied to Databricks."
+  );
+}
+
+/**
+ * The in-flight banner's headline for a thread's pending turn or compaction. A poll problem (`lastPollError`) comes
+ * first, for every kind and route, with the next retry time. Otherwise a free-model (immediate) turn that OpenRouter
+ * rate-limited says when it retries (local time) and how many rate limits so far out of `maxRateLimits` (after which
+ * the turn fails). Otherwise the kind and route. Plain text.
+ */
+export function inflightHeadline(
+  kind: "turn" | "compaction",
+  job: { route?: string; nextPollAt?: string; consecutivePollFailures?: number; lastPollError?: { message?: string } } | null | undefined,
+  maxRateLimits: number,
+): string {
+  const at = job && job.nextPollAt ? new Date(job.nextPollAt) : null;
+  const hhmm = at && Number.isFinite(at.getTime()) ? String(at.getHours()).padStart(2, "0") + ":" + String(at.getMinutes()).padStart(2, "0") : "";
+  const what = kind === "compaction" ? "Compaction" : job && job.route === "immediate" ? "Free-model turn" : "Batch turn";
+  if (job && job.lastPollError && job.lastPollError.message) {
+    return "⚠ " + what + ": poll problem: " + job.lastPollError.message + (hhmm ? "; retrying at " + hhmm : "");
+  }
+  const n = (job && job.consecutivePollFailures) || 0;
+  if (kind === "turn" && job && job.route === "immediate" && n > 0 && hhmm) {
+    return "⏳ Free-model turn rate-limited by OpenRouter; retrying at " + hhmm + " (rate limit " + n + " of " + maxRateLimits + ")";
+  }
+  return "⏳ " + what + " in flight";
 }
 
 /**
@@ -204,7 +282,16 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
       display: flex;
       align-items: center;
       gap: 10px;
+      flex-shrink: 0;
     }
+    /* The top bar never wraps: the badge is capped and truncates (full text in its tooltip), and the brand side gives
+       way, its workspace pill shrinking first. */
+    .topbar > * { white-space: nowrap; }
+    .topbar .brand { min-width: 0; flex-shrink: 1; overflow: hidden; }
+    .topbar .nav-tabs, .topbar .btn { flex-shrink: 0; }
+    .topbar .workspace-pill { min-width: 60px; flex-shrink: 1; }
+    .topbar .nav-tab { padding: 6px 10px; }
+    #badgePill { max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
     .badge-pill {
       font-size: 12px;
       padding: 4px 10px;
@@ -680,7 +767,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
             <span id="contextMeterText">0 tok</span>
             <div class="meter-bar"><div class="meter-fill" id="contextMeterFill" style="width:0%"></div></div>
           </div>
-          <button class="btn btn-sm" id="compactThreadBtn" title="Summarise earlier exchanges via batch compaction">🗜️ Compact</button>
+          <button class="btn btn-sm" id="compactThreadBtn" data-action="openCompactForm" data-args="[]" aria-expanded="false" aria-controls="compactForm" title="Summarise earlier exchanges via batch compaction">🗜️ Compact</button>
           <button class="btn btn-sm" id="exportThreadBtn" title="Download Markdown transcript">⬇️ Export .md</button>
         </div>
       </div>
@@ -693,6 +780,14 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         <span style="color:var(--text-muted);" id="chatCatalogState"></span>
       </div>
       <div id="chatModelAlert" style="padding:0 16px;"></div>
+      <div id="compactForm" style="display:none; padding:8px 16px; gap:8px; flex-direction:column; border-bottom:1px solid var(--border);">
+        <label for="compactFocusInput" style="font-size:12px; color:var(--text-muted);">Optional focus for the compaction summary (leave blank for the default)</label>
+        <textarea id="compactFocusInput" rows="2" style="width:100%; font-size:12px;"></textarea>
+        <div style="display:flex; gap:8px;">
+          <button class="btn btn-sm btn-primary" id="compactSubmitBtn" data-action="submitCompact" data-args="[]">Compact</button>
+          <button class="btn btn-sm" id="compactCancelBtn" data-action="cancelCompact" data-args="[]">Cancel</button>
+        </div>
+      </div>
 
       <div class="chat-stream" id="chatStream">
         <div style="margin:auto; text-align:center; color:var(--text-muted);">
@@ -967,6 +1062,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
           <div>
             <label for="jobModelInput" style="font-size:12px; color:var(--text-muted);">Model Slug</label>
             <input type="text" id="jobModelInput" list="knownModelsList" style="width:100%; font-family:var(--mono);">
+            <div id="jobModelNotice" class="alert-box alert-warning" role="status" style="display:none; margin-top:6px;"></div>
           </div>
           <div>
             <label for="jobFormatSelect" style="font-size:12px; color:var(--text-muted);">Output Format</label>
@@ -1069,6 +1165,10 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
 
   <script nonce="${nonceAttr}">
     ${failureStates.toString()}
+    ${inflightHeadline.toString()}
+    ${metadataWrittenText.toString()}
+    ${messageNumbers.toString()}
+    const MAX_RATE_LIMITS = ${MAX_CONSECUTIVE_429};
     ${createCoalescer.toString()}
     ${privacyNoticeHtml.toString()}
     ${neverReachedOpenRouter.toString()}
@@ -1100,6 +1200,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
       picker: { entries: [], catalog: null, key: "" },
       showBlocked: false,
       pickedRoute: null,
+      metadataCard: null,
     };
 
     function updateWorkspaceDisplay(rootPath) {
@@ -1131,6 +1232,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
       "quickAttachToChat", "inspectJobItem", "generateJobArtifact", "exportDatasetJob", "previewArtifactFrame",
       "submitPreviewedJob", "cancelBatchJob", "retryBatchJob", "synthesizeBatchJob", "setJobSubTab",
       "writeMetadataReview", "writeMetadataApproved", "validateMetadataApproved",
+      "openCompactForm", "submitCompact", "cancelCompact",
     ]);
     function act(name, ...args) {
       return 'data-action="' + escapeHtml(name) + '" data-args="' + escapeHtml(JSON.stringify(args)) + '"';
@@ -1290,6 +1392,8 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
 
     function showToast(msg, level = "info") {
       const c = document.getElementById("toastContainer");
+      // A message already on screen is not shown a second time (one action never needs two identical toasts).
+      if (Array.from(c.children).some((t) => t.textContent === msg)) return;
       const el = document.createElement("div");
       el.className = "toast";
       if (level === "error" || level === "warning") el.style.borderColor = "var(--warning)";
@@ -1359,6 +1463,8 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
       document.getElementById("settingsDefaultAccount").value = state.config.defaultAccount || "";
       document.getElementById("settingsProjectInstructions").value = data.projectInstructions || "";
       document.getElementById("jobModelInput").value = state.config.defaultModel || "";
+      state.jobModelAuto = null;
+      applyJobModelFallback();
 
       const wfSel = document.getElementById("datasetWorkflowSelect");
       wfSel.innerHTML = state.workflows.length
@@ -1391,6 +1497,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
     function updateBadge(text) {
       const pill = document.getElementById("badgePill");
       pill.textContent = text || "📦 Batch: Idle";
+      pill.title = pill.textContent; // the pill may be truncated
     }
 
     // One EventSource and one handler. Each event asks for a refresh; refreshes arriving within 250 ms coalesce into
@@ -1633,7 +1740,11 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
 
     async function selectThread(threadId, preserveScroll = false) {
       // A notice about another thread (e.g. the model a new thread started on) does not belong to this one.
-      if (state.activeThreadId !== threadId) document.getElementById("chatModelAlert").innerHTML = "";
+      // An open Compact form belongs to the thread it was opened on (a live refresh of the same thread keeps it).
+      if (state.activeThreadId !== threadId) {
+        document.getElementById("chatModelAlert").innerHTML = "";
+        window.cancelCompact();
+      }
       state.activeThreadId = threadId;
       renderThreadList();
       const detail = await api("/api/threads/" + encodeURIComponent(threadId));
@@ -1667,6 +1778,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
           "</div>";
       } else {
         const failures = failureStates(entries, detail.thread.lastFailure);
+        const numbers = messageNumbers(entries);
         stream.innerHTML = entries
           .map((e, i) => {
             if (e.type === "user") {
@@ -1694,7 +1806,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
                 : "";
               return (
                 '<div class="msg-card msg-user">' +
-                '<div class="msg-header"><span><strong>You</strong> · #' + e.seq + "</span><span>" + escapeHtml(e.at.slice(11, 19)) + "</span></div>" +
+                '<div class="msg-header"><span><strong>You</strong> · #' + numbers.of[e.seq] + "</span><span>" + escapeHtml(e.at.slice(11, 19)) + "</span></div>" +
                 '<div class="msg-body">' + formatMarkdownLite(e.text) + "</div>" +
                 (atts ? '<div class="att-list">' + atts + "</div>" : "") +
                 previewBlock +
@@ -1705,7 +1817,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
               return (
                 '<div class="msg-card msg-assistant">' +
                 '<div class="msg-header" style="flex-wrap:wrap;">' +
-                '<span><strong style="color:#a5b4fc;">' + escapeHtml(e.model) + "</strong> · #" + e.seq + "</span>" +
+                '<span><strong style="color:#a5b4fc;">' + escapeHtml(e.model) + "</strong> · #" + numbers.of[e.seq] + "</span>" +
                 '<span style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">' +
                 (e.finishReason === "length" ? '<span class="status-dot status-waiting">truncated: max_tokens</span>' : "") +
                 '<button class="btn btn-sm" title="Render & download this reply as Markdown (.md)" ' + act("exportReplyArtifact", e.jobId, "markdown") + '>⬇️ .md</button>' +
@@ -1720,7 +1832,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
             if (e.type === "compaction") {
               return (
                 '<div class="msg-card" style="align-self:stretch; background:rgba(56,189,248,0.07); border-color:rgba(56,189,248,0.3);">' +
-                '<div class="msg-header"><strong>🗜️ Compacted Conversation (through #' + e.throughSeq + " · " + escapeHtml(e.model) + ")</strong><span>" + escapeHtml(e.jobId) + "</span></div>" +
+                '<div class="msg-header"><strong>🗜️ Compacted Conversation (through #' + numbers.through(e.throughSeq) + " · " + escapeHtml(e.model) + ")</strong><span>" + escapeHtml(e.jobId) + "</span></div>" +
                 '<details><summary style="cursor:pointer; font-size:12px; color:#7dd3fc;">View Compaction Summary</summary>' +
                 '<div class="msg-body" style="margin-top:8px;">' + formatMarkdownLite(e.summary) + "</div></details></div>"
               );
@@ -1765,7 +1877,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         inflight.innerHTML =
           '<div class="inflight-banner">' +
           "<div>" +
-          "<strong>⏳ " + (p ? "Batch Turn in Flight" : "Compaction in Flight") + "</strong> " +
+          "<strong>" + escapeHtml(inflightHeadline(p ? "turn" : "compaction", activeJob, MAX_RATE_LIMITS)) + "</strong> " +
           (jobId ? "(<code>" + escapeHtml(jobId) + "</code> · " + escapeHtml(jobStatus) + ")" : "") +
           '<div style="font-size:11px; color:var(--text-muted);">Messages sent while waiting are queued in the thread and automatically submitted as one turn when the reply lands.</div>' +
           "</div>" +
@@ -1942,21 +2054,43 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
       }
     });
 
-    document.getElementById("compactThreadBtn").addEventListener("click", async () => {
+    // Compact: an in-page form (no blocking window.prompt). One request at a time: both buttons are disabled while it
+    // runs, so a second click can't start another (the server also allows one compaction per thread).
+    let compactInFlight = false;
+    function setCompactBusy(busy) {
+      compactInFlight = busy;
+      document.getElementById("compactSubmitBtn").disabled = busy;
+      document.getElementById("compactThreadBtn").disabled = busy;
+    }
+    window.openCompactForm = () => {
       if (!state.activeThreadId) return;
-      const focus = prompt("Optional focus instructions for compaction summary (leave blank for default):", "");
-      if (focus === null) return;
+      document.getElementById("compactForm").style.display = "flex";
+      document.getElementById("compactThreadBtn").setAttribute("aria-expanded", "true");
+      document.getElementById("compactFocusInput").focus();
+    };
+    window.cancelCompact = () => {
+      document.getElementById("compactForm").style.display = "none";
+      document.getElementById("compactThreadBtn").setAttribute("aria-expanded", "false");
+      document.getElementById("compactFocusInput").value = "";
+    };
+    window.submitCompact = async () => {
+      if (!state.activeThreadId || compactInFlight) return;
+      const focus = document.getElementById("compactFocusInput").value.trim();
+      setCompactBusy(true);
       try {
         const res = await api("/api/threads/" + encodeURIComponent(state.activeThreadId) + "/compact", {
           method: "POST",
-          body: { instructions: focus.trim() || undefined },
+          body: { instructions: focus || undefined },
         });
+        window.cancelCompact();
         showToast("Compaction batch started: " + res.jobId);
         await refreshStateQuiet();
       } catch (err) {
         showToast(err.message, "error");
+      } finally {
+        setCompactBusy(false);
       }
-    });
+    };
 
     document.getElementById("exportThreadBtn").addEventListener("click", () => {
       if (!state.activeThreadId) return;
@@ -2403,7 +2537,8 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         (isActive ? '<button class="btn btn-sm" ' + act("pollSingleJob", j.localId) + '>🔄 Poll Now</button>' : "") +
         (isActive || isPreviewed ? '<button class="btn btn-sm btn-danger" ' + act("cancelBatchJob", j.localId) + '>Cancel</button>' : "") +
         (isTerminal && !isChat ? '<button class="btn btn-sm" ' + act("retryBatchJob", j.localId, false) + '>🔁 Retry All</button>' : "") +
-        (isTerminal && !isChat && j.requestCount > 1 ? '<button class="btn btn-sm" ' + act("retryBatchJob", j.localId, true) + '>🔁 Retry Failed Items</button>' : "") +
+        // Also for a one-request job with an unusable item, which refusals point at ("Retry Failed Items button").
+        (isTerminal && !isChat && (j.requestCount > 1 || (j.items || []).some((it) => ["failed", "corrupt", "missing"].includes(it.status))) ? '<button class="btn btn-sm" ' + act("retryBatchJob", j.localId, true) + '>🔁 Retry Failed Items</button>' : "") +
         ((j.localStatus === "ready" || j.localStatus === "partial") && !isChat && j.requestCount > 1 && j.kind !== "synthesis"
           ? '<button class="btn btn-sm btn-primary" ' + act("synthesizeBatchJob", j.localId) + '>✨ Synthesize</button>'
           : "") +
@@ -2441,29 +2576,44 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
       const dir = inPath.includes("/") ? inPath.slice(0, inPath.lastIndexOf("/") + 1) : "";
       const field = (id, label, value) =>
         '<div><label style="font-size:12px; color:var(--text-muted);">' + label + '</label><input type="text" id="' + id + '" value="' + escapeHtml(value) + '" style="width:100%; font-family:var(--mono);"></div>';
+      // Restored after a live refresh: what the user typed and ticked, and the last result.
+      const saved = state.metadataCard && state.metadataCard.jobId === j.localId ? state.metadataCard : null;
+      const checked = (on) => (on ? " checked" : "");
       return (
         '<div class="msg-card" style="max-width:none; display:flex; flex-direction:column; gap:10px;">' +
         "<strong>UC Metadata handoff</strong>" +
         '<div style="font-size:12px; color:var(--text-muted);">Writes files into the workspace through the artifact system. Proposals only: nothing is applied to Databricks.</div>' +
         '<div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">' +
-        field("metadataReviewOut", "Review file (.md)", dir + "review.md") +
-        field("metadataApprovedOut", "Approved file (.jsonl)", dir + "approved.jsonl") +
+        field("metadataReviewOut", "Review file (.md)", saved && saved.review !== undefined ? saved.review : dir + "review.md") +
+        field("metadataApprovedOut", "Approved file (.jsonl)", saved && saved.approved !== undefined ? saved.approved : dir + "approved.jsonl") +
         "</div>" +
         '<div style="display:flex; gap:14px; flex-wrap:wrap; font-size:12px;">' +
-        '<label><input type="checkbox" id="metadataOverwrite"> Overwrite existing file</label>' +
-        '<label><input type="checkbox" id="metadataAllowPartial"> Allow partial (tables without a proposal keep their existing values)</label>' +
+        '<label><input type="checkbox" id="metadataOverwrite"' + checked(saved && saved.overwrite) + "> Overwrite existing file</label>" +
+        '<label><input type="checkbox" id="metadataAllowPartial"' + checked(saved && saved.allowPartial) + "> Allow partial (tables without a proposal keep their existing values)</label>" +
         "</div>" +
         '<div style="display:flex; gap:8px; flex-wrap:wrap;">' +
         '<button class="btn btn-sm btn-primary" ' + act("writeMetadataReview", j.localId) + ">Write review.md</button>" +
         '<button class="btn btn-sm btn-primary" ' + act("writeMetadataApproved", j.localId) + ">Write approved.jsonl</button>" +
         '<button class="btn btn-sm" ' + act("validateMetadataApproved", j.localId) + ">Validate approved file</button>" +
         "</div>" +
-        '<div id="metadataActionOutput"></div>' +
+        '<div id="metadataActionOutput">' + (saved ? saved.html : "") + "</div>" +
         "</div>"
       );
     }
 
+    // The card is rebuilt by every live refresh (writing a file broadcasts artifact_created), so its fields and the last
+    // result are kept in state and restored by metadataActionsCard; otherwise the success line vanished at once.
     function metadataOutput(html) {
+      const v = (id) => (document.getElementById(id) || {}).value;
+      const c = (id) => !!(document.getElementById(id) || {}).checked;
+      state.metadataCard = {
+        jobId: state.selectedJobId,
+        review: v("metadataReviewOut"),
+        approved: v("metadataApprovedOut"),
+        overwrite: c("metadataOverwrite"),
+        allowPartial: c("metadataAllowPartial"),
+        html,
+      };
       const box = document.getElementById("metadataActionOutput");
       if (box) box.innerHTML = html;
     }
@@ -2480,7 +2630,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
           method: "POST",
           body: { out: document.getElementById("metadataReviewOut").value.trim() || undefined, overwrite: document.getElementById("metadataOverwrite").checked },
         });
-        metadataOutput('<div class="alert-box alert-success">Review written: ' + escapeHtml(res.path) + " (artifact " + escapeHtml(res.artifactId) + ")" + (res.gaps ? "\\n" + res.gaps + " table(s) without a usable proposal are listed in it" : "") + "</div>");
+        metadataOutput('<div class="alert-box alert-success" role="status">' + escapeHtml(metadataWrittenText("review", res)) + "</div>");
         showToast("Wrote " + res.path);
       } catch (err) {
         metadataOutput('<div class="alert-box alert-danger">' + escapeHtml(err.message) + "</div>");
@@ -2498,8 +2648,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
           },
         });
         metadataOutput(
-          '<div class="alert-box alert-success">Draft handoff written: ' + escapeHtml(res.path) + "\\nsha256 " + escapeHtml(res.sha256) + "\\n" + escapeHtml(metadataCounts(res.counts)) +
-            "\\nThis is a draft for review; edit approved_* values, then validate it.</div>" + metadataProblems(res.problems),
+          '<div class="alert-box alert-success" role="status">' + escapeHtml(metadataWrittenText("approved", res)) + "</div>" + metadataProblems(res.problems),
         );
         showToast("Wrote " + res.path);
       } catch (err) {
@@ -2809,6 +2958,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
     }
 
     function renderPrivacySettings() {
+      applyJobModelFallback();
       const p = state.privacy;
       if (!p) return;
       document.getElementById("privacy-level-select").value = p.level;
@@ -2832,6 +2982,28 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         renderPrivacySettings();
         if (state.activeThreadDetail) renderThreadPrivacy(state.activeThreadDetail);
       } catch {}
+    }
+
+    // The job studio's Model field starts on the first selectable batch model when the level refuses the default (as
+    // new threads do), with the server's notice. Only a field still holding the default (or that fallback) changes.
+    function applyJobModelFallback() {
+      const input = document.getElementById("jobModelInput");
+      const box = document.getElementById("jobModelNotice");
+      if (!input || !box) return;
+      const fb = state.privacy && state.privacy.jobModelFallback;
+      const def = (state.config && state.config.defaultModel) || "";
+      const untouched = input.value === def || (!!state.jobModelAuto && input.value === state.jobModelAuto);
+      if (fb && untouched) {
+        input.value = fb.id;
+        state.jobModelAuto = fb.id;
+        box.textContent = fb.notice;
+        box.style.display = "";
+      } else if (!fb && state.jobModelAuto && input.value === state.jobModelAuto) {
+        input.value = def;
+        state.jobModelAuto = null;
+        box.textContent = "";
+        box.style.display = "none";
+      }
     }
 
     function showPrivacyNotice(text) {

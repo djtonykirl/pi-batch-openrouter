@@ -39,7 +39,7 @@ function withChat(opts: { zdr?: ZdrEndpoint[] | Error }, fn: (c: Ctx) => Promise
       const catalog = new ModelCatalog({
         fetch: async () => {
           if (zdr instanceof Error) throw zdr;
-          return { models: [], zdr, batchEndpoints: batchEndpointsMatchingZdr(zdr) };
+          return { models: [], zdr, batchEndpoints: batchEndpointsMatchingZdr(zdr), freeEndpoints: batchEndpointsMatchingZdr(zdr) };
         },
         file: join(root, "catalog.json"),
       });

@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import test from "node:test";
+import * as path from "node:path";
+import { ModelCatalog } from "../src/models/catalog.js";
+import { withFreeZdr } from "./fixtures/catalog.js";
 import type { BatchConfig } from "../src/config.js";
 import { atomicWriteJson } from "../src/fsutil.js";
 import { itemText, jobItems } from "../src/items.js";
 import { OpenRouterBatchClient } from "../src/openrouter/client.js";
-import { classify429, immediateResultId, runImmediateJob } from "../src/openrouter/immediate.js";
+import { classify429, immediateResultId, isRateLimitErrorObject, runImmediateJob } from "../src/openrouter/immediate.js";
 import { normaliseBatchResult } from "../src/openrouter/normalise-result.js";
 import type { BatchService } from "../src/service.js";
 import type { JobManifest } from "../src/types.js";
@@ -33,7 +36,9 @@ function withService(level: BatchConfig["privacy"]["level"], fn: (c: Ctx) => Pro
         c.privacy.level = level;
       });
       const settled: JobManifest[] = [];
-      await fn({ service: makeService(root, fake, cfg, settled), fake, cfg, settled });
+      const catalog = new ModelCatalog({ fetch: async () => withFreeZdr({ models: [], zdr: [] }), file: path.join(root, "catalog.json") });
+      await catalog.load();
+      await fn({ service: makeService(root, fake, cfg, settled, catalog), fake, cfg, settled });
     } finally {
       rm(root);
     }
@@ -130,13 +135,16 @@ test(
     fake.chatReplies = [{ status: 429, body: PER_MINUTE, headers: { "Retry-After": "20" } }];
     const before = Date.now();
     const job = await chatJob(service);
+    const after = Date.now();
     const m = service.registry.read(job.localId);
     assert.ok(m.localStatus === "submitted" || m.localStatus === "polling", m.localStatus);
     assert.equal(m.error, undefined);
     assert.equal(m.lastPollError, undefined);
     assert.equal(m.items![0]!.status, "submitted");
-    const delay = Date.parse(m.nextPollAt!) - before;
-    assert.ok(delay >= 19_000 && delay <= 22_000, `nextPollAt is ${delay} ms ahead`);
+    // Retry-After: 20 is applied when the 429 arrives, somewhere between `before` and `after` (which can be seconds
+    // apart under a loaded test run), so bound it by both rather than by a fixed window from `before`.
+    const next = Date.parse(m.nextPollAt!);
+    assert.ok(next >= before + 19_000 && next <= after + 21_000, `nextPollAt is ${next - before} ms after the start (${after - before} ms elapsed)`);
 
     // Not due yet: the poller leaves it alone.
     const early = await service.reconcile(job.localId);
@@ -178,7 +186,7 @@ test(
 );
 
 test(
-  "more than 8 consecutive 429s count as the daily limit",
+  "more than 8 consecutive per-minute 429s fail as rate_limited, not as the daily limit",
   withService("standard", async ({ service, fake }) => {
     fake.chatReplies = [{ status: 429, body: PER_MINUTE, headers: { "Retry-After": "1" } }];
     const job = await chatJob(service);
@@ -189,7 +197,40 @@ test(
     assert.equal(chatPosts(fake).length, 8);
     const r = await service.reconcile(job.localId, { force: true });
     assert.equal(r.status, "failed");
-    assert.equal(service.registry.read(job.localId).error?.code, "rate_limited_daily");
+    assert.deepEqual(service.registry.read(job.localId).error, { code: "rate_limited", message: "Free model is rate-limited; try again later or switch model" });
+  }),
+);
+
+test(
+  "a 200 whose error object is an upstream rate limit is rescheduled like a 429, not failed as provider_error",
+  withService("standard", async ({ service, fake }) => {
+    const upstream = { error: { message: "google/gemma-4-31b-it:free is temporarily rate-limited upstream. Please retry shortly, or add your own key", code: 429 } };
+    fake.chatReplies = [{ status: 200, body: upstream }];
+    const job = await chatJob(service);
+    const m = service.registry.read(job.localId);
+    assert.ok(m.localStatus === "submitted" || m.localStatus === "polling", m.localStatus);
+    assert.equal(m.error, undefined);
+    assert.equal(m.consecutivePollFailures, 1);
+    const delay = Date.parse(m.nextPollAt!) - Date.now();
+    assert.ok(delay > 28_000 && delay <= 30_000, `backoff ${delay}`);
+    // Message only (no code), and code 429 only (no rate-limit words), are both rate limits.
+    fake.chatReplies = [{ status: 200, body: { error: { message: "Rate limit exceeded upstream" } } }];
+    assert.notEqual((await service.reconcile(job.localId, { force: true })).status, "failed");
+    fake.chatReplies = [{ status: 200, body: { error: { code: "429", message: "Too many requests" } } }];
+    assert.notEqual((await service.reconcile(job.localId, { force: true })).status, "failed");
+    assert.equal(service.registry.read(job.localId).consecutivePollFailures, 3);
+    fake.chatReplies = [{ status: 200, body: chatCompletion("Done.") }];
+    assert.equal((await service.reconcile(job.localId, { force: true })).status, "ready");
+  }),
+);
+
+test(
+  "a 200 error object that is not a rate limit still fails as provider_error",
+  withService("standard", async ({ service, fake }) => {
+    fake.chatReplies = [{ status: 200, body: { error: { code: 404, message: "No endpoints found matching your data policy" } } }];
+    const job = await chatJob(service);
+    assert.equal(job.localStatus, "failed");
+    assert.equal(job.error?.code, "provider_error");
   }),
 );
 
@@ -377,3 +418,39 @@ test("runImmediateJob builds a final response normaliseBatchResult accepts", asy
   assert.equal(n.items[0]!.text, "one");
   assert.deepEqual(n.warnings, []);
 });
+
+test("isRateLimitErrorObject: the message counts only when the code is absent, 429 or 5xx", () => {
+  assert.equal(isRateLimitErrorObject({ message: "Model is temporarily rate-limited upstream. Please retry shortly" }), true);
+  assert.equal(isRateLimitErrorObject({ code: 429, message: "Too many requests" }), true);
+  assert.equal(isRateLimitErrorObject({ code: "429", message: "x" }), true);
+  assert.equal(isRateLimitErrorObject({ code: 503, message: "upstream rate limit" }), true);
+  assert.equal(isRateLimitErrorObject({ code: 400, message: "max_tokens exceeds the rate limit tier for this key" }), false);
+  assert.equal(isRateLimitErrorObject({ code: 404, message: "No endpoints found" }), false);
+  assert.equal(isRateLimitErrorObject({ message: "Internal error" }), false);
+});
+
+test(
+  "a 200 error with code 400 that mentions a rate limit fails as provider_error, not rescheduled",
+  withService("standard", async ({ service, fake }) => {
+    fake.chatReplies = [{ status: 200, body: { error: { code: 400, message: "Request exceeds the rate limit tier for this key" } } }];
+    const job = await chatJob(service);
+    assert.equal(job.localStatus, "failed");
+    assert.equal(job.error?.code, "provider_error");
+  }),
+);
+
+test(
+  "a code-less 'temporarily rate-limited upstream' 200 is rescheduled; after the cap it fails with the real status (200)",
+  withService("standard", async ({ service, fake }) => {
+    fake.chatReplies = [{ status: 200, body: { error: { message: "x/y:free is temporarily rate-limited upstream. Please retry shortly" } } }];
+    const job = await chatJob(service);
+    assert.equal(service.registry.read(job.localId).localStatus === "failed", false);
+    for (let i = 0; i < 7; i++) await service.reconcile(job.localId, { force: true });
+    const r = await service.reconcile(job.localId, { force: true });
+    assert.equal(r.status, "failed");
+    const m = service.registry.read(job.localId);
+    assert.equal(m.error?.code, "rate_limited");
+    const progress = JSON.parse(fs.readFileSync(service.registry.artefact(job.localId, "immediateProgress"), "utf8")) as Record<string, { status?: number }>;
+    assert.ok(Object.values(progress).some((s) => s.status === 200), "the recorded status is the real HTTP status");
+  }),
+);

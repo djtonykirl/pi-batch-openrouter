@@ -17,7 +17,7 @@ import { FAKE_KEY, FakeOpenRouter, accepted, makeConfig, makeService } from "./f
 import { metadataWorkspace } from "./fixtures/metadata.js";
 import { chatCompletion, completed, successItem } from "./fixtures/openrouter.js";
 import { rm, tempWorkspace, writeFiles } from "./helpers.js";
-import { batchEndpointsMatchingZdr } from "./fixtures/catalog.js";
+import { batchEndpointsMatchingZdr, withFreeZdr } from "./fixtures/catalog.js";
 
 /**
  * routing.* (provider allow-list, account requirements) linked with the privacy levels:
@@ -55,7 +55,7 @@ function withEnv(
         c.privacy.accountNoTraining = opts.accountNoTraining ?? false;
         Object.assign(c.routing, opts.routing ?? {});
       });
-      const catalog = new ModelCatalog({ fetch: async () => ({ models: [], zdr: ZDR, batchEndpoints: batchEndpointsMatchingZdr(ZDR) }), file: path.join(root, "catalog.json") });
+      const catalog = new ModelCatalog({ fetch: async () => withFreeZdr({ models: [], zdr: ZDR, batchEndpoints: batchEndpointsMatchingZdr(ZDR) }), file: path.join(root, "catalog.json") });
       await catalog.load();
       const jobsDir = path.join(root, ".pi", "batches");
       const service = new BatchService({
@@ -385,7 +385,7 @@ test(
 );
 
 test("model picker at zdr: a batch model with no ZDR endpoint in the allow-list is blocked with decidePrivacy's reason", () => {
-  const snap = { fresh: true, loadedAt: new Date().toISOString(), models: [{ id: "meta/llama-free:free", free: true }], zdr: ZDR, batchEndpoints: batchEndpointsMatchingZdr(ZDR) } as never;
+  const snap = { fresh: true, loadedAt: new Date().toISOString(), models: [{ id: "meta/llama-free:free", free: true }], ...withFreeZdr({ zdr: ZDR }), batchEndpoints: batchEndpointsMatchingZdr(ZDR) } as never;
   const blocked = pickerEntries(snap, [MODEL], "zdr", false, ["groq"]).find((e) => e.id === MODEL)!;
   assert.equal(blocked.blocked, `Privacy level zdr: no ZDR provider for ${MODEL} within routing.allowedProviders (groq)`);
   assert.equal(pickerEntries(snap, [MODEL], "zdr", false, ["azure"]).find((e) => e.id === MODEL)!.blocked, undefined);

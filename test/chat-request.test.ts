@@ -118,8 +118,20 @@ describe("helpers", () => {
   });
   it("provisionalTitle", () => {
     const t = provisionalTitle(("word ".repeat(10) + "\n").repeat(2));
-    assert.equal(t.length, 60);
+    assert.equal(t, "word ".repeat(11) + "word…", "cut at a word boundary, with an ellipsis, within 60 characters");
+    assert.ok(t.length <= 60);
     assert.ok(!t.includes("\n"));
+    // The walk-through's title: never cut mid-word.
+    assert.equal(
+      provisionalTitle("How does the token cache work, and when does the refresh trigger fire exactly?"),
+      "How does the token cache work, and when does the refresh…",
+    );
+    assert.equal(provisionalTitle("Short question"), "Short question");
+    // One long word: cut it, still with the ellipsis.
+    assert.equal(provisionalTitle("x".repeat(80)), "x".repeat(59) + "…");
+  });
+  it("cleanTitle truncates at a word boundary too", () => {
+    assert.equal(cleanTitle("Title: " + "alpha ".repeat(15)), "alpha ".repeat(9) + "alpha…");
   });
   it("cleanTitle", () => {
     assert.equal(cleanTitle('  "Title: Auth redesign"\nmore'), "Auth redesign");

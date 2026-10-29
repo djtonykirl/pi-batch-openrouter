@@ -4,7 +4,7 @@ import type { CatalogSnapshot } from "../models/catalog.js";
 import { accountRequirementBlockers, formatRoutingPolicy } from "../openrouter/routing.js";
 import type { BatchRuntime } from "../runtime.js";
 import { formatIsoShort } from "../time.js";
-import { batchZdrView, isPrivacyLevel, normaliseModelSlug, resolveBatchProvider, PRIVACY_LEVELS, routeForModel, type PrivacyLevel, type Route } from "./policy.js";
+import { batchZdrView, immediateHasZdr, immediateZdrRefusal, isPrivacyLevel, normaliseModelSlug, resolveBatchProvider, PRIVACY_LEVELS, routeForModel, type PrivacyLevel, type Route } from "./policy.js";
 
 export const PRIVACY_SETTINGS_URL = "https://openrouter.ai/settings/privacy";
 
@@ -47,9 +47,8 @@ export function pickerEntries(
   const out: PickerEntry[] = [];
   for (const [id, route] of candidates) {
     const base = normaliseModelSlug(id);
-    // Batch route: ZDR only when a batch endpoint is on the ZDR list. Immediate route: the sync ZDR endpoints, since its
-    // requests carry `zdr: true`.
-    const hasZdr = route === "batch" ? batchZdrView(catalog, base).pinnable.length > 0 : !!catalog?.zdr.some((e) => e.model === base);
+    // Batch route: ZDR only when a batch endpoint is on the ZDR list. `:free`: only when a free endpoint is.
+    const hasZdr = route === "batch" ? batchZdrView(catalog, base).pinnable.length > 0 : immediateHasZdr(catalog, id);
     const labels = [route === "batch" ? "batch" : "free", ...(hasZdr ? ["ZDR"] : [])];
     const entry: PickerEntry = { id, route, labels };
     const unmet = config ? accountRequirementBlockers(config, level, route) : [];
@@ -58,8 +57,11 @@ export function pickerEntries(
       if (route === "batch") {
         const d = resolveBatchProvider({ level, model: id, catalog, accountNoTraining, allowedProviders });
         if (!d.ok) entry.blocked = d.reason;
-      } else if (!catalog?.fresh) entry.blocked = "Privacy level zdr: model catalog not loaded this session, so ZDR providers can't be verified (run /batch privacy refresh)";
-      else if (!hasZdr) entry.blocked = `Privacy level zdr: no ZDR provider for ${base}`;
+      } else {
+        // The same refusal decidePrivacyFor gives a send.
+        const refusal = immediateZdrRefusal(catalog, id);
+        if (refusal) entry.blocked = refusal;
+      }
     } else if (level === "no-training" && route === "batch" && !accountNoTraining) {
       entry.blocked = "Privacy level no-training: batch models need your account's no-training attestation (/batch privacy attest)";
     }
@@ -95,8 +97,16 @@ export function catalogStateLine(snapshot: CatalogSnapshot | undefined): string 
   const at = formatIsoShort(snapshot.loadedAt);
   const state = snapshot.fresh ? `fresh at ${at}` : `from ${at}, refresh failed${snapshot.error ? ` (${snapshot.error})` : ""}`;
   // Batch models whose :batch endpoints could not be loaded are refused at zdr until a refresh succeeds for them.
-  const unknown = new Set(snapshot.models.filter((m) => m.id.endsWith(":batch")).map((m) => normaliseModelSlug(m.id)).filter((id) => !Object.hasOwn(snapshot.batchEndpoints ?? {}, id))).size;
-  return unknown ? `${state} (batch endpoints unknown for ${unknown} model${unknown === 1 ? "" : "s"}; /batch privacy refresh retries)` : state;
+  // Likewise `:free` models whose free endpoints could not be loaded.
+  const unknownOf = (suffix: string, map: Record<string, string[]> | undefined) =>
+    new Set(snapshot.models.filter((m) => m.id.endsWith(suffix)).map((m) => normaliseModelSlug(m.id)).filter((id) => !Object.hasOwn(map ?? {}, id))).size;
+  const parts = [
+    [unknownOf(":batch", snapshot.batchEndpoints), "batch"],
+    [unknownOf(":free", snapshot.freeEndpoints), "free"],
+  ]
+    .filter(([n]) => n)
+    .map(([n, what]) => `${what} endpoints unknown for ${n} model${n === 1 ? "" : "s"}`);
+  return parts.length ? `${state} (${parts.join("; ")}; /batch privacy refresh retries)` : state;
 }
 
 /** Recorded with the attestation: the extension only stores what the user says. */
