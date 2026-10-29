@@ -15,7 +15,7 @@ import { allowListPin, allowedProviders, formatPin, formatPrivacyPolicy, formatR
 import { IgnoreMatcher, hardDenyMatcher } from "../context/ignore.js";
 import { buildContextPackage, gitCheckIgnore, toPosix } from "../context/package.js";
 import { formatSecretFindings, scanForSecrets } from "../context/secrets.js";
-import { atomicWriteFile, isInside, sha256Hex, writeFileAtomicExclusive } from "../fsutil.js";
+import { atomicWriteFile, isInside, sha256Hex, writeFileAtomicExclusive, writeFilesAllOrNothing } from "../fsutil.js";
 import { jobItems, sourceLabel } from "../items.js";
 import { formatMetadataPreview } from "../metadata-commands.js";
 import { writeApprovedDraft, writeMetadataReview } from "../metadata/outputs.js";
@@ -322,49 +322,6 @@ function checkWorkspaceWriteTarget(workspaceRoot: string, relPath: string): Writ
     if (fs.existsSync(cur) && fs.lstatSync(cur).isSymbolicLink()) return { ok: false, error: `Refusing to write through symbolic link: ${normRel}` };
   }
   return { ok: true, abs, normRel };
-}
-
-/**
- * Write several files all or nothing: every temp file is written first, existing
- * files are moved aside, then the temps are renamed into place. Any failure puts
- * the originals back and removes everything it created.
- */
-function writeFilesAllOrNothing(files: Array<{ abs: string; bytes: Buffer }>): void {
-  const suffix = `${process.pid}.${crypto.randomBytes(4).toString("hex")}`;
-  const temps: string[] = [];
-  const backups: Array<{ abs: string; bak: string }> = [];
-  const placed: string[] = [];
-  try {
-    for (const f of files) {
-      fs.mkdirSync(path.dirname(f.abs), { recursive: true });
-      const tmp = `${f.abs}.tmp.${suffix}`;
-      temps.push(tmp);
-      fs.writeFileSync(tmp, f.bytes, { flag: "wx" });
-    }
-    for (const f of files) {
-      if (fs.existsSync(f.abs)) {
-        const bak = `${f.abs}.bak.${suffix}`;
-        fs.renameSync(f.abs, bak);
-        backups.push({ abs: f.abs, bak });
-      }
-    }
-    for (const [i, f] of files.entries()) {
-      fs.renameSync(temps[i]!, f.abs);
-      placed.push(f.abs);
-    }
-  } catch (err) {
-    for (const p of placed) fs.rmSync(p, { force: true });
-    for (const b of backups) {
-      try {
-        fs.renameSync(b.bak, b.abs);
-      } catch {
-        // best-effort restore
-      }
-    }
-    for (const t of temps) fs.rmSync(t, { force: true });
-    throw err;
-  }
-  for (const b of backups) fs.rmSync(b.bak, { force: true });
 }
 
 export class BatchWebServer {
@@ -1415,7 +1372,7 @@ export class BatchWebServer {
         try {
           writeFilesAllOrNothing(targets);
         } catch (err) {
-          this.sendJson(res, 400, { error: `Could not write the bundle; nothing was replaced: ${err instanceof Error ? err.message : String(err)}` });
+          this.sendJson(res, 500, { error: `Could not write the bundle; nothing was replaced: ${err instanceof Error ? err.message : String(err)}` });
           return;
         }
         const m = check.manifest;
@@ -1447,6 +1404,10 @@ export class BatchWebServer {
         const rootReal = fs.realpathSync.native(path.resolve(this.deps.workspaceRoot));
         if (!isInside(rootReal, r.absPath)) {
           this.sendJson(res, 400, { error: "approved file is outside the workspace" });
+          return;
+        }
+        if (!r.absPath.toLowerCase().endsWith(".jsonl")) {
+          this.sendJson(res, 400, { error: "Only .jsonl files can be downloaded here." });
           return;
         }
         const bytes = fs.readFileSync(r.absPath);

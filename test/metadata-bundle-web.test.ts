@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 import { ArtifactService } from "../src/artifacts/service.js";
 import { ArtifactStore } from "../src/artifacts/store.js";
 import { ChatService } from "../src/chat/service.js";
@@ -23,8 +23,8 @@ interface Env {
   anon: (p: string, method?: string) => Promise<Response>;
 }
 
-function withWeb(extra: Record<string, string>, fn: (e: Env) => Promise<void>): () => Promise<void> {
-  return async () => {
+function withWeb(extra: Record<string, string>, fn: (e: Env, t: TestContext) => Promise<void>): (t: TestContext) => Promise<void> {
+  return async (t) => {
     const root = metadataWorkspace(extra);
     let web: BatchWebServer | undefined;
     try {
@@ -50,7 +50,7 @@ function withWeb(extra: Record<string, string>, fn: (e: Env) => Promise<void>): 
       const post = (p: string, body: unknown = {}, extra: Record<string, string> = {}) =>
         globalThis.fetch(base + p, { method: "POST", headers: { "Content-Type": "application/json", "X-Batch-Token": web!.csrfToken, Cookie: cookie, ...extra }, body: JSON.stringify(body) });
       const anon = (p: string, method = "GET") => globalThis.fetch(base + p, { method, headers: { "X-Batch-Token": web!.csrfToken } });
-      await fn({ root, get, post, anon });
+      await fn({ root, get, post, anon }, t);
     } finally {
       await web?.stop();
       rm(root);
@@ -133,11 +133,11 @@ test(
 );
 
 test(
-  "a failing destination leaves nothing replaced",
+  "a destination that is a directory is refused by the pre-check and nothing is written",
   withWeb({ "metadata/pnpt/r1/manifest.json/keep.txt": "x" }, async ({ root, post }) => {
-    // manifest.json is a directory, so its write must fail; the other two must not be left behind.
+    // manifest.json is a directory, so the pre-check refuses the whole import; the other two must not be written.
     const r = await post("/api/metadata/import-bundle", { files: bundle().files, overwrite: true });
-    assert.notEqual(r.status, 201);
+    assert.equal(r.status, 400);
     assert.equal(existsSync(join(root, D, "tables.jsonl")), false);
     assert.equal(existsSync(join(root, D, "context.md")), false);
     assert.deepEqual(readdirSync(join(root, D)), ["manifest.json"]);
@@ -157,5 +157,24 @@ test(
     assert.equal((await get(`/api/metadata/approved-file?path=${encodeURIComponent("../outside.jsonl")}`)).status, 400);
     assert.equal((await get(`/api/metadata/approved-file?path=${encodeURIComponent(`${D}/context.md`)}`)).status, 400);
     assert.equal((await get("/api/metadata/approved-file")).status, 400);
+  }),
+);
+
+test(
+  "approved-file refuses a .jsonl name that is a symlink to a non-.jsonl file",
+  withWeb({}, async ({ root, get }, t) => {
+    mkdirSync(join(root, "docs"), { recursive: true });
+    writeFileSync(join(root, "docs", "notes.md"), "secret notes");
+    try {
+      symlinkSync(join(root, "docs", "notes.md"), join(root, "docs", "x.jsonl"));
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EPERM") {
+        t.skip("cannot create symlinks on this platform");
+        return;
+      }
+      throw err;
+    }
+    const r = await get(`/api/metadata/approved-file?path=${encodeURIComponent("docs/x.jsonl")}`);
+    assert.equal(r.status, 400);
   }),
 );

@@ -285,3 +285,66 @@ export function writeFileAtomicExclusive(absPath: string, data: string | Buffer,
     }
   }
 }
+
+/**
+ * Write several files all or nothing: every temp file is written first, existing
+ * files are moved aside, then the temps are renamed into place. Any failure puts
+ * the originals back and removes everything it created. An existing directory at
+ * a target is not moved aside, so placing a file there fails and rolls back.
+ */
+export function writeFilesAllOrNothing(files: Array<{ abs: string; bytes: Buffer }>): void {
+  const suffix = `${process.pid}.${crypto.randomBytes(4).toString("hex")}`;
+  const temps: string[] = [];
+  const backups: Array<{ abs: string; bak: string }> = [];
+  const placed: string[] = [];
+  try {
+    for (const f of files) {
+      fs.mkdirSync(path.dirname(f.abs), { recursive: true });
+      const tmp = `${f.abs}.tmp.${suffix}`;
+      temps.push(tmp);
+      fs.writeFileSync(tmp, f.bytes, { flag: "wx" });
+    }
+    for (const f of files) {
+      if (fs.existsSync(f.abs) && !fs.lstatSync(f.abs).isDirectory()) {
+        const bak = `${f.abs}.bak.${suffix}`;
+        fs.renameSync(f.abs, bak);
+        backups.push({ abs: f.abs, bak });
+      }
+    }
+    for (const [i, f] of files.entries()) {
+      fs.renameSync(temps[i]!, f.abs);
+      placed.push(f.abs);
+    }
+  } catch (err) {
+    // Each cleanup step is independent: one failing must not skip the others.
+    for (const p of placed) {
+      try {
+        fs.rmSync(p, { force: true });
+      } catch {
+        // best-effort
+      }
+    }
+    for (const t of temps) {
+      try {
+        fs.rmSync(t, { force: true });
+      } catch {
+        // best-effort
+      }
+    }
+    for (const b of backups) {
+      try {
+        fs.renameSync(b.bak, b.abs);
+      } catch {
+        // best-effort restore
+      }
+    }
+    throw err;
+  }
+  for (const b of backups) {
+    try {
+      fs.rmSync(b.bak, { force: true });
+    } catch {
+      // the write succeeded; a leftover backup is harmless
+    }
+  }
+}
