@@ -1,0 +1,37 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-10-17/server.schema.json",
+  "name": "io.github.mastnacek/pi-batch-openrouter",
+  "description": "Deferred OpenRouter Batch jobs (~50% discount) with per-file/dataset fan-out, synthesis, privacy controls, and artifacts.",
+  "repository": {
+    "url": "https://github.com/mastnacek/pi-batch-openrouter",
+    "source": "github"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "pi-batch-openrouter",
+      "version": "0.1.0",
+      "runtimeHint": "npx",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "named",
+          "name": "--cwd",
+          "description": "Workspace root directory",
+          "isRequired": false
+        }
+      ],
+      "environmentVariables": [
+        {
+          "name": "OPENROUTER_API_KEY",
+          "description": "OpenRouter API key (optional when configured in ~/.pi/agent/auth.json)",
+          "isSecret": true,
+          "isRequired": false
+        }
+      ]
+    }
+  ]
+}
