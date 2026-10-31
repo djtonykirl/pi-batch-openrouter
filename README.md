@@ -56,6 +56,8 @@ Add to `~/.pi/agent/settings.json` or `.pi/settings.json`:
 
 The API key comes from Pi's model registry/`auth.json` for the selected account (`/batch provider`), falling back to `OPENROUTER_API_KEY`.
 
+Using **VS Code (Copilot Agent Mode)**, **Claude Code**, or **Google Antigravity**? See [MCP server (`pi-batch-mcp`)](#mcp-server-pi-batch-mcp--vs-code-copilot-claude-code-antigravity) for installation and usage guides.
+
 ## Commands
 
 | Command | Purpose |
@@ -1293,9 +1295,11 @@ A workflow's own `limits` can only lower these. The `routing` section is describ
 
 The `privacy` section is described in [Privacy levels and free models](#privacy-levels-and-free-models). `/batch privacy attest` also writes `privacy.attestedAt` (an ISO time) next to `accountNoTraining`.
 
-## LLM tools
+## LLM tools and MCP server
 
-All tools call the same `BatchService` as the slash commands, so they get the same path, exclusion, secret, limit and duplicate checks.
+All model-callable tools use the same `BatchService` as the slash commands, so they get the same path containment, exclusion, secret-scanning, privacy/ZDR, limit and duplicate checks.
+
+### Pi tools
 
 - `batch_submit_goal` (`prompt`, optional `files`, `model`, `provider` (account alias)) submits a single deferred goal.
 - `batch_plan_files` (`prompt`, `files`, optional `model`, `group_size`) builds and saves a map-files plan. It **never submits** and incurs no cost.
@@ -1304,12 +1308,280 @@ All tools call the same `BatchService` as the slash commands, so they get the sa
 - `batch_list_workflows` and `batch_validate_workflow` (`name` or `file`) are read-only.
 - `batch_plan_dataset` (`workflow`, `input`, optional `ids`, `from_row`, `to_row`, `model`) saves a dataset plan
   as a preview. It runs every check of `/batch run` and **never submits**.
-- There is deliberately no export tool. Writing export files is an explicit user command.
 - `artifact_list` and `artifact_show` are read-only.
 - `artifact_plan_render` (`source`, `format`, optional `out`) runs every check of `/artifact render` and renders
   in memory, but **writes nothing**. It tells the user the command to run.
-- There is no artifact-writing tool.
 - `batch_check_jobs` (optional `batch_id`) reconciles, then reports from local state.
+
+### MCP server (`pi-batch-mcp`) — VS Code Copilot, Claude Code, Antigravity
+
+The package also ships a standalone `stdio` Model Context Protocol (MCP) server (`pi-batch-mcp`) so interactive streaming agents in **VS Code (GitHub Copilot Agent Mode)**, **Claude Code**, **Google Antigravity**, and other MCP clients can offload heavy or multi-file work to OpenRouter Batch (~50% token discount, up to 24h turnaround) and pull the results back later.
+
+`pi-batch-mcp` uses the exact same `BatchService`, `.pi/batches/` store, and per-job file locks as Pi and `/batch web`, so you can run all three side by side on the same workspace.
+
+#### 1. Prerequisites & API Key Setup
+
+Build the package once if running from a local checkout:
+
+```bash
+npm install
+npm run build
+```
+
+`pi-batch-mcp` resolves your OpenRouter API key in this order (and redacts every resolved key from `.pi/batches/extension.log`):
+1. **`~/.pi/agent/auth.json`** for the selected account (`defaultAccount` in `.pi/batch.config.json`, default `"openrouter"`, or the `provider` argument passed to `batch_plan_goal`):
+   ```json
+   {
+     "openrouter": { "key": "sk-or-v1-..." },
+     "openrouter-work": { "key": "sk-or-v1-..." }
+   }
+   ```
+2. **`OPENROUTER_API_KEY` environment variable** (used only for the configured default account, never for another named account so the wrong account is never billed).
+
+---
+
+#### 2. Installation Across Clients
+
+##### A. Visual Studio Code (GitHub Copilot Agent Mode)
+
+Create `.vscode/mcp.json` in your workspace (or add the server to your User `mcp.json` via Command Palette → **MCP: Open User Configuration**):
+
+**Option 1 — Via `npx` (published package or git):**
+```json
+{
+  "inputs": [
+    {
+      "id": "openrouter-key",
+      "type": "promptString",
+      "description": "OpenRouter API key (leave blank if configured in ~/.pi/agent/auth.json)",
+      "password": true
+    }
+  ],
+  "servers": {
+    "pibatch": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "--package", "pi-batch-openrouter", "pi-batch-mcp", "--cwd", "${workspaceFolder}"],
+      "env": {
+        "OPENROUTER_API_KEY": "${input:openrouter-key}"
+      }
+    }
+  }
+}
+```
+
+**Option 2 — Local repository checkout:**
+```json
+{
+  "servers": {
+    "pibatch": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["C:/path/to/pi-batch-openrouter/dist/src/mcp/cli.js", "--cwd", "${workspaceFolder}"]
+    }
+  }
+}
+```
+
+- Open the Command Palette (`Ctrl+Shift+P` / `Cmd+Shift+P`) → **MCP: List Servers** → select `pibatch` → **Start Server**.
+- In the Copilot Chat view, switch to **Agent** mode and click the **Configure Tools** icon to verify the `pibatch` tools are enabled.
+
+##### B. Claude Code
+
+You can register `pi-batch-mcp` via the `claude mcp` CLI or by checking a `.mcp.json` file into the project root.
+
+**Option 1 — CLI registration (project or user scope):**
+```bash
+# Using npx (project scope, writes .mcp.json):
+claude mcp add --transport stdio --scope project pibatch -- npx -y --package pi-batch-openrouter pi-batch-mcp
+
+# Or from a local checkout (user scope, available in every project; workspace is resolved automatically via MCP roots/list or process.cwd()):
+claude mcp add --transport stdio --scope user -e OPENROUTER_API_KEY=sk-or-v1-... pibatch -- node /abs/path/to/pi-batch-openrouter/dist/src/mcp/cli.js
+```
+
+**Option 2 — Project `.mcp.json` (checked into git):**
+```json
+{
+  "mcpServers": {
+    "pibatch": {
+      "command": "npx",
+      "args": ["-y", "--package", "pi-batch-openrouter", "pi-batch-mcp", "--cwd", "."]
+    }
+  }
+}
+```
+
+- Inside Claude Code, run `/mcp` to check the server connection and inspect exposed tools and prompts.
+
+##### C. Google Antigravity
+
+Antigravity reads MCP servers from `~/.gemini/config/mcp_config.json` (global) or from a plugin's `plugins/<name>/mcp_config.json` (workspace/plugin-scoped).
+
+**Option 1 — Global configuration (`~/.gemini/config/mcp_config.json`):**
+```json
+{
+  "mcpServers": {
+    "pibatch": {
+      "command": "node",
+      "args": ["C:/path/to/pi-batch-openrouter/dist/src/mcp/cli.js"],
+      "env": {
+        "OPENROUTER_API_KEY": "sk-or-v1-..."
+      }
+    }
+  }
+}
+```
+*(When `--cwd` is omitted, `pi-batch-mcp` automatically queries the client's `roots/list` for the active workspace root, falling back to `process.cwd()`. To pin a specific workspace, append `"--cwd", "C:/path/to/workspace"` to `args`.)*
+
+**Option 2 — Workspace plugin (`.agents/plugins/pibatch/plugin.json` + `mcp_config.json`):**
+```json
+// .agents/plugins/pibatch/mcp_config.json
+{
+  "mcpServers": {
+    "pibatch": {
+      "command": "npx",
+      "args": ["-y", "--package", "pi-batch-openrouter", "pi-batch-mcp", "--cwd", "."]
+    }
+  }
+}
+```
+
+- Verify in the Antigravity UI via **Additional Options (`...`) → MCP Servers**.
+
+---
+
+#### 3. Safety & Cost Model Over MCP
+
+1. **Always plan → confirm → submit.** One-step `batch_submit_goal` is intentionally **not exposed** over MCP. Every planning tool (`batch_plan_goal`, `batch_plan_files`, `batch_plan_dataset`, `batch_retry_items`, `batch_plan_synthesis`) is marked `readOnlyHint: true`, makes zero OpenRouter requests, and costs nothing.
+2. **Two-layer submission confirmation:**
+   - `batch_submit_plan` is annotated as cost-bearing (`readOnlyHint: false`, `openWorldHint: true`), so MCP clients prompt before running it.
+   - When the client supports MCP `elicitation`, `batch_submit_plan` also sends an interactive confirmation form showing the job ID, model, request count, character count, privacy level, and objective before posting to OpenRouter.
+3. **Request-count cap:** `mcp.maxRequestsPerSubmit` (default `100` in `.pi/batch.config.json`) blocks oversized submissions over MCP.
+4. **Identical local guardrails:** Path containment, `.pi/batchignore`, `.gitignore`, hard-deny patterns (`.env`, keys, certs), high-confidence secret scanning, duplicate active-job detection, and `standard` / `no-training` / `zdr` privacy enforcement all run unchanged.
+
+**MCP configuration** (`mcp` section in `.pi/batch.config.json`):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `mcp.maxRequestsPerSubmit` | `100` | Largest request count `batch_submit_plan` will submit in one call over MCP. |
+| `mcp.disabledTools` | `[]` | Tool names to hide and block on the MCP server (e.g. `["batch_cancel", "batch_export"]`). |
+
+---
+
+#### 4. Complete MCP Reference
+
+##### Tools (18)
+
+| Category | Tool | Annotations | Purpose |
+|---|---|---|---|
+| **Plan (free)** | `batch_plan_goal` | Read-only | Plan a single deferred review/analysis goal over `files` (`prompt`, optional `files`, `model`, `provider`). |
+| | `batch_plan_files` | Read-only | Plan a `map-files` job: one request per file (or `group_size` files) sharing one `prompt`. |
+| | `batch_plan_dataset` | Read-only | Plan a `.pi/batch-workflows/*.yaml` workflow over a CSV/JSONL `input` file (optional `ids`, `from_row`, `to_row`, `model`). |
+| | `batch_retry_items` | Read-only | Plan a linked retry job for `failed: true` or specific `items` selectors of a finished multi-item job. |
+| | `batch_plan_synthesis` | Read-only | Plan a linked synthesis job over a finished multi-item job (combines retry coverage; optional `allow_partial`, `model`). |
+| **Submit ($)** | `batch_submit_plan` | Cost-bearing | Submit a previewed job (`batch_id`) to OpenRouter after user approval. |
+| **Track & Read** | `batch_check_jobs` | Read-only (network) | Reconcile active jobs with OpenRouter now and report status (optional `batch_id`). |
+| | `batch_list_jobs` | Read-only (local) | Fast local list of jobs without network calls (`status`: `active`\|`done`\|`ready`\|`partial`\|`failed`\|`previewed`\|`all`, `limit`). |
+| | `batch_get_items` | Read-only | Per-item status, source file/row, and combined coverage with linked retry jobs (`batch_id`). |
+| | `batch_read_result` | Read-only | Bring a finished result into chat (`batch_id`, `mode`: `"summary"` (default bounded excerpt) \| `"full"` \| `"item"` (with `item`) \| `"synthesis"`). |
+| **Control** | `batch_cancel` | Destructive | Cancel a previewed or active job (`batch_id`). |
+| **Workflows** | `batch_list_workflows` | Read-only | List built-in and `.pi/batch-workflows/*.yaml` definitions and their validity. |
+| | `batch_validate_workflow` | Read-only | Validate a workflow by `name` or workspace `file` path and report diagnostics with locations. |
+| **Exports & Artifacts** | `batch_export` | Writes file | Export finished per-item results + provenance to `jsonl` or `csv` (`batch_id`, `format`, optional `out`, `overwrite`, `job_only`). |
+| | `artifact_list` | Read-only | List generated artifacts (optional `job_id`). |
+| | `artifact_show` | Read-only | Show full provenance, hashes, source state, and lineage for `artifact_id`. |
+| | `artifact_templates` | Read-only | List `.pi/artifact-templates/*.yaml` templates and their validity. |
+| | `artifact_plan_render` | Read-only | Dry-run rendering a workspace Markdown `source` file to `html` or `pdf` in memory without writing. |
+| | `artifact_create` | Writes file | Render a controlled `markdown`, `html`, `pdf`, or `text` file from `job_id` (or `source_file`) with optional `template`, `item`, `synthesis`, `out`, `overwrite`. |
+| **Privacy** | `batch_privacy_status` | Read-only | Report effective privacy level (`standard`\|`no-training`\|`zdr`), attestation, routing policy, and catalog state. |
+
+##### Resources (5 URIs / templates, with `resources/subscribe`)
+
+Attach these directly to your chat context (e.g. **Add Context → MCP Resources** in VS Code, or `@batch://...` in Claude Code) without spending a tool call:
+- `batch://jobs` — JSON inventory of all workspace batch jobs.
+- `batch://jobs/{id}` — Full manifest, item statuses, usage/cost, and linked retries/syntheses.
+- `batch://jobs/{id}/result` — Bounded Markdown result of a finished job.
+- `batch://jobs/{id}/items/{n}` — Metadata and result text for item `n` (or `custom_id` / source path).
+- `batch://jobs/{id}/synthesis` — Newest synthesis result with its locally recorded coverage block.
+
+When the background poller settles a job, the server emits `notifications/resources/updated` and `notifications/resources/list_changed`.
+
+##### Prompts / Slash Commands (3)
+
+- `review-files` (`objective`, `files`, optional `model`) — Instructs the agent to expand the file list, call `batch_plan_files`, present the plan, and wait for approval.
+- `status` — Reconciles active jobs via `batch_check_jobs` and summarises what finished.
+- `bring-result` (`batch_id`, optional `mode`) — Reads a finished job via `batch_read_result` and summarises findings as advisory analysis.
+
+---
+
+#### 5. Optimal Usage Patterns & Examples
+
+OpenRouter Batch is asynchronous (typically minutes to a few hours, up to 24h) and ~50% cheaper per token. Use your editor's streaming chat model for interactive edits and debugging, and offload **high-token, fan-out, or deep-reasoning tasks** to `pi-batch-mcp`.
+
+##### Pattern 1: Deep architectural or security audit (`batch_plan_goal`)
+
+Best when you want a frontier reasoning model (`anthropic/claude-opus-5.5`, `deepseek/deepseek-r1`, etc.) to read several large files thoroughly while you keep working on something else, or even close your editor.
+
+> **You:** "Plan a batch goal on `anthropic/claude-opus-5.5` over `src/service.ts`, `src/poller.ts`, and `src/registry.ts` to identify race conditions or crash-recovery gaps. Show me the plan first."
+>
+> **Agent:** Calls `batch_plan_goal` → reports `B-20261031-4F9A` (1 request, 3 files, 162,400 chars, privacy `standard`, $0 incurred) and asks to submit.
+>
+> **You:** "Submit `B-20261031-4F9A`." *(Approve the confirmation prompt.)*
+>
+> *(Later — even after restarting VS Code / Claude Code / Antigravity)*
+>
+> **You:** "Check my batch jobs and bring in the result if it's ready." (or run `/mcp.pibatch.status`)
+>
+> **Agent:** Calls `batch_check_jobs` → sees `ready` → calls `batch_read_result(batch_id: "B-20261031-4F9A", mode: "summary")` → summarises the findings and waits for your instructions before touching any code.
+
+##### Pattern 2: Repository-wide per-file fan-out, retry, and synthesis (`batch_plan_files`)
+
+Instead of stuffing 30 files into one giant context window (where models lose attention in the middle), `map-files` sends **one independent request per file** in a single batch, then synthesizes the validated per-file results.
+
+> **You:** "Use `batch_plan_files` to review every `.ts` file under `src/workflows/` and `src/artifacts/` (1 file per request) for untrusted-input handling bugs. Don't submit yet."
+>
+> **Agent:** Lists the 11 files, calls `batch_plan_files`, and shows `B-20261031-8K2M` (11 requests, 94,100 total chars).
+>
+> **You:** "Looks good, submit `B-20261031-8K2M`."
+>
+> *(When the batch completes)*
+>
+> **You:** "Check `B-20261031-8K2M` and inspect its items."
+>
+> **Agent:** Calls `batch_check_jobs` and `batch_get_items`.
+> - If 10/11 succeeded and item 4 failed: ask the agent to call `batch_retry_items(batch_id: "B-20261031-8K2M", failed: true)` → approve `batch_submit_plan` for the 1-item retry.
+> - Once coverage is 11/11, ask: *"Plan a synthesis for `B-20261031-8K2M`"* → `batch_plan_synthesis` → approve `batch_submit_plan`.
+> - When the synthesis finishes, read the consolidated report with `batch_read_result(batch_id: "B-20261031-8K2M", mode: "synthesis")` or drill into a single file with `batch_read_result(batch_id: "B-20261031-8K2M", mode: "item", item: "src/artifacts/service.ts")`.
+
+##### Pattern 3: Schema-validated dataset processing & export (`batch_plan_dataset` + `batch_export`)
+
+When processing CSV or JSONL datasets through a `.pi/batch-workflows/<name>.yaml` definition:
+
+> **You:** "Validate the `classify-tickets` workflow, plan it over `data/tickets.csv` for rows 1 to 50, and show me the plan."
+>
+> **Agent:** Calls `batch_validate_workflow(name: "classify-tickets")` → calls `batch_plan_dataset(workflow: "classify-tickets", input: "data/tickets.csv", from_row: 1, to_row: 50)` → reports selected rows, fields sent, and character count.
+>
+> **You:** "Submit the plan." → *(Once ready)* → "Export the results of `B-20261031-9P1Q` to `exports/tickets-classified.jsonl`."
+>
+> **Agent:** Calls `batch_export`, writing schema-validated JSON objects with full item and retry provenance.
+
+##### Pattern 4: Generating controlled PDF / HTML deliverables (`artifact_create`)
+
+Turn a finished batch result or synthesis into a clean Markdown, HTML, or PDF report without sending another model request:
+
+> **You:** "Create a Markdown report from the synthesis of `B-20261031-8K2M` at `reports/security-review.md`, then render it to `reports/security-review.pdf`."
+>
+> **Agent:**
+> 1. Calls `artifact_create(job_id: "B-20261031-8K2M", synthesis: true, format: "markdown", out: "reports/security-review.md")`.
+> 2. *(Optional: you or the agent can edit `reports/security-review.md` locally — provenance tracks that the source was modified after generation.)*
+> 3. Calls `artifact_create(source_file: "reports/security-review.md", format: "pdf", out: "reports/security-review.pdf")`.
+
+##### Best-practice tips for MCP users
+
+- **Keep context lean:** Always start with `batch_read_result` in `mode: "summary"` (the default, capped at `injection.maxCharacters`, 30,000 chars). For multi-file jobs, inspect `batch_get_items` first and pull only the items you need with `mode: "item"`.
+- **Attach resources directly:** In VS Code Copilot (`Add Context → MCP Resources`) or Claude Code (`@batch://jobs/<id>/result`), you can attach a finished job's result directly into your prompt without waiting for an agent tool round-trip.
+- **Check privacy before sending sensitive code:** Ask the agent to call `batch_privacy_status` first. If your project requires Zero Data Retention (`zdr`) or `no-training`, configure it in Pi (`/batch privacy zdr`) or `.pi/batch.config.json` — the MCP server enforces the project's privacy level on every plan and submission and cannot weaken it.
+- **Co-exist with the Web UI:** Run `npm run web` (or `npx pi-batch-web --cwd .`) alongside your IDE if you want a live browser dashboard for inspecting jobs, items, and rendered artifacts while your MCP agent works.
 
 ## Known limitations
 

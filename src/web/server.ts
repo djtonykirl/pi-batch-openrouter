@@ -34,6 +34,7 @@ import { isChatJob, type JobManifest } from "../types.js";
 import { discoverWorkflows } from "../workflows/definition.js";
 import { checkBundle, manifestIds } from "../metadata/bundle.js";
 import { resolveWorkspaceInput } from "../workspace-paths.js";
+import { createWorkspaceServices } from "../workspace.js";
 import { renderWebUiHtml } from "./ui.js";
 
 export interface WebServerDeps {
@@ -90,49 +91,8 @@ const DEFAULT_FALLBACK_MODELS = [
   "deepseek/deepseek-r1",
 ];
 
-/**
- * The API key for `account` outside Pi: that account's own entry in ~/.pi/agent/auth.json, or OPENROUTER_API_KEY
- * only when `account` is the configured default. Never another account's key (that would bill the wrong account);
- * with no key it throws a clear error.
- */
-export function resolveStandaloneApiKey(account: string, defaultAccount: string, authFile = path.join(os.homedir(), ".pi", "agent", "auth.json")): string {
-  let authError: string | undefined;
-  try {
-    if (fs.existsSync(authFile)) {
-      const auth = JSON.parse(fs.readFileSync(authFile, "utf8")) as Record<string, { key?: string; access?: string } | undefined>;
-      const entry = Object.prototype.hasOwnProperty.call(auth, account) ? auth[account] : undefined;
-      if (entry?.key) return entry.key;
-      if (entry?.access) return entry.access;
-    }
-  } catch (err) {
-    authError = (err as Error).message;
-  }
-  const isDefault = account === defaultAccount;
-  if (isDefault && process.env.OPENROUTER_API_KEY) return process.env.OPENROUTER_API_KEY;
-  throw new Error(
-    `No API key for account "${account}" in ${authFile}${authError ? ` (unreadable: ${authError})` : ""}` +
-      (isDefault ? " and OPENROUTER_API_KEY is not set." : `. OPENROUTER_API_KEY is used only for the default account ("${defaultAccount}").`),
-  );
-}
-
-/**
- * Wraps a key resolver so the standalone logger can redact every key it has handed out (plus OPENROUTER_API_KEY).
- * `base` defaults to `resolveStandaloneApiKey` with the configured default account.
- */
-export function createStandaloneKeyResolver(
-  getDefaultAccount: () => string,
-  base: (account: string) => Promise<string> = async (account) => resolveStandaloneApiKey(account, getDefaultAccount()),
-): { resolve: (account: string) => Promise<string>; secrets: () => string[] } {
-  const resolved = new Set<string>();
-  return {
-    resolve: async (account) => {
-      const key = await base(account);
-      if (key) resolved.add(key);
-      return key;
-    },
-    secrets: () => [...resolved, ...(process.env.OPENROUTER_API_KEY ? [process.env.OPENROUTER_API_KEY] : [])],
-  };
-}
+// Standalone key resolution moved to ../workspace.ts (shared with the MCP server); re-exported for existing callers.
+export { createStandaloneKeyResolver, resolveStandaloneApiKey } from "../workspace.js";
 
 
 /**
@@ -352,80 +312,22 @@ export class BatchWebServer {
     getServer: () => BatchWebServer | null,
     getKnownModels?: () => string[],
   ): WebServerDeps {
-    let loaded = loadConfig(workspaceRoot);
-    const storage = path.resolve(workspaceRoot, loaded.config.storagePath);
-    const registry = new JobRegistry(storage);
-    // Every key handed out is redacted from this workspace's log.
-    const keys = createStandaloneKeyResolver(() => loaded.config.defaultAccount, resolveKey);
-    const logger = new FileLogger(path.join(storage, "extension.log"), keys.secrets);
-
-    const catalog = new ModelCatalog({
-      file: path.join(storage, "model-catalog.json"),
-      logger,
-      fetch: async (): Promise<CatalogData> => {
-        const apiKey = await keys.resolve(loaded.config.defaultAccount);
-        const client = new OpenRouterBatchClient({ apiKey, timeoutMs: loaded.config.polling.requestTimeoutSeconds * 1000 });
-        return fetchCatalogData(client, logger);
-      },
+    const ws = createWorkspaceServices(workspaceRoot, {
+      resolveApiKey: resolveKey,
+      onSettled: (job) => getServer()?.broadcast({ type: "settled", localId: job.localId, status: job.localStatus }),
+      onBadge: () => getServer()?.broadcast({ type: "badge" }),
+      onTick: () => getServer()?.broadcast({ type: "tick" }),
     });
-    // Privacy decisions read the config files fresh: another process may have raised the level since this snapshot.
-    const getPrivacy = () => readPrivacyConfig(workspaceRoot, undefined, loaded.config.privacy);
-    const service = new BatchService({
-      registry,
-      catalog,
-      workspaceRoot,
-      getConfig: () => loaded.config,
-      getPrivacy,
-      resolveApiKey: keys.resolve,
-      logger,
-      onSettled: (job) => {
-        if (isChatJob(job)) {
-          try {
-            chat.applySettled(job);
-          } catch {
-            // logged by ChatService
-          }
-        }
-        getServer()?.broadcast({ type: "settled", localId: job.localId, status: job.localStatus });
-      },
-    });
-    const artifacts = new ArtifactService({
-      batch: service,
-      workspaceRoot,
-      getConfig: () => loaded.config,
-      store: new ArtifactStore(path.join(storage, "artifacts")),
-    });
-    const chatStore = new ThreadStore(path.join(storage, "threads"));
-    const chat = new ChatService({
-      store: chatStore,
-      batch: service,
-      workspaceRoot,
-      getConfig: () => loaded.config,
-      getPrivacy,
-      logger,
-    });
-    const poller = new BatchPoller(
-      () => service,
-      () => loaded.config.polling.enabled,
-      () => getServer()?.broadcast({ type: "badge" }),
-      async () => {
-        await chat.tick();
-        getServer()?.broadcast({ type: "tick" });
-      },
-    );
-
     return {
       workspaceRoot,
-      service,
-      chat,
-      chatStore,
-      artifacts,
-      poller,
-      catalog,
-      getConfig: () => loaded.config,
-      reloadConfig: () => {
-        loaded = loadConfig(workspaceRoot);
-      },
+      service: ws.service,
+      chat: ws.chat,
+      chatStore: ws.chatStore,
+      artifacts: ws.artifacts,
+      poller: ws.poller,
+      catalog: ws.catalog,
+      getConfig: ws.getConfig,
+      reloadConfig: ws.reloadConfig,
       getKnownModels,
       ownsPoller: true,
     };

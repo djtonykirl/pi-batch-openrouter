@@ -66,6 +66,13 @@ export interface BatchConfig {
     requireNoDataCollection: boolean;
     accountDataCollectionDenied: boolean;
   };
+  /** MCP server policy (not used by Pi). */
+  mcp: {
+    /** Largest request count `batch_submit_plan` will submit in one call; above this, submission must happen in Pi or the web UI. */
+    maxRequestsPerSubmit: number;
+    /** Tool names to omit from the MCP server's tool list. */
+    disabledTools: string[];
+  };
 }
 
 /**
@@ -117,6 +124,7 @@ export const DEFAULT_CONFIG: BatchConfig = {
   },
   privacy: { level: "standard", accountNoTraining: false, deleteRemoteBatches: true, noticeShown: false },
   routing: { allowedProviders: [], allowFallbacks: true, requireZdr: false, accountZdrEnforced: false, requireNoDataCollection: false, accountDataCollectionDenied: false },
+  mcp: { maxRequestsPerSubmit: 100, disabledTools: [] },
 };
 
 export const GLOBAL_CONFIG_DIR = path.join(os.homedir(), ".pi", "agent", "pi-batch-openrouter");
@@ -240,6 +248,10 @@ const SCHEMA: Record<string, Check | Record<string, Check>> = {
     accountZdrEnforced: bool,
     requireNoDataCollection: bool,
     accountDataCollectionDenied: bool,
+  },
+  mcp: {
+    maxRequestsPerSubmit: posInt(10_000),
+    disabledTools: (v) => Array.isArray(v) && v.length <= 100 && v.every((x) => typeof x === "string" && /^[a-z0-9_]{1,80}$/i.test(x)),
   },
 };
 
