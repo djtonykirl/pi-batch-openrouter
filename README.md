@@ -1448,6 +1448,38 @@ Antigravity reads MCP servers from `~/.gemini/config/mcp_config.json` (global) o
 
 - Verify in the Antigravity UI via **Additional Options (`...`) → MCP Servers**.
 
+##### D. Install Natural-Language Agent Instructions (`pi-batch-mcp init`)
+
+To make the agent use `pi-batch` automatically from plain English without you naming any tools or batch IDs, run:
+
+```bash
+# Install instructions for all supported clients (VS Code, Claude Code, Antigravity) in the current project:
+npx -y --package pi-batch-openrouter pi-batch-mcp init
+
+# Or target a single client (--client vscode | claude | antigravity | all) and/or workspace (--cwd <path>):
+npx -y --package pi-batch-openrouter pi-batch-mcp init --client vscode --cwd .
+```
+
+This copies the ready-made templates from [`integrations/`](./integrations) into your workspace (skipping any existing files unless `--force` is passed):
+- **VS Code Copilot:** `.github/instructions/pi-batch.instructions.md` (`applyTo: "**"`)
+- **Claude Code:** `.claude/skills/pi-batch/SKILL.md`
+- **Google Antigravity:** `.agents/plugins/pibatch/{plugin.json,mcp_config.json,rules/AGENTS.md,skills/pi-batch/SKILL.md}`
+
+---
+
+#### 2.5 Natural-Language Job & Item References
+
+You never need to copy or remember `B-YYYYMMDD-XXXX` IDs or item numbers:
+
+1. **Human-readable labels:** Every job automatically gets a short label derived from its objective (or an explicit `name` passed to `batch_plan_goal`, `batch_plan_files`, or `batch_plan_dataset`, such as `"auth security audit"`).
+2. **Natural `batch_id` / `job_id` resolution:** Every tool and `batch://jobs/{id}*` resource accepts:
+   - **Recency:** `"latest"`, `"the latest finished job"`, `"previous"`, `"oldest"`
+   - **Status + topic phrases:** `"the security audit"`, `"the finished review of src/api"`, `"yesterday's audit"`, `"the unsubmitted plan"`
+   - **Exact name or ID:** `"auth security audit"`, `"B-20261031-4F9A"`, or a unique suffix like `"4F9A"`
+   - **Ambiguity safety:** For cost-bearing (`batch_submit_plan`) or destructive (`batch_cancel`) actions, if a phrase matches more than one eligible job without a recency qualifier, the server refuses and lists the matching jobs so you can pick the right one.
+3. **Bare file names as item selectors:** In `batch_read_result(mode: "item")` and `batch_retry_items`, `item` / `items` accepts a bare file name (`"auth.ts"`), a trailing path suffix (`"api/auth.ts"`), a full workspace path, an item number (`1..N`), or `id:<sourceId>`.
+4. **Conversational tool outputs:** Every tool response starts with a plain-English summary sentence (for example, `Plan ready: "auth security audit" will review 11 requests (one per file) with anthropic/claude-opus-5.5. Nothing has been sent or billed yet.`), while keeping machine-readable fields in `structuredContent`.
+
 ---
 
 #### 3. Safety & Cost Model Over MCP
@@ -1522,36 +1554,35 @@ OpenRouter Batch is asynchronous (typically minutes to a few hours, up to 24h) a
 
 Best when you want a frontier reasoning model (`anthropic/claude-opus-5.5`, `deepseek/deepseek-r1`, etc.) to read several large files thoroughly while you keep working on something else, or even close your editor.
 
-> **You:** "Plan a batch goal on `anthropic/claude-opus-5.5` over `src/service.ts`, `src/poller.ts`, and `src/registry.ts` to identify race conditions or crash-recovery gaps. Show me the plan first."
+> **You:** "Have Claude Opus do a deep batch audit of `src/service.ts`, `src/poller.ts`, and `src/registry.ts` for race conditions or crash-recovery gaps."
 >
-> **Agent:** Calls `batch_plan_goal` → reports `B-20261031-4F9A` (1 request, 3 files, 162,400 chars, privacy `standard`, $0 incurred) and asks to submit.
+> **Agent:** Calls `batch_plan_goal(name: "race & recovery audit", ...)` → *"Plan ready: 'race & recovery audit' will send 1 request covering 3 files (162,400 chars) to `anthropic/claude-opus-5.5`. Nothing has been sent or billed yet. Would you like me to submit it?"*
 >
-> **You:** "Submit `B-20261031-4F9A`." *(Approve the confirmation prompt.)*
+> **You:** "Yes, go ahead." *(Approve the confirmation prompt.)*
 >
 > *(Later — even after restarting VS Code / Claude Code / Antigravity)*
 >
-> **You:** "Check my batch jobs and bring in the result if it's ready." (or run `/mcp.pibatch.status`)
+> **You:** "Is my batch done? If so, what did it find?"
 >
-> **Agent:** Calls `batch_check_jobs` → sees `ready` → calls `batch_read_result(batch_id: "B-20261031-4F9A", mode: "summary")` → summarises the findings and waits for your instructions before touching any code.
+> **Agent:** Calls `batch_check_jobs` → sees `"race & recovery audit"` is finished → calls `batch_read_result(batch_id: "latest", mode: "summary")` → summarises the findings and waits for your instructions before touching any code.
 
 ##### Pattern 2: Repository-wide per-file fan-out, retry, and synthesis (`batch_plan_files`)
 
 Instead of stuffing 30 files into one giant context window (where models lose attention in the middle), `map-files` sends **one independent request per file** in a single batch, then synthesizes the validated per-file results.
 
-> **You:** "Use `batch_plan_files` to review every `.ts` file under `src/workflows/` and `src/artifacts/` (1 file per request) for untrusted-input handling bugs. Don't submit yet."
+> **You:** "Review every `.ts` file under `src/workflows/` and `src/artifacts/` in a batch for untrusted-input handling bugs."
 >
-> **Agent:** Lists the 11 files, calls `batch_plan_files`, and shows `B-20261031-8K2M` (11 requests, 94,100 total chars).
+> **Agent:** Resolves the 11 files, calls `batch_plan_files(name: "input handling review", ...)`, and reports: *"Plan ready: 'input handling review' will review 11 requests (one per file, 94,100 total chars). Submit?"*
 >
-> **You:** "Looks good, submit `B-20261031-8K2M`."
+> **You:** "Submit it."
 >
 > *(When the batch completes)*
 >
-> **You:** "Check `B-20261031-8K2M` and inspect its items."
+> **You:** "How did the input handling review go?"
 >
-> **Agent:** Calls `batch_check_jobs` and `batch_get_items`.
-> - If 10/11 succeeded and item 4 failed: ask the agent to call `batch_retry_items(batch_id: "B-20261031-8K2M", failed: true)` → approve `batch_submit_plan` for the 1-item retry.
-> - Once coverage is 11/11, ask: *"Plan a synthesis for `B-20261031-8K2M`"* → `batch_plan_synthesis` → approve `batch_submit_plan`.
-> - When the synthesis finishes, read the consolidated report with `batch_read_result(batch_id: "B-20261031-8K2M", mode: "synthesis")` or drill into a single file with `batch_read_result(batch_id: "B-20261031-8K2M", mode: "item", item: "src/artifacts/service.ts")`.
+> **Agent:** Calls `batch_check_jobs(batch_id: "the input handling review")` and `batch_get_items`.
+> - If 10/11 succeeded and 1 failed, you can simply say: *"Retry the one that failed, and once it's done combine all 11 into one report."*
+> - To inspect a single file's review at any time, ask: *"What did the batch say about `service.ts`?"* → `batch_read_result(batch_id: "the input handling review", mode: "item", item: "service.ts")`.
 
 ##### Pattern 3: Schema-validated dataset processing & export (`batch_plan_dataset` + `batch_export`)
 

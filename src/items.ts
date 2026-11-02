@@ -82,6 +82,21 @@ export function resolveItem(items: readonly JobItem[], selector: string): JobIte
   if (matches.length > 1) {
     throw new Error(`"${selector}" is ambiguous; it matches items ${matches.map((m) => m.ordinal).join(", ")}. Use the item number or custom_id.`);
   }
+  // Natural references: a bare file name ("auth.ts") or a trailing path fragment ("api/auth.ts").
+  const tail = wanted.replace(/^\/+/, "");
+  const loose = tail
+    ? items.filter((i) => {
+        const paths = i.source.path ? [i.source.path] : (i.source.paths ?? []);
+        return paths.some((p) => {
+          const n = norm(p);
+          return n === tail || n.endsWith(`/${tail}`);
+        });
+      })
+    : [];
+  if (loose.length === 1) return loose[0]!;
+  if (loose.length > 1) {
+    throw new Error(`"${selector}" matches several items (${loose.map((m) => `${m.ordinal}: ${sourceLabel(m)}`).join(", ")}). Use a longer path or the item number.`);
+  }
   throw new Error(`No item matches "${selector}". Use an item number (see /batch items), a custom_id, a source ID (id:<value>), or a source path.`);
 }
 

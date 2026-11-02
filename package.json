@@ -24,6 +24,7 @@
     "index.ts",
     "src",
     "dist",
+    "integrations",
     "server.json",
     "AGENTS.md",
     "README.md",

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "pi-batch": {
+      "command": "npx",
+      "args": ["-y", "-p", "pi-batch-openrouter", "pi-batch-mcp"]
+    }
+  }
+}

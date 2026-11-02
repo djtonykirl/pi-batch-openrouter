@@ -1,0 +1,9 @@
+{
+  "name": "pibatch",
+  "author": "pi-batch-openrouter",
+  "homepage": "https://github.com/mastnacek/pi-batch-openrouter#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mastnacek/pi-batch-openrouter.git"
+  }
+}
