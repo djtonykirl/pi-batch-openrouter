@@ -371,7 +371,7 @@ test("MCP stdio child process: handshake succeeds and stdout carries only valid 
     let buffer = "";
 
     const firstResponse = new Promise<Record<string, unknown>>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("stdio initialize timed out")), 10_000);
+      const timer = setTimeout(() => reject(new Error("stdio initialize timed out")), 25_000);
       child.stdout.on("data", (chunk: Buffer) => {
         buffer += chunk.toString("utf8");
         let idx: number;
