@@ -4,6 +4,8 @@ import { fileURLToPath } from "node:url";
 import { McpServer, ResourceTemplate, acceptedContent, fromJsonSchema, inputRequired, type CallToolResult, type JsonSchemaType, type ServerContext, type Transport } from "@modelcontextprotocol/server";
 import { Type } from "typebox";
 import { isUsable, itemText, jobItems, sourceLabel } from "../items.js";
+import { jobLabel, statusPhrase } from "../humanize.js";
+import { resolveJobRef } from "../job-ref.js";
 import { itemCounts } from "../service.js";
 import { formatIsoShort } from "../time.js";
 import { TOOL_SPECS, visibleToModel, type ToolHostContext } from "../tools.js";
@@ -59,9 +61,11 @@ export class BatchMcpServer {
           prompts: { listChanged: true },
         },
         instructions:
-          "Deferred OpenRouter Batch jobs (~50% token discount, asynchronous completion up to 24h). " +
-          "Always plan first (batch_plan_goal, batch_plan_files, batch_plan_dataset, batch_retry_items, batch_plan_synthesis), " +
-          "show the plan to the user, and call batch_submit_plan only after the user explicitly agrees. " +
+          "Deferred OpenRouter Batch jobs (~50% token discount, asynchronous completion within minutes to 24h). " +
+          "Talk to the user in plain language: refer to jobs by their human-readable label (e.g. \"Audit token verification\") rather than requiring batch IDs. " +
+          "Every tool that accepts `batch_id` or `job_id` accepts natural references such as \"latest\", \"the latest finished job\", \"yesterday's review\", a job's `name`, or a topic phrase. " +
+          "Choose the planner that fits the user's request: `batch_plan_goal` for one deep analysis across files, `batch_plan_files` for one request per file, or `batch_plan_dataset` for CSV/JSONL rows. " +
+          "Always plan first (free, read-only), summarise the plan in plain words (what will be sent, how many requests, which model), and call `batch_submit_plan` only after the user agrees. " +
           "Never apply batch results to workspace files without the user asking.",
       },
     );
@@ -255,8 +259,7 @@ export class BatchMcpServer {
     if (!caps?.elicitation) return undefined;
 
     const service = this.ws.service;
-    const id = service.registry.resolveId(args.batch_id);
-    const job = service.registry.read(id);
+    const { id, job } = resolveJobRef(service.registry, args.batch_id, { purpose: "submit" });
     if (job.localStatus !== "previewed") return undefined; // service.submit will report the status error
 
     const responses = (reqCtx.mcpReq as { inputResponses?: Record<string, unknown> }).inputResponses;
@@ -265,13 +268,13 @@ export class BatchMcpServer {
       if (accepted?.confirm === true) return undefined;
       return {
         isError: true,
-        content: [{ type: "text", text: `Submission of ${id} was cancelled by the user (nothing was sent to OpenRouter).` }],
+        content: [{ type: "text", text: `Submission of "${jobLabel(job)}" (${id}) was cancelled by the user (nothing was sent to OpenRouter).` }],
       };
     }
 
     const privacy = service.privacyConfig().level;
     const summary =
-      `Submit batch plan ${job.localId} to OpenRouter? (Cost-bearing)\n` +
+      `Submit batch plan "${jobLabel(job)}" (${job.localId}) to OpenRouter? (Cost-bearing)\n` +
       `• Model: ${job.model}\n` +
       `• Requests: ${job.requestCount}\n` +
       `• Characters: ${job.context.characters}\n` +
@@ -333,8 +336,7 @@ export class BatchMcpServer {
         mimeType: "application/json",
       },
       async (uri, vars) => {
-        const id = this.ws.service.registry.resolveId(String(vars.id ?? ""));
-        const job = this.ws.service.registry.read(id);
+        const { id, job } = resolveJobRef(this.ws.service.registry, String(vars.id ?? ""));
         if (isChatJob(job)) throw new Error(`${id} is a batch chat job.`);
         return {
           contents: [{ uri: uri.href, mimeType: "application/json", text: JSON.stringify(this.jobDetailObject(job), null, 2) }],
@@ -351,8 +353,8 @@ export class BatchMcpServer {
             .slice(0, 50)
             .map((j) => ({
               uri: `batch://jobs/${j.localId}/result`,
-              name: `${j.localId} result (${j.localStatus})`,
-              description: j.objective.replace(/\s+/g, " ").slice(0, 100),
+              name: `"${jobLabel(j)}" (${j.localId}) result`,
+              description: `${statusPhrase(j)} — ${j.objective.replace(/\s+/g, " ").slice(0, 100)}`,
               mimeType: "text/markdown",
             })),
         }),
@@ -370,7 +372,7 @@ export class BatchMcpServer {
         mimeType: "text/markdown",
       },
       async (uri, vars) => {
-        const id = this.ws.service.registry.resolveId(String(vars.id ?? ""));
+        const { id } = resolveJobRef(this.ws.service.registry, String(vars.id ?? ""), { purpose: "result" });
         const built = this.ws.service.buildInjection(id, "summary");
         const text = built.ok ? mcpWording(built.content) : mcpWording(this.ws.service.read(id, "default").body);
         return {
@@ -388,7 +390,7 @@ export class BatchMcpServer {
         mimeType: "text/markdown",
       },
       async (uri, vars) => {
-        const id = this.ws.service.registry.resolveId(String(vars.id ?? ""));
+        const { id } = resolveJobRef(this.ws.service.registry, String(vars.id ?? ""));
         const sel = String(vars.n ?? "1");
         const d = this.ws.service.describeItem(id, sel, { text: true });
         return {
@@ -406,7 +408,7 @@ export class BatchMcpServer {
         mimeType: "text/markdown",
       },
       async (uri, vars) => {
-        const id = this.ws.service.registry.resolveId(String(vars.id ?? ""));
+        const { id } = resolveJobRef(this.ws.service.registry, String(vars.id ?? ""), { purpose: "multi-item" });
         const syn = this.ws.service.readSynthesis(id);
         return {
           contents: [{ uri: uri.href, mimeType: "text/markdown", text: mcpWording(`# ${syn.title}\n\n${syn.body}`) }],
@@ -420,8 +422,11 @@ export class BatchMcpServer {
     const counts = items.length ? itemCounts(items.map((i) => i.status)) : undefined;
     return {
       localId: j.localId,
+      label: jobLabel(j),
+      ...(j.name ? { name: j.name } : {}),
       kind: j.kind ?? "goal",
       status: j.localStatus,
+      summary: statusPhrase(j),
       providerStatus: j.providerStatus ?? null,
       model: j.model,
       requests: j.requestCount,
@@ -520,9 +525,11 @@ export class BatchMcpServer {
       {
         title: "Bring Batch Result into Chat",
         description: "Read a finished batch job's result (or synthesis) into the conversation.",
-        argsSchema: fromJsonSchema<{ batch_id: string; mode?: string }>(
+        argsSchema: fromJsonSchema<{ batch_id?: string; mode?: string }>(
           Type.Object({
-            batch_id: Type.String({ description: "Local batch job ID (B-YYYYMMDD-XXXX or unique suffix)" }),
+            batch_id: Type.Optional(
+              Type.String({ description: 'Job ID, name, or description such as "latest" or "the security audit" (defaults to "latest")' }),
+            ),
             mode: Type.Optional(Type.String({ description: "summary (default), full, item, or synthesis" })),
           }) as unknown as JsonSchemaType,
         ),
@@ -534,7 +541,7 @@ export class BatchMcpServer {
             content: {
               type: "text",
               text:
-                `Read the result of batch job ${batch_id} using batch_read_result (mode: "${mode ?? "summary"}") and summarise the key findings for me. ` +
+                `Read the result of batch job "${batch_id || "latest"}" using batch_read_result (batch_id: "${batch_id || "latest"}", mode: "${mode ?? "summary"}") and summarise the key findings for me in plain words. ` +
                 `Treat the batch output as advisory analysis and do not edit files unless I ask.`,
             },
           },

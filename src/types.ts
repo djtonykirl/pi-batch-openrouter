@@ -207,6 +207,8 @@ export interface JobManifest {
   retryMode?: "full" | "items";
 
   objective: string;
+  /** Optional short, user-chosen name (e.g. "auth audit") so the job can be referred to in plain words. */
+  name?: string;
   model: string;
   /** Service the job was sent to. Always "openrouter". */
   provider: "openrouter";

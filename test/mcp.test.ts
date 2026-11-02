@@ -7,6 +7,8 @@ import test from "node:test";
 import { Client } from "@modelcontextprotocol/client";
 import { InMemoryTransport } from "@modelcontextprotocol/server";
 import { BatchMcpServer, type BatchMcpServerOptions } from "../src/mcp/server.js";
+import { parseMcpCliArgs } from "../src/mcp/cli.js";
+import { initAgentInstructions } from "../src/mcp/init.js";
 import { mcpWording } from "../src/mcp/wording.js";
 import { OpenRouterBatchClient } from "../src/openrouter/client.js";
 import { TOOL_SPECS } from "../src/tools.js";
@@ -427,4 +429,129 @@ test("mcpWording rewrites Pi slash commands to MCP tool names", () => {
   assert.match(mcpWording("No batch job B-1. Use /batch list to see known jobs."), /batch_list_jobs/);
   assert.match(mcpWording("Use /batch check to reconcile now."), /batch_check_jobs/);
   assert.match(mcpWording("Details: /batch item B-20261018-ABCD <n>"), /batch_read_result/);
+});
+
+test("MCP natural-language job references, named jobs, bare file item selectors, and conversational output", async () => {
+  const root = tempWorkspace();
+  writeFiles(root, {
+    "src/api/auth.ts": "export function checkAuth() { return true; }\n",
+    "src/db/payments.ts": "export function chargeCard() { return true; }\n",
+  });
+  try {
+    const m = await connectMcp(root);
+    try {
+      // 1. Plan two jobs with natural names and distinct topics
+      const authPlan = await m.client.callTool({
+        name: "batch_plan_files",
+        arguments: {
+          name: "auth security audit",
+          prompt: "Audit authentication and session handling for vulnerabilities",
+          files: ["src/api/auth.ts", "src/db/payments.ts"],
+        },
+      });
+      assert.ok(!authPlan.isError, textOf(authPlan));
+      assert.match(textOf(authPlan), /^Plan ready: "auth security audit" will review 2 requests/);
+      assert.equal((authPlan.structuredContent as { label: string }).label, "auth security audit");
+
+      const billingPlan = await m.client.callTool({
+        name: "batch_plan_goal",
+        arguments: {
+          prompt: "Review payment retry idempotency in billing layer",
+          files: ["src/db/payments.ts"],
+        },
+      });
+      assert.ok(!billingPlan.isError, textOf(billingPlan));
+      assert.match(textOf(billingPlan), /^Plan ready: "Review payment retry idempotency in billing layer" will send 1 request/);
+
+      // 2. Ambiguous "submit the plan" refuses when two unsubmitted plans match equally without recency
+      const ambigSubmit = await m.client.callTool({
+        name: "batch_submit_plan",
+        arguments: { batch_id: "the unsubmitted plan" },
+      });
+      assert.equal(ambigSubmit.isError, true);
+      assert.match(textOf(ambigSubmit), /matches more than one saved plan/);
+
+      // 3. Submit the auth audit by topic description ("the auth security audit")
+      m.fake.submitReplies = [accepted("batch_nl_auth")];
+      const submittedAuth = await m.client.callTool({
+        name: "batch_submit_plan",
+        arguments: { batch_id: "the auth security audit" },
+      });
+      assert.ok(!submittedAuth.isError, textOf(submittedAuth));
+      assert.match(textOf(submittedAuth), /Sent "auth security audit" to OpenRouter as a batch of 2 requests/);
+
+      // 4. Complete the auth audit and check all jobs conversationally
+      const authId = (authPlan.structuredContent as { localId: string }).localId;
+      const cids = m.server.services.service.registry.read(authId).customIds;
+      m.fake.getReplies = [
+        {
+          status: 200,
+          body: completed(
+            [successItem(cids[0]!, "auth.ts: missing rate limiting on login."), successItem(cids[1]!, "payments.ts: idempotency key ok.")],
+            { id: "batch_nl_auth" },
+          ),
+        },
+      ];
+      const allStatus = await m.client.callTool({ name: "batch_check_jobs", arguments: {} });
+      assert.ok(!allStatus.isError, textOf(allStatus));
+      assert.match(textOf(allStatus), /^You have 2 batch jobs: 1 finished with results ready, 1 plan not yet submitted\./);
+
+      // 5. Read the finished result by natural description ("the finished security audit") and bare file name ("auth.ts")
+      const readItem = await m.client.callTool({
+        name: "batch_read_result",
+        arguments: { batch_id: "the finished security audit", mode: "item", item: "auth.ts" },
+      });
+      assert.ok(!readItem.isError, textOf(readItem));
+      assert.match(textOf(readItem), /Result of "auth security audit"/);
+      assert.match(textOf(readItem), /missing rate limiting on login/);
+
+      // 6. Read via "latest" (prefers the finished job when purpose is "result", skipping the unsubmitted billing plan)
+      const readLatest = await m.client.callTool({
+        name: "batch_read_result",
+        arguments: { batch_id: "latest", mode: "summary" },
+      });
+      assert.ok(!readLatest.isError, textOf(readLatest));
+      assert.equal((readLatest.structuredContent as { localId: string }).localId, authId);
+
+      // 7. Cancel the remaining unsubmitted plan by description ("the payment retry plan")
+      const cancelled = await m.client.callTool({
+        name: "batch_cancel",
+        arguments: { batch_id: "the payment retry plan" },
+      });
+      assert.ok(!cancelled.isError, textOf(cancelled));
+      assert.match(textOf(cancelled), /Cancelled "Review payment retry idempotency in billing layer"/);
+    } finally {
+      await m.close();
+    }
+  } finally {
+    rm(root);
+  }
+});
+
+test("initAgentInstructions installs VS Code, Claude Code, and Antigravity instruction files without overwriting unless forced", () => {
+  const root = tempWorkspace();
+  try {
+    const parsed = parseMcpCliArgs(["init", "--client", "all", "--cwd", root]);
+    assert.equal(parsed.subcommand, "init");
+    assert.equal(parsed.client, "all");
+
+    const first = initAgentInstructions({ workspaceRoot: root, client: "all" });
+    assert.equal(first.written.length, 6);
+    assert.equal(first.skipped.length, 0);
+    assert.ok(fs.existsSync(path.join(root, ".github", "instructions", "pi-batch.instructions.md")));
+    assert.ok(fs.existsSync(path.join(root, ".claude", "skills", "pi-batch", "SKILL.md")));
+    assert.ok(fs.existsSync(path.join(root, ".agents", "plugins", "pibatch", "plugin.json")));
+    assert.ok(fs.existsSync(path.join(root, ".agents", "plugins", "pibatch", "mcp_config.json")));
+    assert.ok(fs.existsSync(path.join(root, ".agents", "plugins", "pibatch", "rules", "AGENTS.md")));
+    assert.ok(fs.existsSync(path.join(root, ".agents", "plugins", "pibatch", "skills", "pi-batch", "SKILL.md")));
+
+    const second = initAgentInstructions({ workspaceRoot: root, client: "all", overwrite: false });
+    assert.equal(second.written.length, 0);
+    assert.equal(second.skipped.length, 6);
+
+    const forced = initAgentInstructions({ workspaceRoot: root, client: "vscode", overwrite: true });
+    assert.deepEqual(forced.written, [".github/instructions/pi-batch.instructions.md"]);
+  } finally {
+    rm(root);
+  }
 });

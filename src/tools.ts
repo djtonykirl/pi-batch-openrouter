@@ -8,6 +8,8 @@ import { discoverTemplates } from "./artifacts/templates.js";
 import type { BatchConfig } from "./config.js";
 import { buildExportRows, toCsv, toJsonl } from "./export.js";
 import { resolveItem } from "./items.js";
+import { describeJob, inventorySentence, jobBullet, jobLabel, statusPhrase } from "./humanize.js";
+import { resolveJobRef, type JobPurpose, type JobRefResolution } from "./job-ref.js";
 import { mcpWording } from "./mcp/wording.js";
 import type { ModelCatalog } from "./models/catalog.js";
 import { formatRoutingPolicy } from "./openrouter/routing.js";
@@ -66,13 +68,13 @@ export interface ToolSpec<T extends TObject = TObject> {
 function submitNextStep(host: "pi" | "mcp", localId: string): string {
   return host === "pi"
     ? `Submitting will be billed by OpenRouter. The user can submit with /batch submit ${localId}, or ask you to call batch_submit_plan.`
-    : `Submitting will be billed by OpenRouter. Show the user this plan and get their explicit agreement before calling batch_submit_plan (batch_id: "${localId}").`;
+    : `Submitting will be billed by OpenRouter. Tell the user in plain words what will be sent (how many requests, which model) and ask whether to go ahead; only call batch_submit_plan (batch_id: "${localId}") after they agree.`;
 }
 
 function trackNextStep(host: "pi" | "mcp", localId: string): string {
   return host === "pi"
     ? `The user can track it with /batch show ${localId} and bring the result into this conversation with /batch inject ${localId}.`
-    : `Track progress with batch_check_jobs (batch_id: "${localId}") and read the finished result with batch_read_result (batch_id: "${localId}").`;
+    : `Batch jobs usually finish within minutes to a few hours (at most 24h). Check progress with batch_check_jobs (batch_id: "${localId}") and read the finished result with batch_read_result (batch_id: "${localId}"); the user can simply ask "is my batch done?".`;
 }
 
 function wording(host: "pi" | "mcp", text: string): string {
@@ -81,6 +83,41 @@ function wording(host: "pi" | "mcp", text: string): string {
 
 function def<T extends TObject>(spec: ToolSpec<T>): ToolSpec<T> {
   return spec;
+}
+
+/** Shared description for every parameter that names a batch job. */
+const JOB_REF_DESCRIPTION =
+  'Which batch job: its ID (e.g. "B-20261031-A7C2" or just "A7C2"), the name it was given, or a plain description such as ' +
+  '"latest", "the latest finished job", "yesterday\'s security review" or "the auth audit".';
+
+const NAME_DESCRIPTION = 'Optional short name for the job so it can be referred to later in plain words (e.g. "auth audit")';
+
+/** Resolves a natural-language job reference for a tool call. */
+function findJob(ctx: ToolHostContext, reference: string, purpose: JobPurpose = "any"): JobRefResolution {
+  return resolveJobRef(ctx.requireService().registry, reference, { purpose });
+}
+
+/** Prefixes the resolver's note (if the match involved a judgement call) to a tool's text. */
+function withNote(found: JobRefResolution, text: string): string {
+  return found.note ? `${found.note}\n${text}` : text;
+}
+
+/** Saves an optional user-given name on a newly planned job. */
+function applyName(ctx: ToolHostContext, localId: string, name: string | undefined): void {
+  const clean = name?.replace(/\s+/g, " ").trim().slice(0, 80);
+  if (!clean) return;
+  ctx.requireService().registry.update(localId, (u) => {
+    u.manifest.name = clean;
+    u.note("named", { name: clean });
+  });
+}
+
+function labelOf(ctx: ToolHostContext, localId: string): string {
+  return jobLabel(ctx.requireService().registry.read(localId));
+}
+
+function plural(n: number, word: string): string {
+  return `${n} ${word}${n === 1 ? "" : "s"}`;
 }
 
 // ------------------------------------------------------------------ Tool catalogue
@@ -151,9 +188,11 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
       files: Type.Optional(Type.Array(Type.String(), { description: "Workspace-relative text files to include as context" })),
       model: Type.Optional(Type.String({ description: "OpenRouter batch-capable model slug override (e.g. anthropic/claude-opus-5.5)" })),
       provider: Type.Optional(Type.String({ description: "Account/provider alias for the API key (e.g. openrouter, openrouter-work)" })),
+      name: Type.Optional(Type.String({ description: NAME_DESCRIPTION })),
     }),
     outputSchema: Type.Object({
       localId: Type.String(),
+      label: Type.Optional(Type.String()),
       requests: Type.Number(),
       files: Type.Number(),
       characters: Type.Number(),
@@ -174,14 +213,17 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
         includeInstructions: true,
       });
       const job = await service.createJob(prepared, { previewOnly: true });
+      applyName(ctx, job.localId, params.name);
+      const label = labelOf(ctx, job.localId);
       return {
         text:
+          `Plan ready: "${label}" will send 1 request covering ${plural(job.context.fileCount, "file")} to ${job.model}. Nothing has been sent or billed yet.\n` +
           `Plan saved as ${job.localId} (NOT submitted; no cost incurred).\n` +
           `Requests: 1 · Model: ${job.model} · Privacy: ${ctx.getPrivacy().level}\n` +
           `Files included: ${job.context.fileCount} (excluded: ${prepared.pkg.excluded.length}) · Characters: ${job.context.characters} (not tokens)\n` +
           (job.warnings.length ? `Warnings:\n${job.warnings.map((w) => `  - ${wording(ctx.host, w)}`).join("\n")}\n` : "") +
           submitNextStep(ctx.host, job.localId),
-        details: { localId: job.localId, requests: 1, files: job.context.fileCount, characters: job.context.characters, model: job.model },
+        details: { localId: job.localId, label, requests: 1, files: job.context.fileCount, characters: job.context.characters, model: job.model },
       };
     },
   }),
@@ -204,9 +246,11 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
       files: Type.Array(Type.String(), { description: "Workspace-relative text files; one request each", minItems: 1 }),
       model: Type.Optional(Type.String({ description: "OpenRouter batch-capable model slug" })),
       group_size: Type.Optional(Type.Integer({ minimum: 1, description: "Files per request (default 1)" })),
+      name: Type.Optional(Type.String({ description: NAME_DESCRIPTION })),
     }),
     outputSchema: Type.Object({
       localId: Type.String(),
+      label: Type.Optional(Type.String()),
       requests: Type.Number(),
       characters: Type.Number(),
       model: Type.String(),
@@ -226,13 +270,16 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
         includeInstructions: true,
       });
       const job = await service.createWorkflowJob(plan, { previewOnly: true });
+      applyName(ctx, job.localId, params.name);
+      const label = labelOf(ctx, job.localId);
       return {
         text:
+          `Plan ready: "${label}" will review ${plural(plan.items.length, "request")} (one per ${(params.group_size ?? 1) > 1 ? "group of files" : "file"}) with ${plan.model}. Nothing has been sent or billed yet.\n` +
           `Plan saved as ${job.localId} (NOT submitted; no cost incurred).\n` +
           `Requests: ${plan.items.length} (one OpenRouter batch)\nModel: ${plan.model}\n` +
           `Total characters: ${plan.totalCharacters} (not tokens)\nExcluded files: ${plan.pkg.excluded.length}\n` +
           submitNextStep(ctx.host, job.localId),
-        details: { localId: job.localId, requests: plan.items.length, characters: plan.totalCharacters, model: plan.model },
+        details: { localId: job.localId, label, requests: plan.items.length, characters: plan.totalCharacters, model: plan.model },
       };
     },
   }),
@@ -245,9 +292,10 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
       "This is a COST-BEARING action. Only call it after the user has seen the plan and agreed to submit it.",
     promptSnippet: "Use batch_submit_plan only after the user approves a saved batch plan.",
     promptGuidelines: ["Never call batch_submit_plan without the user's explicit agreement to the specific plan and its request count"],
-    parameters: Type.Object({ batch_id: Type.String({ description: "Local job ID of a previewed job" }) }),
+    parameters: Type.Object({ batch_id: Type.String({ description: `${JOB_REF_DESCRIPTION} Must be a saved plan that has not been submitted.` }) }),
     outputSchema: Type.Object({
       localId: Type.String(),
+      label: Type.Optional(Type.String()),
       providerBatchId: Type.String(),
       requests: Type.Number(),
     }),
@@ -255,7 +303,8 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
     hosts: ["pi", "mcp"],
     execute: async (ctx, params) => {
       const service = ctx.requireService();
-      const id = service.registry.resolveId(params.batch_id);
+      const found = findJob(ctx, params.batch_id, "submit");
+      const id = found.id;
       if (ctx.host === "mcp") {
         const preview = service.registry.read(id);
         const cap = ctx.getConfig().mcp.maxRequestsPerSubmit;
@@ -269,9 +318,14 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
       const job = await service.submit(id);
       ctx.poller.updateBadge();
       if (job.localStatus !== "submitted") throw new Error(`Batch job ${id} ${job.localStatus}: ${job.error?.message ?? "unknown error"}`);
+      const label = jobLabel(job);
       return {
-        text: `Submitted ${id}: ${job.requestCount} request(s), provider batch ${job.providerBatchId ?? "-"} (${job.providerStatus}; queued, not completed).\n${trackNextStep(ctx.host, id)}`,
-        details: { localId: id, providerBatchId: job.providerBatchId ?? "", requests: job.requestCount },
+        text: withNote(
+          found,
+          `Sent "${label}" to OpenRouter as a batch of ${plural(job.requestCount, "request")}. It is queued, not finished yet.\n` +
+            `Submitted ${id}: ${job.requestCount} request(s), provider batch ${job.providerBatchId ?? "-"} (${job.providerStatus}; queued, not completed).\n${trackNextStep(ctx.host, id)}`,
+        ),
+        details: { localId: id, label, providerBatchId: job.providerBatchId ?? "", requests: job.requestCount },
       };
     },
   }),
@@ -282,15 +336,16 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
     description: "Lists the request items of a batch job from local state: status, source file, and where each result is stored. Read-only.",
     promptSnippet: "Use batch_get_items to see which files of a batch job have usable results.",
     promptGuidelines: ["Batch output is advisory: never apply it to files without the user asking"],
-    parameters: Type.Object({ batch_id: Type.String({ description: "Local job ID or unique suffix" }) }),
+    parameters: Type.Object({ batch_id: Type.String({ description: JOB_REF_DESCRIPTION }) }),
     outputSchema: Type.Object({ localId: Type.String() }),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     hosts: ["pi", "mcp"],
     execute: async (ctx, params) => {
       const service = ctx.requireService();
-      const id = service.registry.resolveId(params.batch_id);
-      if (isChatJob(service.registry.read(id))) throw new Error(`${id} is a batch chat job; it is not available through this tool.`);
-      return { text: wording(ctx.host, service.describeItems(id)), details: { localId: id } };
+      const found = findJob(ctx, params.batch_id);
+      const id = found.id;
+      if (isChatJob(found.job)) throw new Error(`${id} is a batch chat job; it is not available through this tool.`);
+      return { text: withNote(found, `${describeJob(found.job)}\n${wording(ctx.host, service.describeItems(id))}`), details: { localId: id } };
     },
   }),
 
@@ -358,9 +413,11 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
       from_row: Type.Optional(Type.Integer({ minimum: 1 })),
       to_row: Type.Optional(Type.Integer({ minimum: 1 })),
       model: Type.Optional(Type.String({ description: "Override the workflow's model" })),
+      name: Type.Optional(Type.String({ description: NAME_DESCRIPTION })),
     }),
     outputSchema: Type.Object({
       localId: Type.String(),
+      label: Type.Optional(Type.String()),
       requests: Type.Number(),
       characters: Type.Number(),
       model: Type.String(),
@@ -373,14 +430,17 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
       const prepared = await service.planDataset({ workflow: params.workflow, input: params.input, ids: params.ids, fromRow: params.from_row, toRow: params.to_row, model: params.model });
       if (prepared.blockers.length > 0) throw new Error(`Plan blocked; nothing was saved:\n${wording(ctx.host, prepared.blockers.join("\n\n"))}`);
       const job = await service.createDatasetJob(prepared, { previewOnly: true });
+      applyName(ctx, job.localId, params.name);
+      const label = labelOf(ctx, job.localId);
       const c = prepared.plan!.counts;
       return {
         text:
+          `Plan ready: "${label}" will process ${plural(c.plannedRequests, "row")} of ${params.input} with the ${params.workflow} workflow on ${prepared.model}. Nothing has been sent or billed yet.\n` +
           `Plan saved as ${job.localId} (NOT submitted; no cost incurred).\n` +
           `Rows: ${c.totalRows} parsed, ${c.selectedRows} selected, ${c.invalidRows} invalid. Requests: ${c.plannedRequests} (one OpenRouter batch).\n` +
           `Fields sent: ${prepared.definition!.input.fields.join(", ")}. Model: ${prepared.model}. Characters: ${prepared.plan!.totalCharacters} (not tokens).\n` +
           submitNextStep(ctx.host, job.localId),
-        details: { localId: job.localId, requests: c.plannedRequests, characters: prepared.plan!.totalCharacters, model: prepared.model },
+        details: { localId: job.localId, label, requests: c.plannedRequests, characters: prepared.plan!.totalCharacters, model: prepared.model },
       };
     },
   }),
@@ -391,13 +451,13 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
     description: "Lists artifacts (files rendered from validated batch results or local Markdown) with format, source and destination. Read-only.",
     promptSnippet: "Use artifact_list to see which reports/files were generated from batch results.",
     promptGuidelines: ["Artifacts are created only by the user's /batch artifact or /artifact render commands, or artifact_create"],
-    parameters: Type.Object({ job_id: Type.Optional(Type.String({ description: "Only artifacts of this batch job" })) }),
+    parameters: Type.Object({ job_id: Type.Optional(Type.String({ description: `Only artifacts of this batch job. ${JOB_REF_DESCRIPTION}` })) }),
     outputSchema: Type.Object({ count: Type.Number() }),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     hosts: ["pi", "mcp"],
     execute: async (ctx, params) => {
       const art = ctx.requireArtifacts();
-      const jobId = params.job_id ? ctx.requireService().registry.resolveId(params.job_id) : undefined;
+      const jobId = params.job_id ? findJob(ctx, params.job_id).id : undefined;
       const list = art.list(jobId ? { jobId } : {}).slice(0, 50);
       const text = list.length
         ? list.map((a) => `- ${a.artifactId} ${a.status} ${a.format} -> ${a.output?.path ?? "-"} (source: ${a.source.type}${a.source.jobId ? ` ${a.source.jobId}` : ""}${a.source.path ? ` ${a.source.path}` : ""}; ${a.source.state})`).join("\n")
@@ -466,13 +526,14 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
     label: "Batch Check Jobs",
     description: "Reports status of deferred OpenRouter batch jobs from local state, reconciling active ones with OpenRouter first.",
     promptSnippet: "Use batch_check_jobs to see if an offloaded batch job has finished.",
-    promptGuidelines: ["Call batch_check_jobs when the user asks about batch status or progress"],
+    promptGuidelines: ["Call batch_check_jobs when the user asks about batch status or progress (e.g. \"is my batch done?\")"],
     parameters: Type.Object({
-      batch_id: Type.Optional(Type.String({ description: "Local job ID (B-YYYYMMDD-XXXX, or unique suffix) or provider batch ID" })),
+      batch_id: Type.Optional(Type.String({ description: `${JOB_REF_DESCRIPTION} Omit to summarise all recent jobs.` })),
     }),
     outputSchema: Type.Object({
       found: Type.Boolean(),
       localId: Type.Optional(Type.String()),
+      label: Type.Optional(Type.String()),
       localStatus: Type.Optional(Type.String()),
       providerStatus: Type.Optional(Type.String()),
       totalJobs: Type.Optional(Type.Number()),
@@ -483,33 +544,47 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
       const service = ctx.requireService();
       await ctx.poller.checkNow(true);
       if (params.batch_id) {
-        const id = service.registry.resolveId(params.batch_id);
+        const found = findJob(ctx, params.batch_id);
+        const id = found.id;
         const job = service.registry.read(id);
         if (isChatJob(job)) throw new Error(`${id} is a batch chat job; it is not available through this tool.`);
         const resultPath = job.localStatus === "ready" || job.localStatus === "partial" ? service.registry.artefact(id, "resultMd") : undefined;
+        const nextHint =
+          ctx.host === "mcp"
+            ? job.localStatus === "ready" || job.localStatus === "partial"
+              ? `Offer to read it with batch_read_result (batch_id: "${id}").`
+              : job.localStatus === "previewed"
+                ? `It is only a plan; ask the user whether to submit it with batch_submit_plan (batch_id: "${id}").`
+                : ""
+            : "";
         return {
-          text: [
-            `Job: ${job.localId}`,
-            `Provider batch: ${job.providerBatchId ?? "-"}`,
-            `Local status: ${job.localStatus}`,
-            `Provider status: ${job.providerStatus ?? "-"}`,
-            `Objective: ${job.objective.slice(0, 200)}`,
-            job.error ? `Error: [${job.error.code}] ${wording(ctx.host, job.error.message)}` : "",
-            job.lastPollError ? `Last poll error: ${job.lastPollError.category}: ${job.lastPollError.message}` : "",
-            resultPath ? `Result (advisory, read-only): ${resultPath}` : "",
-          ]
-            .filter(Boolean)
-            .join("\n"),
-          details: { localId: job.localId, localStatus: job.localStatus, ...(job.providerStatus ? { providerStatus: job.providerStatus } : {}), found: true },
+          text: withNote(
+            found,
+            [
+              describeJob(job),
+              nextHint,
+              `Job: ${job.localId}`,
+              `Provider batch: ${job.providerBatchId ?? "-"}`,
+              `Local status: ${job.localStatus}`,
+              `Provider status: ${job.providerStatus ?? "-"}`,
+              `Objective: ${job.objective.slice(0, 200)}`,
+              job.error ? `Error: [${job.error.code}] ${wording(ctx.host, job.error.message)}` : "",
+              job.lastPollError ? `Last poll error: ${job.lastPollError.category}: ${job.lastPollError.message}` : "",
+              resultPath ? `Result (advisory, read-only): ${resultPath}` : "",
+            ]
+              .filter(Boolean)
+              .join("\n"),
+          ),
+          details: { localId: job.localId, label: jobLabel(job), localStatus: job.localStatus, ...(job.providerStatus ? { providerStatus: job.providerStatus } : {}), found: true },
           ...(resultPath && ctx.host === "mcp"
             ? { resourceLinks: [{ uri: `batch://jobs/${job.localId}/result`, name: `${job.localId} result`, mimeType: "text/markdown", description: "Retrieved batch result" }] }
             : {}),
         };
       }
       const jobs = visibleToModel(service.registry.list().jobs).slice(0, 20);
-      const summary = jobs.map((j) => `- ${j.localId} [${j.localStatus}] ${formatIsoShort(j.createdAt)} ${j.objective.replace(/\s+/g, " ").slice(0, 60)}`).join("\n");
+      const summary = jobs.map((j) => `${jobBullet(j)} · ${formatIsoShort(j.createdAt)}`).join("\n");
       return {
-        text: `Batch jobs (${jobs.length} most recent):\n${summary || "None"}`,
+        text: `${inventorySentence(jobs)}\nBatch jobs (${jobs.length} most recent):\n${summary || "None"}`,
         details: { totalJobs: jobs.length, found: false },
       };
     },
@@ -536,7 +611,9 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
       jobs: Type.Array(
         Type.Object({
           localId: Type.String(),
+          label: Type.Optional(Type.String()),
           status: Type.String(),
+          summary: Type.Optional(Type.String()),
           model: Type.String(),
           requests: Type.Number(),
           usableItems: Type.Number(),
@@ -562,7 +639,9 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
         const usable = j.items ? itemCounts(j.items.map((i) => i.status)).completed : j.localStatus === "ready" ? j.requestCount : 0;
         return {
           localId: j.localId,
+          label: jobLabel(j),
           status: j.localStatus,
+          summary: statusPhrase(j),
           model: j.model,
           requests: j.requestCount,
           usableItems: j.localStatus === "ready" || j.localStatus === "partial" ? usable : 0,
@@ -571,7 +650,7 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
         };
       });
       const lines = rows.length
-        ? rows.map((r) => `- ${r.localId} [${r.status}] ${r.requests > 1 ? `${r.usableItems}/${r.requests} items · ` : ""}${r.model} · ${formatIsoShort(r.createdAt)} · ${r.objective}`)
+        ? [inventorySentence(all, filter === "all" ? "batch job" : `${filter} batch job`), ...slice.map((j) => `${jobBullet(j)} · ${j.model}`)]
         : ["No matching batch jobs."];
       return { text: lines.join("\n"), details: { count: rows.length, jobs: rows } };
     },
@@ -589,16 +668,17 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
       "Prefer mode 'summary' first for large jobs; request a specific item with mode 'item' and `item`",
     ],
     parameters: Type.Object({
-      batch_id: Type.String({ description: "Local job ID (B-YYYYMMDD-XXXX or unique suffix)" }),
+      batch_id: Type.String({ description: JOB_REF_DESCRIPTION }),
       mode: Type.Optional(
         Type.Union([Type.Literal("summary"), Type.Literal("full"), Type.Literal("item"), Type.Literal("synthesis")], {
           description: "'summary' (default): bounded excerpt; 'full': complete result; 'item': one item (pass `item`); 'synthesis': newest ready synthesis",
         }),
       ),
-      item: Type.Optional(Type.String({ description: "For mode 'item': item number (1..N), custom_id, source ID (id:<val>), or workspace file path" })),
+      item: Type.Optional(Type.String({ description: "For mode 'item': item number (1..N), custom_id, source ID (id:<val>), workspace file path, or just a file name such as \"auth.ts\"" })),
     }),
     outputSchema: Type.Object({
       localId: Type.String(),
+      label: Type.Optional(Type.String()),
       status: Type.String(),
       characters: Type.Number(),
       bounded: Type.Boolean(),
@@ -607,9 +687,14 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
     hosts: ["mcp"],
     execute: async (ctx, params) => {
       const service = ctx.requireService();
-      const id = service.registry.resolveId(params.batch_id);
+      const found = findJob(ctx, params.batch_id, params.mode === "synthesis" ? "multi-item" : "result");
+      const id = found.id;
       const job = service.registry.read(id);
       if (isChatJob(job)) throw new Error(`${id} is a batch chat job; it is not available through this tool.`);
+      const label = jobLabel(job);
+      if (job.localStatus !== "ready" && job.localStatus !== "partial" && params.mode !== "synthesis") {
+        throw new Error(`${describeJob(job)} There is no result to read yet.`);
+      }
       const mode = params.mode ?? "summary";
       if (mode === "item" && !params.item) throw new Error('Pass `item` (item number, custom_id, source ID, or path) when mode is "item".');
 
@@ -622,7 +707,10 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
         // Multi-item jobs that are not ready or where the caller asked for an overview: fall back to service.read/readSynthesis.
         if (mode === "synthesis") {
           const syn = service.readSynthesis(id);
-          return { text: wording("mcp", `${syn.title}\n\n${syn.body}`), details: { localId: id, status: job.localStatus, characters: syn.body.length, bounded: true } };
+          return {
+            text: withNote(found, wording("mcp", `Synthesis of "${label}" (${id}):\n\n${syn.title}\n\n${syn.body}`)),
+            details: { localId: id, label, status: job.localStatus, characters: syn.body.length, bounded: true },
+          };
         }
         throw new Error(wording("mcp", built.message));
       }
@@ -651,9 +739,13 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
       if (fs.existsSync(resultFile)) {
         links.push({ uri: pathToFileURL(resultFile).href, name: `${built.injectedJobId} result.md`, mimeType: "text/markdown", description: "Result file on disk" });
       }
+      const header =
+        `Result of "${label}" (${built.injectedJobId}), ${statusPhrase(job)}` +
+        `${mode === "item" && itemOrdinal !== undefined ? `, item ${itemOrdinal}` : ""}${bounded ? " (excerpt; ask for mode \"full\" or a specific item for more)" : ""}. ` +
+        `This is advisory analysis from a batch model: check it against the current code before acting on it.`;
       return {
-        text: wording("mcp", content),
-        details: { localId: built.injectedJobId, status: job.localStatus, characters: content.length, bounded },
+        text: withNote(found, `${header}\n\n${wording("mcp", content)}`),
+        details: { localId: built.injectedJobId, label, status: job.localStatus, characters: content.length, bounded },
         resourceLinks: links,
       };
     },
@@ -668,13 +760,14 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
     promptSnippet: "Use batch_retry_items to prepare a retry of failed items from a multi-item batch job; it never submits.",
     promptGuidelines: ["Always show the user which items will be retried and get approval before calling batch_submit_plan"],
     parameters: Type.Object({
-      batch_id: Type.String({ description: "Source job ID (B-YYYYMMDD-XXXX or unique suffix)" }),
+      batch_id: Type.String({ description: `Source job. ${JOB_REF_DESCRIPTION}` }),
       failed: Type.Optional(Type.Boolean({ description: "Retry all non-completed (failed/corrupt/missing) items (default true when `items` is omitted)" })),
-      items: Type.Optional(Type.Array(Type.String(), { description: "Specific item selectors (ordinal, custom_id, id:<sourceId>, or file path)" })),
+      items: Type.Optional(Type.Array(Type.String(), { description: "Specific item selectors (ordinal, custom_id, id:<sourceId>, file path, or file name)" })),
       model: Type.Optional(Type.String({ description: "Override model for the retry job" })),
     }),
     outputSchema: Type.Object({
       localId: Type.String(),
+      label: Type.Optional(Type.String()),
       parentJobId: Type.String(),
       requests: Type.Number(),
       model: Type.String(),
@@ -683,16 +776,22 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
     hosts: ["mcp"],
     execute: async (ctx, params) => {
       const service = ctx.requireService();
-      const id = service.registry.resolveId(params.batch_id);
+      const found = findJob(ctx, params.batch_id, "multi-item");
+      const id = found.id;
       const selectors = params.items && params.items.length > 0 ? params.items : undefined;
       const failed = selectors ? Boolean(params.failed) : (params.failed ?? true);
       const job = await service.retryItems(id, { failed, selectors, model: params.model, previewOnly: true });
+      const parentLabel = jobLabel(found.job);
+      if (!job.name && found.job.name) applyName(ctx, job.localId, `${found.job.name} (retry)`);
       return {
-        text:
-          `Retry plan saved as ${job.localId} for parent job ${id} (NOT submitted; no cost incurred).\n` +
-          `Items to retry: ${job.requestCount} · Model: ${job.model} · Characters: ${job.context.characters}\n` +
-          submitNextStep("mcp", job.localId),
-        details: { localId: job.localId, parentJobId: id, requests: job.requestCount, model: job.model },
+        text: withNote(
+          found,
+          `Retry plan ready for "${parentLabel}": ${plural(job.requestCount, "item")} will be re-run with ${job.model}. Items that already succeeded are not re-sent or re-billed. Nothing has been sent yet.\n` +
+            `Retry plan saved as ${job.localId} for parent job ${id} (NOT submitted; no cost incurred).\n` +
+            `Items to retry: ${job.requestCount} · Model: ${job.model} · Characters: ${job.context.characters}\n` +
+            submitNextStep("mcp", job.localId),
+        ),
+        details: { localId: job.localId, label: labelOf(ctx, job.localId), parentJobId: id, requests: job.requestCount, model: job.model },
       };
     },
   }),
@@ -709,12 +808,13 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
       "Show the user the synthesis plan and get approval before calling batch_submit_plan",
     ],
     parameters: Type.Object({
-      batch_id: Type.String({ description: "Source multi-item job ID" }),
+      batch_id: Type.String({ description: `Source multi-item job. ${JOB_REF_DESCRIPTION}` }),
       allow_partial: Type.Optional(Type.Boolean({ description: "Allow synthesising when some items have no usable result (gaps are recorded in coverage)" })),
       model: Type.Optional(Type.String({ description: "Override model for the synthesis job" })),
     }),
     outputSchema: Type.Object({
       localId: Type.String(),
+      label: Type.Optional(Type.String()),
       sourceJobId: Type.String(),
       includedItems: Type.Number(),
       totalItems: Type.Number(),
@@ -725,22 +825,29 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
     hosts: ["mcp"],
     execute: async (ctx, params) => {
       const service = ctx.requireService();
-      const id = service.registry.resolveId(params.batch_id);
+      const found = findJob(ctx, params.batch_id, "multi-item");
+      const id = found.id;
       const prepared = await service.prepareSynthesis(id, {
         allowPartial: Boolean(params.allow_partial),
         model: params.model,
       });
       if (prepared.blockers.length > 0) throw new Error(`Synthesis plan blocked; nothing was saved:\n${wording("mcp", prepared.blockers.join("\n\n"))}`);
       const job = await service.createSynthesisJob(prepared, { previewOnly: true });
+      const sourceLabel = jobLabel(found.job);
+      applyName(ctx, job.localId, `Synthesis of ${sourceLabel}`);
       const cov = prepared.coverage;
       const fromRetries = prepared.linkage.included.filter((i) => i.jobId !== id).length;
       return {
-        text:
-          `Synthesis plan saved as ${job.localId} for source job ${id} (NOT submitted; no cost incurred).\n` +
-          `Coverage: ${cov.included}/${cov.expected} item(s) included${fromRetries ? ` (${fromRetries} from retries)` : ""} · Model: ${prepared.model} · Characters: ${prepared.characters}\n` +
-          submitNextStep("mcp", job.localId),
+        text: withNote(
+          found,
+          `Synthesis plan ready: combines ${cov.included} of ${cov.expected} results from "${sourceLabel}" into one overall report using ${prepared.model}. Nothing has been sent yet.\n` +
+            `Synthesis plan saved as ${job.localId} for source job ${id} (NOT submitted; no cost incurred).\n` +
+            `Coverage: ${cov.included}/${cov.expected} item(s) included${fromRetries ? ` (${fromRetries} from retries)` : ""} · Model: ${prepared.model} · Characters: ${prepared.characters}\n` +
+            submitNextStep("mcp", job.localId),
+        ),
         details: {
           localId: job.localId,
+          label: labelOf(ctx, job.localId),
           sourceJobId: id,
           includedItems: cov.included,
           totalItems: cov.expected,
@@ -757,16 +864,21 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
     description: "Cancels an active or previewed batch job (requests cancellation from OpenRouter if already submitted). Destructive.",
     promptSnippet: "Use batch_cancel only when the user explicitly asks to cancel a batch job.",
     promptGuidelines: ["Never cancel a job without the user asking"],
-    parameters: Type.Object({ batch_id: Type.String({ description: "Local job ID to cancel" }) }),
-    outputSchema: Type.Object({ localId: Type.String(), status: Type.String() }),
+    parameters: Type.Object({ batch_id: Type.String({ description: `${JOB_REF_DESCRIPTION} Must be a running job or unsubmitted plan.` }) }),
+    outputSchema: Type.Object({ localId: Type.String(), label: Type.Optional(Type.String()), status: Type.String() }),
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
     hosts: ["mcp"],
     execute: async (ctx, params) => {
       const service = ctx.requireService();
-      const id = service.registry.resolveId(params.batch_id);
+      const found = findJob(ctx, params.batch_id, "cancel");
+      const id = found.id;
       const { job, message } = await service.cancel(id);
       ctx.poller.updateBadge();
-      return { text: message, details: { localId: job.localId, status: job.localStatus } };
+      const label = jobLabel(job);
+      return {
+        text: withNote(found, `Cancelled "${label}" (${job.localId}): ${statusPhrase(job)}.\n${message}`),
+        details: { localId: job.localId, label, status: job.localStatus },
+      };
     },
   }),
 
@@ -779,7 +891,7 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
     promptSnippet: "Use batch_export when the user asks to write a finished batch job's results to a JSONL or CSV file.",
     promptGuidelines: ["Only write to paths the user asked for; never set overwrite: true without asking"],
     parameters: Type.Object({
-      batch_id: Type.String({ description: "Local job ID" }),
+      batch_id: Type.String({ description: JOB_REF_DESCRIPTION }),
       format: Type.Union([Type.Literal("jsonl"), Type.Literal("csv")]),
       out: Type.Optional(Type.String({ description: "Workspace-relative output file path (defaults to the job's exports/ folder)" })),
       overwrite: Type.Optional(Type.Boolean({ description: "Allow replacing an existing file (default false)" })),
@@ -787,6 +899,7 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
     }),
     outputSchema: Type.Object({
       localId: Type.String(),
+      label: Type.Optional(Type.String()),
       path: Type.String(),
       format: Type.String(),
       rows: Type.Number(),
@@ -795,7 +908,8 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
     hosts: ["mcp"],
     execute: async (ctx, params) => {
       const service = ctx.requireService();
-      const id = service.registry.resolveId(params.batch_id);
+      const found = findJob(ctx, params.batch_id, "result");
+      const id = found.id;
       const rec = service.exportResults(id, {
         format: params.format,
         out: params.out,
@@ -803,12 +917,16 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
         jobOnly: params.job_only,
       });
       const job = service.registry.read(id);
+      const label = jobLabel(job);
       const rows = buildExportRows(service.registry, job, { combined: !params.job_only });
       const usableCount = rows.filter((r) => r.result !== null).length;
       const sample = (params.format === "csv" ? toCsv(rows.slice(0, 3)) : toJsonl(rows.slice(0, 3))).trimEnd();
       return {
-        text: `Exported ${rec.records} row(s) (${usableCount} usable) of ${id} to ${rec.path} (${rec.format}, sha256 ${rec.sha256}).\n\nPreview (first ${Math.min(3, rows.length)} row(s)):\n${sample}`,
-        details: { localId: id, path: rec.path, format: rec.format, rows: rec.records },
+        text: withNote(
+          found,
+          `Exported "${label}" (${id}): wrote ${plural(rec.records, "row")} (${usableCount} with usable results) to ${rec.path} (${rec.format}, sha256 ${rec.sha256}).\n\nPreview (first ${Math.min(3, rows.length)} row(s)):\n${sample}`,
+        ),
+        details: { localId: id, label, path: rec.path, format: rec.format, rows: rec.records },
       };
     },
   }),
@@ -847,10 +965,10 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
     promptSnippet: "Use artifact_create to write a Markdown, HTML, PDF or text report from validated batch results or a local Markdown file.",
     promptGuidelines: ["Only write to paths the user asked for; never set overwrite: true without asking"],
     parameters: Type.Object({
-      job_id: Type.Optional(Type.String({ description: "Source batch job ID (give either job_id or source_file)" })),
+      job_id: Type.Optional(Type.String({ description: `Source batch job (give either job_id or source_file). ${JOB_REF_DESCRIPTION}` })),
       source_file: Type.Optional(Type.String({ description: "Workspace-relative Markdown file to render to HTML or PDF (instead of job_id)" })),
       format: Type.Optional(Type.Union([Type.Literal("markdown"), Type.Literal("html"), Type.Literal("pdf"), Type.Literal("text")])),
-      item: Type.Optional(Type.String({ description: "With job_id: render only this item" })),
+      item: Type.Optional(Type.String({ description: "With job_id: render only this item (number, custom_id, source ID, file path, or file name)" })),
       synthesis: Type.Optional(Type.Boolean({ description: "With job_id: render from the newest ready synthesis" })),
       allow_partial: Type.Optional(Type.Boolean({ description: "With job_id: allow rendering when some items failed" })),
       template: Type.Optional(Type.String({ description: "With job_id: artifact template name (.pi/artifact-templates/<name>.yaml)" })),
@@ -868,13 +986,14 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
     execute: async (ctx, params) => {
       if (!params.job_id === !params.source_file) throw new Error("Give exactly one of job_id or source_file.");
       const art = ctx.requireArtifacts();
+      const found = params.job_id ? findJob(ctx, params.job_id, "result") : undefined;
       const plan = params.source_file
         ? await art.planFromFile(params.source_file, {
             format: (params.format ?? "pdf").toLowerCase(),
             out: params.out,
             overwrite: params.overwrite,
           })
-        : await art.planFromJob(params.job_id!, {
+        : await art.planFromJob(found!.id, {
             item: params.item,
             synthesis: params.synthesis,
             allowPartial: params.allow_partial,
@@ -886,12 +1005,14 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
       const m = art.execute(plan);
       const outPath = m.output!.path;
       const absOut = path.resolve(ctx.workspaceRoot, outPath);
+      const body = [
+        `Created ${m.format.toUpperCase()} report at ${outPath} (${m.output!.bytes} bytes${m.output!.pages ? `, ${m.output!.pages} page(s)` : ""}).`,
+        `Artifact ${m.artifactId}: ${m.format} written to ${outPath}${m.output!.internal ? " (internal)" : ""}`,
+        `Source state: ${m.source.state} · Size: ${m.output!.bytes} bytes${m.output!.pages ? `, ${m.output!.pages} page(s)` : ""} · SHA-256: ${m.output!.sha256}`,
+        ...m.warnings.map((w) => `Warning: ${w}`),
+      ].join("\n");
       return {
-        text: [
-          `Artifact ${m.artifactId}: ${m.format} written to ${outPath}${m.output!.internal ? " (internal)" : ""}`,
-          `Source state: ${m.source.state} · Size: ${m.output!.bytes} bytes${m.output!.pages ? `, ${m.output!.pages} page(s)` : ""} · SHA-256: ${m.output!.sha256}`,
-          ...m.warnings.map((w) => `Warning: ${w}`),
-        ].join("\n"),
+        text: found ? withNote(found, body) : body,
         details: { artifactId: m.artifactId, format: m.format, path: outPath, bytes: m.output!.bytes },
         ...(fs.existsSync(absOut) ? { resourceLinks: [{ uri: pathToFileURL(absOut).href, name: outPath, description: `Artifact ${m.artifactId}` }] } : {}),
       };
