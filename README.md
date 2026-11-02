@@ -1461,7 +1461,7 @@ npx -y --package pi-batch-openrouter pi-batch-mcp init --client vscode --cwd .
 ```
 
 This copies the ready-made templates from [`integrations/`](./integrations) into your workspace (skipping any existing files unless `--force` is passed):
-- **VS Code Copilot:** `.github/instructions/pi-batch.instructions.md` (`applyTo: "**"`)
+- **VS Code Copilot:** `.github/skills/pi-batch/SKILL.md` (on-demand Agent Skill), `.github/prompts/batch.prompt.md` (`/batch` slash prompt), and `.github/instructions/pi-batch.instructions.md` (compact always-on pointer)
 - **Claude Code:** `.claude/skills/pi-batch/SKILL.md`
 - **Google Antigravity:** `.agents/plugins/pibatch/{plugin.json,mcp_config.json,rules/AGENTS.md,skills/pi-batch/SKILL.md}`
 

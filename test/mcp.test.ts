@@ -536,9 +536,11 @@ test("initAgentInstructions installs VS Code, Claude Code, and Antigravity instr
     assert.equal(parsed.client, "all");
 
     const first = initAgentInstructions({ workspaceRoot: root, client: "all" });
-    assert.equal(first.written.length, 6);
+    assert.equal(first.written.length, 8);
     assert.equal(first.skipped.length, 0);
     assert.ok(fs.existsSync(path.join(root, ".github", "instructions", "pi-batch.instructions.md")));
+    assert.ok(fs.existsSync(path.join(root, ".github", "skills", "pi-batch", "SKILL.md")));
+    assert.ok(fs.existsSync(path.join(root, ".github", "prompts", "batch.prompt.md")));
     assert.ok(fs.existsSync(path.join(root, ".claude", "skills", "pi-batch", "SKILL.md")));
     assert.ok(fs.existsSync(path.join(root, ".agents", "plugins", "pibatch", "plugin.json")));
     assert.ok(fs.existsSync(path.join(root, ".agents", "plugins", "pibatch", "mcp_config.json")));
@@ -547,10 +549,14 @@ test("initAgentInstructions installs VS Code, Claude Code, and Antigravity instr
 
     const second = initAgentInstructions({ workspaceRoot: root, client: "all", overwrite: false });
     assert.equal(second.written.length, 0);
-    assert.equal(second.skipped.length, 6);
+    assert.equal(second.skipped.length, 8);
 
     const forced = initAgentInstructions({ workspaceRoot: root, client: "vscode", overwrite: true });
-    assert.deepEqual(forced.written, [".github/instructions/pi-batch.instructions.md"]);
+    assert.deepEqual(forced.written, [
+      ".github/instructions/pi-batch.instructions.md",
+      ".github/skills/pi-batch/SKILL.md",
+      ".github/prompts/batch.prompt.md",
+    ]);
   } finally {
     rm(root);
   }

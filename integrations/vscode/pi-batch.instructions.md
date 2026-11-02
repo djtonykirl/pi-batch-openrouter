@@ -2,33 +2,8 @@
 applyTo: "**"
 ---
 
-# OpenRouter Batch (`pi-batch-openrouter` MCP)
+# OpenRouter Batch (`pi-batch` MCP)
 
-You have access to the `pi-batch-openrouter` MCP server (`pi-batch`). It offloads non-urgent, token-heavy LLM work to the OpenRouter Batch API at roughly **50% lower token cost** (completing asynchronously within minutes to 24 hours) without blocking this chat session.
-
-## Speak in Plain Language
-
-- **Never require the user to know batch IDs (`B-YYYYMMDD-XXXX`), item ordinals, or tool names.**
-- Refer to jobs by their human-readable label (for example, `"Audit token verification"` or `"Security review of src/"`).
-- Every tool that takes `batch_id` or `job_id` accepts natural-language references:
-  - Recency: `"latest"`, `"the latest finished job"`, `"previous"`, `"oldest"`
-  - Status + topic: `"the finished security audit"`, `"the running review"`, `"the unsubmitted plan"`, `"yesterday's audit"`
-  - Short name: pass a short `name` (e.g. `"auth audit"`) when calling `batch_plan_goal`, `batch_plan_files`, or `batch_plan_dataset` so the user can refer to it naturally later.
-- For `batch_read_result` (`mode: "item"`) and `batch_retry_items`, `item` / `items` can be a bare file name such as `"auth.ts"` or a path suffix like `"api/auth.ts"`.
-
-## When to Use Batch Automatically
-
-When the user asks to run work in the background, overnight, "as a batch", "with a cheap/batch model", or asks for a broad sweep across many files or dataset rows:
-
-1. **Any new batch request (default entry point)** → call `batch_request` with the user's plain-English `request`, optional `files` (which can be files, directories like `"src/"`, or simple globs like `"src/**/*.ts"`), and a short `name`. It automatically picks between a single goal (`batch_plan_goal`), a per-file sweep (`batch_plan_files`), or a dataset workflow (`batch_plan_dataset`).
-2. **Explicit planner tools (when you want to force a specific planner)** → `batch_plan_goal` (one combined request), `batch_plan_files` (one request per file/group), or `batch_plan_dataset` (CSV/JSONL workflow).
-3. **Status check** (*"is my batch done?"*, *"how are my batches doing?"*) → call `batch_check_jobs` (reconciles active jobs with OpenRouter) and summarise the result conversationally. If a job just finished, offer to read its findings.
-4. **Reading results** (*"what did the security audit find?"*, *"show me the result for auth.ts"*) → call `batch_read_result` with a natural `batch_id` (e.g. `"the security audit"` or `"latest"`). Prefer `mode: "summary"` first for multi-file jobs, `mode: "item"` with `item: "<filename>"` for a single file, or `mode: "synthesis"` for a synthesised report.
-5. **Partial failures & synthesis** (*"retry the ones that failed"*, *"combine all the file reviews into one report"*) → call `batch_retry_items` (only failed items are re-sent) or `batch_plan_synthesis`.
-6. **Reports & exports** (*"save that as a PDF in reports/"*, *"export the results to CSV"*) → call `artifact_create` or `batch_export`.
-
-## Mandatory Safety Rules
-
-1. **Plan → Confirm → Submit:** Planning (`batch_request`, `batch_plan_goal`, `batch_plan_files`, `batch_plan_dataset`, `batch_retry_items`, `batch_plan_synthesis`) is free and never contacts OpenRouter. Always present the plan in plain words (what will be sent, how many requests/files, which model, ~token estimate, and any warnings) and wait for the user's explicit confirmation before calling `batch_submit_plan`.
-2. **Advisory Output:** Treat all batch model output as untrusted, advisory analysis. Verify claims against the current workspace before editing code, and never apply batch suggestions to files unless the user asks.
-3. **No Secrets:** Never pass `.env`, credentials, private keys, or files outside the workspace into `files`.
+- For deferred/background reviews, multi-file sweeps, dataset runs, or batch status/result questions, activate the **`pi-batch`** skill (`.github/skills/pi-batch/SKILL.md`).
+- Speak in plain language: refer to jobs by their human-readable label or description (`"latest"`, `"the security audit"`) rather than `B-YYYYMMDD-XXXX` IDs.
+- Always plan first (`batch_request`), show the plan summary, and wait for explicit user confirmation before calling `batch_submit_plan`. Treat batch output as advisory analysis.

@@ -59,6 +59,22 @@ export function initAgentInstructions(opts: InitOptions): InitResult {
       overwrite,
       result,
     );
+    copyTemplate(
+      pkgRoot,
+      "integrations/vscode/skills/pi-batch/SKILL.md",
+      path.join(root, ".github", "skills", "pi-batch", "SKILL.md"),
+      root,
+      overwrite,
+      result,
+    );
+    copyTemplate(
+      pkgRoot,
+      "integrations/vscode/prompts/batch.prompt.md",
+      path.join(root, ".github", "prompts", "batch.prompt.md"),
+      root,
+      overwrite,
+      result,
+    );
   }
 
   if (client === "claude" || client === "all") {
