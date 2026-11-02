@@ -26,9 +26,8 @@ Use the `pi-batch` MCP tools to plan, submit, track, and read asynchronous OpenR
 
 | When the user says… | What to do |
 | --- | --- |
-| *"Do a deep security/architecture audit of `src/` in a batch"* | Find the relevant files, call `batch_plan_goal` with `name`, explain the plan, and ask to submit. |
-| *"Review every file in `src/api/` for error handling as a batch"* | Expand the file list, call `batch_plan_files` with `name`, explain the plan, and ask to submit. |
-| *"Run the `classify-tickets` workflow over `data/tickets.jsonl`"* | Call `batch_plan_dataset` with `name`, explain the row/request count, and ask to submit. |
+| *"Summarise each markdown file in `docs/`"* or *"Do a deep security audit of `src/` in a batch"* | Call `batch_request` with `request`, optional `files` (files, directories, or globs like `"docs/*.md"`), and `name`, explain the plan, and ask to submit. |
+| *"Run the `classify-tickets` workflow over `data/tickets.jsonl`"* | Call `batch_request` (or `batch_plan_dataset`) with `name`, explain the row/request count, and ask to submit. |
 | *"Yes, submit it"* / *"Go ahead"* | Call `batch_submit_plan` with `batch_id: "latest"` (or the plan's name). |
 | *"Is my batch done?"* / *"Check on my batches"* | Call `batch_check_jobs` (no arguments, or with the job's name/description). If a job is ready, offer to summarise its findings. |
 | *"What did the security audit find?"* | Call `batch_read_result` with `batch_id: "the security audit"` (or `"latest"`), `mode: "summary"`, and summarise the findings. |

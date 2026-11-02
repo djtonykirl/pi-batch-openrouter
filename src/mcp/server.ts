@@ -64,7 +64,7 @@ export class BatchMcpServer {
           "Deferred OpenRouter Batch jobs (~50% token discount, asynchronous completion within minutes to 24h). " +
           "Talk to the user in plain language: refer to jobs by their human-readable label (e.g. \"Audit token verification\") rather than requiring batch IDs. " +
           "Every tool that accepts `batch_id` or `job_id` accepts natural references such as \"latest\", \"the latest finished job\", \"yesterday's review\", a job's `name`, or a topic phrase. " +
-          "Choose the planner that fits the user's request: `batch_plan_goal` for one deep analysis across files, `batch_plan_files` for one request per file, or `batch_plan_dataset` for CSV/JSONL rows. " +
+          "Use `batch_request` as the high-level entry point for any plain-English batch request (it resolves files, directories, and globs and automatically chooses between single goal, per-file batch, or dataset workflow), or call `batch_plan_goal`, `batch_plan_files`, or `batch_plan_dataset` directly. " +
           "Always plan first (free, read-only), summarise the plan in plain words (what will be sent, how many requests, which model), and call `batch_submit_plan` only after the user agrees. " +
           "Never apply batch results to workspace files without the user asking.",
       },
@@ -234,7 +234,13 @@ export class BatchMcpServer {
                 ...(link.description ? { description: link.description } : {}),
               });
             }
-            if (spec.name === "batch_submit_plan" || spec.name.startsWith("batch_plan_") || spec.name === "batch_retry_items" || spec.name === "batch_cancel") {
+            if (
+              spec.name === "batch_request" ||
+              spec.name === "batch_submit_plan" ||
+              spec.name.startsWith("batch_plan_") ||
+              spec.name === "batch_retry_items" ||
+              spec.name === "batch_cancel"
+            ) {
               const id = typeof res.details.localId === "string" ? res.details.localId : undefined;
               if (id) this.notifyJobUpdated(id);
             }

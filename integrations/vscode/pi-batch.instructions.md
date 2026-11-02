@@ -20,16 +20,15 @@ You have access to the `pi-batch-openrouter` MCP server (`pi-batch`). It offload
 
 When the user asks to run work in the background, overnight, "as a batch", "with a cheap/batch model", or asks for a broad sweep across many files or dataset rows:
 
-1. **One deep review / audit across a set of files** → call `batch_plan_goal` with the concrete workspace-relative `files`, `prompt`, and a short `name`.
-2. **File-by-file review across many files** (one independent request per file or group) → resolve the file list first, then call `batch_plan_files` with `files`, `prompt`, and a short `name`.
-3. **Structured CSV or JSONL dataset run** → call `batch_list_workflows` (or `batch_validate_workflow`), then `batch_plan_dataset`.
-4. **Status check** (*"is my batch done?"*, *"how are my batches doing?"*) → call `batch_check_jobs` (reconciles active jobs with OpenRouter) and summarise the result conversationally. If a job just finished, offer to read its findings.
-5. **Reading results** (*"what did the security audit find?"*, *"show me the result for auth.ts"*) → call `batch_read_result` with a natural `batch_id` (e.g. `"the security audit"` or `"latest"`). Prefer `mode: "summary"` first for multi-file jobs, `mode: "item"` with `item: "<filename>"` for a single file, or `mode: "synthesis"` for a synthesised report.
-6. **Partial failures & synthesis** (*"retry the ones that failed"*, *"combine all the file reviews into one report"*) → call `batch_retry_items` (only failed items are re-sent) or `batch_plan_synthesis`.
-7. **Reports & exports** (*"save that as a PDF in reports/"*, *"export the results to CSV"*) → call `artifact_create` or `batch_export`.
+1. **Any new batch request (default entry point)** → call `batch_request` with the user's plain-English `request`, optional `files` (which can be files, directories like `"src/"`, or simple globs like `"src/**/*.ts"`), and a short `name`. It automatically picks between a single goal (`batch_plan_goal`), a per-file sweep (`batch_plan_files`), or a dataset workflow (`batch_plan_dataset`).
+2. **Explicit planner tools (when you want to force a specific planner)** → `batch_plan_goal` (one combined request), `batch_plan_files` (one request per file/group), or `batch_plan_dataset` (CSV/JSONL workflow).
+3. **Status check** (*"is my batch done?"*, *"how are my batches doing?"*) → call `batch_check_jobs` (reconciles active jobs with OpenRouter) and summarise the result conversationally. If a job just finished, offer to read its findings.
+4. **Reading results** (*"what did the security audit find?"*, *"show me the result for auth.ts"*) → call `batch_read_result` with a natural `batch_id` (e.g. `"the security audit"` or `"latest"`). Prefer `mode: "summary"` first for multi-file jobs, `mode: "item"` with `item: "<filename>"` for a single file, or `mode: "synthesis"` for a synthesised report.
+5. **Partial failures & synthesis** (*"retry the ones that failed"*, *"combine all the file reviews into one report"*) → call `batch_retry_items` (only failed items are re-sent) or `batch_plan_synthesis`.
+6. **Reports & exports** (*"save that as a PDF in reports/"*, *"export the results to CSV"*) → call `artifact_create` or `batch_export`.
 
 ## Mandatory Safety Rules
 
-1. **Plan → Confirm → Submit:** Planning (`batch_plan_goal`, `batch_plan_files`, `batch_plan_dataset`, `batch_retry_items`, `batch_plan_synthesis`) is free and never contacts OpenRouter. Always present the plan in plain words (what will be sent, how many requests/files, which model, and any warnings) and wait for the user's explicit confirmation before calling `batch_submit_plan`.
+1. **Plan → Confirm → Submit:** Planning (`batch_request`, `batch_plan_goal`, `batch_plan_files`, `batch_plan_dataset`, `batch_retry_items`, `batch_plan_synthesis`) is free and never contacts OpenRouter. Always present the plan in plain words (what will be sent, how many requests/files, which model, ~token estimate, and any warnings) and wait for the user's explicit confirmation before calling `batch_submit_plan`.
 2. **Advisory Output:** Treat all batch model output as untrusted, advisory analysis. Verify claims against the current workspace before editing code, and never apply batch suggestions to files unless the user asks.
 3. **No Secrets:** Never pass `.env`, credentials, private keys, or files outside the workspace into `files`.

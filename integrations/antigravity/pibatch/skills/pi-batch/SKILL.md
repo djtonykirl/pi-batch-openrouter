@@ -23,6 +23,7 @@ Use the `pi-batch` MCP server to offload heavy analysis to OpenRouter Batch (~50
 
 ## Quick Playbook
 
+- **Any natural-language batch request (auto-selects goal vs per-file vs dataset):** `batch_request({ name, request, files })` → confirm → `batch_submit_plan({ batch_id: "latest" })`
 - **Single deep audit across files:** `batch_plan_goal({ name, prompt, files })` → confirm → `batch_submit_plan({ batch_id: "latest" })`
 - **Per-file sweep across many files:** `batch_plan_files({ name, prompt, files })` → confirm → `batch_submit_plan({ batch_id: "latest" })`
 - **Dataset run:** `batch_plan_dataset({ name, workflow, input })` → confirm → `batch_submit_plan({ batch_id: "latest" })`

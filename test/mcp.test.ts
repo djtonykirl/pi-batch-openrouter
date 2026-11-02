@@ -555,3 +555,101 @@ test("initAgentInstructions installs VS Code, Claude Code, and Antigravity instr
     rm(root);
   }
 });
+
+test("MCP batch_request: auto-selects goal, per_file (from directory/glob/phrasing), and dataset workflow", async () => {
+  const root = tempWorkspace();
+  writeFiles(root, {
+    "docs/intro.md": "# Intro\nWelcome.\n",
+    "docs/setup.md": "# Setup\nInstall steps.\n",
+    "src/auth.ts": "export const auth = 1;\n",
+    "src/session.ts": "export const session = 2;\n",
+    "data/tickets.jsonl": `${JSON.stringify({ id: "t1", body: "Cannot log in" })}\n${JSON.stringify({ id: "t2", body: "Billing question" })}\n`,
+    ".pi/batch-workflows/triage-tickets.yaml": [
+      "schemaVersion: 1",
+      "name: triage-tickets",
+      "description: Triage support tickets",
+      "input:",
+      "  type: jsonl",
+      "  idField: id",
+      "  fields: [id, body]",
+      "request:",
+      "  prompt: |",
+      "    Triage ticket {{id}}: {{body}}",
+      "output:",
+      "  type: markdown",
+    ].join("\n"),
+  });
+  try {
+    const m = await connectMcp(root);
+    try {
+      // 1. "Summarise each markdown file in docs/" -> auto-extracts `docs/` directory and chooses `per_file` (2 requests)
+      const perFile = await m.client.callTool({
+        name: "batch_request",
+        arguments: {
+          name: "docs summary",
+          request: "Summarise each markdown file in `docs/` in two bullet points.",
+        },
+      });
+      assert.ok(!perFile.isError, textOf(perFile));
+      const pfStruct = perFile.structuredContent as { localId: string; planner: string; requests: number; files: number; approxTokens: number };
+      assert.equal(pfStruct.planner, "per_file");
+      assert.equal(pfStruct.requests, 2);
+      assert.equal(pfStruct.files, 2);
+      assert.ok(pfStruct.approxTokens > 0);
+      assert.match(textOf(perFile), /~50% OpenRouter Batch discount/);
+      assert.match(textOf(perFile), /Submit\?/);
+      assert.equal(m.fake.requests.length, 0, "batch_request must never submit on its own");
+
+      // 2. Single combined cross-file audit -> chooses `goal` (1 request covering 2 files)
+      const singleGoal = await m.client.callTool({
+        name: "batch_request",
+        arguments: {
+          request: "Audit how `src/auth.ts` and `src/session.ts` interact and check for session fixation bugs.",
+        },
+      });
+      assert.ok(!singleGoal.isError, textOf(singleGoal));
+      const goalStruct = singleGoal.structuredContent as { planner: string; requests: number; files: number };
+      assert.equal(goalStruct.planner, "goal");
+      assert.equal(goalStruct.requests, 1);
+      assert.equal(goalStruct.files, 2);
+
+      // 3. Glob in `files` (`src/**/*.ts`) with per-file phrasing -> `per_file` (2 requests)
+      const globPerFile = await m.client.callTool({
+        name: "batch_request",
+        arguments: {
+          request: "Review every file individually for exported symbol naming",
+          files: ["src/**/*.ts"],
+        },
+      });
+      assert.ok(!globPerFile.isError, textOf(globPerFile));
+      assert.equal((globPerFile.structuredContent as { planner: string; requests: number }).planner, "per_file");
+      assert.equal((globPerFile.structuredContent as { requests: number }).requests, 2);
+
+      // 4. Dataset workflow auto-detected from `data/tickets.jsonl` and single matching `.jsonl` workflow
+      const datasetPlan = await m.client.callTool({
+        name: "batch_request",
+        arguments: {
+          name: "ticket triage",
+          request: "Run triage-tickets on `data/tickets.jsonl`",
+        },
+      });
+      assert.ok(!datasetPlan.isError, textOf(datasetPlan));
+      const dsStruct = datasetPlan.structuredContent as { localId: string; planner: string; requests: number };
+      assert.equal(dsStruct.planner, "dataset");
+      assert.equal(dsStruct.requests, 2);
+
+      // 5. Submitting the `batch_request` plan by name works seamlessly
+      m.fake.submitReplies = [accepted("batch_req_ds")];
+      const submitted = await m.client.callTool({
+        name: "batch_submit_plan",
+        arguments: { batch_id: "ticket triage" },
+      });
+      assert.ok(!submitted.isError, textOf(submitted));
+      assert.equal((submitted.structuredContent as { localId: string }).localId, dsStruct.localId);
+    } finally {
+      await m.close();
+    }
+  } finally {
+    rm(root);
+  }
+});

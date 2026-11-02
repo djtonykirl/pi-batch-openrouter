@@ -1467,18 +1467,22 @@ This copies the ready-made templates from [`integrations/`](./integrations) into
 
 ---
 
-#### 2.5 Natural-Language Job & Item References
+#### 2.5 Natural-Language Entry Point (`batch_request`) & Job/Item References
 
-You never need to copy or remember `B-YYYYMMDD-XXXX` IDs or item numbers:
+You never need to know which planner to call or copy `B-YYYYMMDD-XXXX` IDs or item numbers:
 
-1. **Human-readable labels:** Every job automatically gets a short label derived from its objective (or an explicit `name` passed to `batch_plan_goal`, `batch_plan_files`, or `batch_plan_dataset`, such as `"auth security audit"`).
-2. **Natural `batch_id` / `job_id` resolution:** Every tool and `batch://jobs/{id}*` resource accepts:
+1. **Single high-level entry tool (`batch_request`):** Pass a free-text `request` (such as *"summarise each markdown file in `docs/`"*, *"audit `src/auth.ts` and `src/session.ts` for race conditions"*, or *"run `classify-tickets` on `data/tickets.jsonl`"*). `batch_request`:
+   - Extracts workspace files, directories (expanded with `.gitignore`/`.pi/batchignore` filtering), or simple globs (`"src/**/*.ts"`) from `files` or directly from the `request` text.
+   - Automatically selects the right planner (`goal`, `per_file`, or `dataset`), or respects an explicit `mode` override.
+   - Runs every path, exclusion, secret, and privacy check locally and returns a conversational summary (`Plan ready: "..." — N request(s) on <model>, ~X,XXX tokens, ~50% OpenRouter Batch discount, results typically in 1–24h. Nothing has been sent or billed yet. Submit?`).
+2. **Human-readable labels:** Every job automatically gets a short label derived from its objective (or an explicit `name` passed to `batch_request`, `batch_plan_goal`, `batch_plan_files`, or `batch_plan_dataset`, such as `"auth security audit"`).
+3. **Natural `batch_id` / `job_id` resolution:** Every tool and `batch://jobs/{id}*` resource accepts:
    - **Recency:** `"latest"`, `"the latest finished job"`, `"previous"`, `"oldest"`
    - **Status + topic phrases:** `"the security audit"`, `"the finished review of src/api"`, `"yesterday's audit"`, `"the unsubmitted plan"`
    - **Exact name or ID:** `"auth security audit"`, `"B-20261031-4F9A"`, or a unique suffix like `"4F9A"`
    - **Ambiguity safety:** For cost-bearing (`batch_submit_plan`) or destructive (`batch_cancel`) actions, if a phrase matches more than one eligible job without a recency qualifier, the server refuses and lists the matching jobs so you can pick the right one.
-3. **Bare file names as item selectors:** In `batch_read_result(mode: "item")` and `batch_retry_items`, `item` / `items` accepts a bare file name (`"auth.ts"`), a trailing path suffix (`"api/auth.ts"`), a full workspace path, an item number (`1..N`), or `id:<sourceId>`.
-4. **Conversational tool outputs:** Every tool response starts with a plain-English summary sentence (for example, `Plan ready: "auth security audit" will review 11 requests (one per file) with anthropic/claude-opus-5.5. Nothing has been sent or billed yet.`), while keeping machine-readable fields in `structuredContent`.
+4. **Bare file names as item selectors:** In `batch_read_result(mode: "item")` and `batch_retry_items`, `item` / `items` accepts a bare file name (`"auth.ts"`), a trailing path suffix (`"api/auth.ts"`), a full workspace path, an item number (`1..N`), or `id:<sourceId>`.
+5. **Conversational tool outputs:** Every tool response starts with a plain-English summary sentence, while keeping machine-readable fields in `structuredContent`.
 
 ---
 
@@ -1502,11 +1506,12 @@ You never need to copy or remember `B-YYYYMMDD-XXXX` IDs or item numbers:
 
 #### 4. Complete MCP Reference
 
-##### Tools (18)
+##### Tools (19)
 
 | Category | Tool | Annotations | Purpose |
 |---|---|---|---|
-| **Plan (free)** | `batch_plan_goal` | Read-only | Plan a single deferred review/analysis goal over `files` (`prompt`, optional `files`, `model`, `provider`). |
+| **Plan (free)** | `batch_request` | Read-only | High-level natural-language entry point: resolves files, directories, or globs from `request` / `files` and automatically plans a `goal`, `per_file`, or `dataset` batch job. |
+| | `batch_plan_goal` | Read-only | Plan a single deferred review/analysis goal over `files` (`prompt`, optional `files`, `model`, `provider`, `name`). |
 | | `batch_plan_files` | Read-only | Plan a `map-files` job: one request per file (or `group_size` files) sharing one `prompt`. |
 | | `batch_plan_dataset` | Read-only | Plan a `.pi/batch-workflows/*.yaml` workflow over a CSV/JSONL `input` file (optional `ids`, `from_row`, `to_row`, `model`). |
 | | `batch_retry_items` | Read-only | Plan a linked retry job for `failed: true` or specific `items` selectors of a finished multi-item job. |

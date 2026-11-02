@@ -6,6 +6,7 @@ import { describeArtifact } from "./artifact-commands.js";
 import type { ArtifactService } from "./artifacts/service.js";
 import { discoverTemplates } from "./artifacts/templates.js";
 import type { BatchConfig } from "./config.js";
+import { buildContextPackage } from "./context/package.js";
 import { buildExportRows, toCsv, toJsonl } from "./export.js";
 import { resolveItem } from "./items.js";
 import { describeJob, inventorySentence, jobBullet, jobLabel, statusPhrase } from "./humanize.js";
@@ -15,6 +16,7 @@ import type { ModelCatalog } from "./models/catalog.js";
 import { formatRoutingPolicy } from "./openrouter/routing.js";
 import type { BatchPoller } from "./poller.js";
 import { formatPrivacyStatus, levelSource } from "./privacy/commands.js";
+import { choosePlanner, formatTokenEstimate, resolveRequestPaths } from "./request.js";
 import type { BatchRuntime } from "./runtime.js";
 import { itemCounts, type BatchService } from "./service.js";
 import { ACTIVE_STATUSES, TERMINAL_STATUSES, type LocalStatus } from "./state.js";
@@ -166,6 +168,200 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
           `Files: ${job.context.fileCount}, characters: ${job.context.characters}\n` +
           trackNextStep(ctx.host, job.localId),
         details: { localId: job.localId, providerBatchId: job.providerBatchId, status: job.localStatus, model: job.model },
+      };
+    },
+  }),
+
+  def({
+    name: "batch_request",
+    label: "Batch Request (Auto-Plan)",
+    description:
+      "High-level natural-language entry point for OpenRouter Batch (~50% token discount, 1–24h turnaround). " +
+      "Takes a plain-English request (e.g. 'summarise each markdown file in docs/', 'audit src/auth.ts and src/session.ts for race conditions', " +
+      "or 'run classify-tickets on data/tickets.jsonl'), resolves workspace files, directories, or simple globs (e.g. 'src/**/*.ts'), " +
+      "automatically picks the right planner (single goal, per-file batch, or dataset workflow), runs all path/exclusion/secret/privacy checks, " +
+      "and SAVES a free preview plan. It NEVER submits or bills on its own; call batch_submit_plan after the user agrees.",
+    promptSnippet: "Use batch_request as the default entry point when the user asks in plain English to run a batch job.",
+    promptGuidelines: [
+      "Prefer batch_request when the user describes a batch task in natural language or passes directories/globs",
+      "Show the returned plain-language plan summary (requests, files/rows, model, ~token estimate) and wait for user approval before calling batch_submit_plan",
+      "Never include credentials or files outside the workspace",
+    ],
+    parameters: Type.Object({
+      request: Type.String({
+        description:
+          "Plain-English description of what the batch should do (may mention workspace files, directories, or patterns such as 'docs/' or 'src/**/*.ts')",
+      }),
+      files: Type.Optional(
+        Type.Array(Type.String(), {
+          description:
+            "Optional workspace-relative files, directories (expanded automatically with .gitignore/.pi/batchignore filtering), or simple globs ('src/**/*.ts'). If omitted, paths mentioned in `request` are resolved.",
+        }),
+      ),
+      mode: Type.Optional(
+        Type.Union([Type.Literal("auto"), Type.Literal("goal"), Type.Literal("per_file"), Type.Literal("dataset")], {
+          description: "Planner strategy: 'auto' (default: infers goal vs per_file vs dataset), 'goal', 'per_file', or 'dataset'",
+        }),
+      ),
+      workflow: Type.Optional(Type.String({ description: "Project workflow name (.pi/batch-workflows/<name>.yaml) when running a dataset batch" })),
+      group_size: Type.Optional(Type.Integer({ minimum: 1, description: "Files per request when per_file mode is used (default 1)" })),
+      model: Type.Optional(Type.String({ description: "OpenRouter batch-capable model slug override (e.g. anthropic/claude-opus-5.5)" })),
+      provider: Type.Optional(Type.String({ description: "Account/provider alias for the API key (e.g. openrouter, openrouter-work)" })),
+      name: Type.Optional(Type.String({ description: NAME_DESCRIPTION })),
+    }),
+    outputSchema: Type.Object({
+      localId: Type.String(),
+      label: Type.Optional(Type.String()),
+      planner: Type.Union([Type.Literal("goal"), Type.Literal("per_file"), Type.Literal("dataset")]),
+      reason: Type.String(),
+      requests: Type.Number(),
+      files: Type.Number(),
+      characters: Type.Number(),
+      approxTokens: Type.Number(),
+      model: Type.String(),
+    }),
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    hosts: ["mcp"],
+    execute: async (ctx, params, signal) => {
+      if (signal?.aborted) throw new Error("Planning aborted");
+      const service = ctx.requireService();
+      const classified = resolveRequestPaths(ctx.workspaceRoot, params.request, params.files);
+
+      let expandedFileCount = classified.files.length;
+      if (classified.contexts.length > 0) {
+        const probe = buildContextPackage({
+          workspaceRoot: ctx.workspaceRoot,
+          objective: params.request,
+          files: classified.files,
+          contexts: classified.contexts,
+          includeInstructions: false,
+          format: "markdown",
+          config: ctx.getConfig(),
+          knownSecrets: [],
+          renderPackage: false,
+        });
+        expandedFileCount = probe.files.length;
+      }
+
+      const choice = choosePlanner({
+        workspaceRoot: ctx.workspaceRoot,
+        request: params.request,
+        mode: params.mode,
+        workflow: params.workflow,
+        groupSize: params.group_size,
+        classified,
+        expandedFileCount,
+      });
+
+      if (choice.kind === "dataset") {
+        const prepared = await service.planDataset({
+          workflow: choice.workflow!,
+          input: choice.datasetInput!,
+          model: params.model,
+          account: params.provider,
+        });
+        if (prepared.blockers.length > 0) throw new Error(`Plan blocked; nothing was saved:\n${wording(ctx.host, prepared.blockers.join("\n\n"))}`);
+        const job = await service.createDatasetJob(prepared, { previewOnly: true });
+        applyName(ctx, job.localId, params.name);
+        const label = labelOf(ctx, job.localId);
+        const c = prepared.plan!.counts;
+        const chars = prepared.plan!.totalCharacters;
+        const approxTokens = Math.max(1, Math.ceil(chars / 4));
+        return {
+          text:
+            `Plan ready: "${label}" (${choice.reason}) — ${plural(c.plannedRequests, "request")} on ${prepared.model}, ${formatTokenEstimate(chars)}, ~50% OpenRouter Batch discount, results typically in 1–24h. Nothing has been sent or billed yet. Submit?\n` +
+            `Plan saved as ${job.localId} (NOT submitted; no cost incurred).\n` +
+            `Rows: ${c.totalRows} parsed, ${c.selectedRows} selected, ${c.invalidRows} invalid. Requests: ${c.plannedRequests} (one OpenRouter batch).\n` +
+            `Fields sent: ${prepared.definition!.input.fields.join(", ")}. Model: ${prepared.model}. Privacy: ${ctx.getPrivacy().level}.\n` +
+            submitNextStep(ctx.host, job.localId),
+          details: {
+            localId: job.localId,
+            label,
+            planner: "dataset",
+            reason: choice.reason,
+            requests: c.plannedRequests,
+            files: 1,
+            characters: chars,
+            approxTokens,
+            model: prepared.model,
+          },
+        };
+      }
+
+      if (choice.kind === "per_file") {
+        if (classified.files.length === 0 && classified.contexts.length === 0) {
+          throw new Error("No workspace files or directories were found for this per-file batch request. Pass the target files or directory in `files`.");
+        }
+        const plan = await service.planMapFiles({
+          objective: params.request,
+          files: classified.files,
+          contexts: classified.contexts,
+          groupSize: params.group_size ?? 1,
+          model: params.model,
+          account: params.provider,
+          format: "markdown",
+          includeInstructions: true,
+        });
+        const job = await service.createWorkflowJob(plan, { previewOnly: true });
+        applyName(ctx, job.localId, params.name);
+        const label = labelOf(ctx, job.localId);
+        const chars = plan.totalCharacters;
+        const approxTokens = Math.max(1, Math.ceil(chars / 4));
+        return {
+          text:
+            `Plan ready: "${label}" (${choice.reason}) — ${plural(plan.items.length, "request")} across ${plural(plan.pkg.files.length, "file")} on ${plan.model}, ${formatTokenEstimate(chars)}, ~50% OpenRouter Batch discount, results typically in 1–24h. Nothing has been sent or billed yet. Submit?\n` +
+            `Plan saved as ${job.localId} (NOT submitted; no cost incurred).\n` +
+            `Requests: ${plan.items.length} (one OpenRouter batch) · Model: ${plan.model} · Privacy: ${ctx.getPrivacy().level}\n` +
+            `Files included: ${plan.pkg.files.length} (excluded: ${plan.pkg.excluded.length}) · Total characters: ${chars} (not tokens)\n` +
+            submitNextStep(ctx.host, job.localId),
+          details: {
+            localId: job.localId,
+            label,
+            planner: "per_file",
+            reason: choice.reason,
+            requests: plan.items.length,
+            files: plan.pkg.files.length,
+            characters: chars,
+            approxTokens,
+            model: plan.model,
+          },
+        };
+      }
+
+      // Default: single `goal`
+      const prepared = await service.prepare({
+        objective: params.request,
+        files: classified.files,
+        contexts: classified.contexts,
+        model: params.model,
+        account: params.provider,
+        format: "markdown",
+        includeInstructions: true,
+      });
+      const job = await service.createJob(prepared, { previewOnly: true });
+      applyName(ctx, job.localId, params.name);
+      const label = labelOf(ctx, job.localId);
+      const chars = job.context.characters;
+      const approxTokens = Math.max(1, Math.ceil(chars / 4));
+      return {
+        text:
+          `Plan ready: "${label}" (${choice.reason}) — 1 request covering ${plural(job.context.fileCount, "file")} on ${job.model}, ${formatTokenEstimate(chars)}, ~50% OpenRouter Batch discount, results typically in 1–24h. Nothing has been sent or billed yet. Submit?\n` +
+          `Plan saved as ${job.localId} (NOT submitted; no cost incurred).\n` +
+          `Requests: 1 · Model: ${job.model} · Privacy: ${ctx.getPrivacy().level}\n` +
+          `Files included: ${job.context.fileCount} (excluded: ${prepared.pkg.excluded.length}) · Characters: ${chars} (not tokens)\n` +
+          (job.warnings.length ? `Warnings:\n${job.warnings.map((w) => `  - ${wording(ctx.host, w)}`).join("\n")}\n` : "") +
+          submitNextStep(ctx.host, job.localId),
+        details: {
+          localId: job.localId,
+          label,
+          planner: "goal",
+          reason: choice.reason,
+          requests: 1,
+          files: job.context.fileCount,
+          characters: chars,
+          approxTokens,
+          model: job.model,
+        },
       };
     },
   }),
