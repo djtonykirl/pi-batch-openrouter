@@ -136,11 +136,6 @@ export class BatchMcpServer {
 
   public async connect(transport: Transport): Promise<void> {
     await this.mcp.connect(transport);
-    if (this.opts.startPoller !== false && !this.started) {
-      this.started = true;
-      void this.ws.catalog.load();
-      this.ws.poller.start();
-    }
   }
 
   public async close(): Promise<void> {
