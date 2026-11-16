@@ -23,6 +23,11 @@ export interface ThreadState {
   /** `code`: the failed job's error code; "submission_unknown" means OpenRouter may have accepted (and billed) it. */
   lastFailure?: { purpose: "turn" | "compact"; jobId?: string; code?: string; message: string; at: string };
   summary?: { text: string; throughSeq: number; jobId: string };
+  /**
+   * Set on a thread an agent started through the MCP server (`chat_start`): the user agreed to at most `turnBudget`
+   * billed turns, and `turnsUsed` counts the ones sent. The MCP chat tools see only threads that carry this.
+   */
+  mcp?: { turnBudget: number; turnsUsed: number };
 }
 
 export type TranscriptEntry = { seq: number; at: string } & (

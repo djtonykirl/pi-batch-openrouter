@@ -79,6 +79,12 @@ export interface ChatServiceDeps {
   getConfig: () => BatchConfig;
   /** The `privacy` section read fresh at each decision (`readPrivacyConfig`). Defaults to `getConfig().privacy`. */
   getPrivacy?: () => BatchConfig["privacy"];
+  /**
+   * Whether this process may send a thread's queued messages on its own (after a reply lands, or on a poller tick).
+   * Defaults to always. A host that must not bill turns nobody confirmed in it (the MCP server) returns false; it
+   * still applies replies, expires stale claims and records failures. `send` and `retry` are never affected.
+   */
+  maySendQueued?: (thread: ThreadState) => boolean;
   logger?: Logger;
 }
 
@@ -216,7 +222,18 @@ export class ChatService {
    * pending turn is this job. After a reply, queued messages go out in the background.
    */
   public applySettled(job: JobManifest): void {
-    if (this.settle(job)) this.sendInBackground(job.chat!.threadId);
+    if (this.settle(job) && this.maySendQueued(job.chat!.threadId)) this.sendInBackground(job.chat!.threadId);
+  }
+
+  /** False when this host leaves the thread's queued messages for another process to send. An unreadable thread is left alone. */
+  private maySendQueued(threadId: string): boolean {
+    const allowed = this.deps.maySendQueued;
+    if (!allowed) return true;
+    try {
+      return allowed(this.store.read(threadId));
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -702,6 +719,8 @@ export class ChatService {
   private afterReply(threadId: string): void {
     const { chat } = this.deps.getConfig();
     if (!chat.autoCompact) return;
+    // A compaction is a billed job too: a host that leaves sending to another process leaves this to it as well.
+    if (!this.maySendQueued(threadId)) return;
     try {
       const thread = this.store.read(threadId);
       if (thread.compacting) return;
@@ -856,7 +875,7 @@ export class ChatService {
       if (job && TERMINAL_STATUSES.has(job.localStatus)) this.settle(job);
     }
     // A reply settled here starts automatic compaction too (settle calls afterReply).
-    await this.sendUnsent(thread.id);
+    if (this.maySendQueued(thread.id)) await this.sendUnsent(thread.id);
   }
 
   /** Sends unsent messages as one turn if the thread is idle (no pending turn, no failure). Returns the job ID. */

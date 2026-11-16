@@ -69,7 +69,13 @@ async function main(): Promise<void> {
     const targetRoot = cwd ?? process.cwd();
     const res = initAgentInstructions({ workspaceRoot: targetRoot, client: client ?? "all", overwrite: force });
     for (const f of res.written) process.stderr.write(`Wrote ${f}\n`);
-    for (const f of res.skipped) process.stderr.write(`Skipped ${f} (already exists; pass --force to overwrite)\n`);
+    for (const f of res.skipped) {
+      process.stderr.write(
+        res.outdated.includes(f)
+          ? `Outdated ${f} (differs from the packaged version: an older install or a local edit; pass --force to replace it)\n`
+          : `Skipped ${f} (already up to date)\n`,
+      );
+    }
     process.exit(0);
   }
 

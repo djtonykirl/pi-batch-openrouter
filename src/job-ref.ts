@@ -1,6 +1,6 @@
 import { JobNotFoundError, type JobRegistry } from "./registry.js";
 import { ACTIVE_STATUSES, type LocalStatus } from "./state.js";
-import { isChatJob, type JobManifest } from "./types.js";
+import { isChatJob, isMetadataWorkflow, type JobManifest } from "./types.js";
 import { jobLabel, relativeTime, statusPhrase } from "./humanize.js";
 
 /**
@@ -12,7 +12,7 @@ import { jobLabel, relativeTime, statusPhrase } from "./humanize.js";
  */
 
 /** What the caller is about to do with the job; used to prefer (and, for submit/cancel, require) suitable jobs. */
-export type JobPurpose = "any" | "result" | "submit" | "cancel" | "multi-item";
+export type JobPurpose = "any" | "result" | "submit" | "cancel" | "multi-item" | "metadata";
 
 export interface JobRefResolution {
   id: string;
@@ -38,6 +38,8 @@ const PURPOSE_FILTER: Record<JobPurpose, (j: JobManifest) => boolean> = {
   submit: (j) => j.localStatus === "previewed",
   cancel: (j) => j.localStatus === "previewed" || ACTIVE_STATUSES.has(j.localStatus),
   "multi-item": (j) => FINISHED.has(j.localStatus) && j.requestCount > 1,
+  // The original metadata job; its retries are combined into it and are never addressed on their own.
+  metadata: (j) => isMetadataWorkflow(j.workflow) && !j.parentJobId,
 };
 
 const PURPOSE_NOUN: Record<JobPurpose, string> = {
@@ -46,6 +48,7 @@ const PURPOSE_NOUN: Record<JobPurpose, string> = {
   submit: "saved plan that has not been submitted",
   cancel: "running job or unsubmitted plan",
   "multi-item": "finished multi-item batch job",
+  metadata: "Databricks metadata job",
 };
 
 /** Purposes where guessing between several matches is not acceptable. */

@@ -72,6 +72,14 @@ export interface BatchConfig {
     maxRequestsPerSubmit: number;
     /** Tool names to omit from the MCP server's tool list. */
     disabledTools: string[];
+    /**
+     * Whether the MCP server's background poller may send chat messages queued in threads the user opened in Pi or the
+     * web UI. Off by default: an MCP process then only applies replies that have landed, so it never bills a turn nobody
+     * confirmed in that client. Threads started with `chat_start` are sent either way (their budget was agreed).
+     */
+    sendQueuedChat: boolean;
+    /** Default and upper limit of the turn budget a `chat_start` thread may be given. */
+    chatMaxTurnsPerThread: number;
   };
 }
 
@@ -124,7 +132,7 @@ export const DEFAULT_CONFIG: BatchConfig = {
   },
   privacy: { level: "standard", accountNoTraining: false, deleteRemoteBatches: true, noticeShown: false },
   routing: { allowedProviders: [], allowFallbacks: true, requireZdr: false, accountZdrEnforced: false, requireNoDataCollection: false, accountDataCollectionDenied: false },
-  mcp: { maxRequestsPerSubmit: 100, disabledTools: [] },
+  mcp: { maxRequestsPerSubmit: 100, disabledTools: [], sendQueuedChat: false, chatMaxTurnsPerThread: 10 },
 };
 
 export const GLOBAL_CONFIG_DIR = path.join(os.homedir(), ".pi", "agent", "pi-batch-openrouter");
@@ -252,6 +260,8 @@ const SCHEMA: Record<string, Check | Record<string, Check>> = {
   mcp: {
     maxRequestsPerSubmit: posInt(10_000),
     disabledTools: (v) => Array.isArray(v) && v.length <= 100 && v.every((x) => typeof x === "string" && /^[a-z0-9_]{1,80}$/i.test(x)),
+    sendQueuedChat: bool,
+    chatMaxTurnsPerThread: posInt(1_000),
   },
 };
 
