@@ -4,8 +4,8 @@ import { toPosix } from "./context/package.js";
 import { isInside } from "./fsutil.js";
 import { discoverWorkflows } from "./workflows/definition.js";
 
-export type RequestPlannerMode = "auto" | "goal" | "per_file" | "dataset";
-export type ResolvedPlannerKind = "goal" | "per_file" | "dataset";
+export type RequestPlannerMode = "auto" | "goal" | "per_file" | "dataset" | "metadata";
+export type ResolvedPlannerKind = "goal" | "per_file" | "dataset" | "metadata";
 
 export interface ClassifiedPaths {
   files: string[];
@@ -23,6 +23,23 @@ const PER_FILE_PATTERNS = [
 const SINGLE_GOAL_PATTERNS = [
   /\b(?:single\s+request|one\s+combined|together\s+in\s+one|cross[-\s]file|interactions?\s+between|how\s+they\s+interact)\b/i,
 ];
+
+/**
+ * Wording that marks a request for the built-in `databricks-metadata` workflow (table descriptions and column
+ * comments). Such a request must never fall through to the generic planners: they skip the per-table evidence
+ * validation, the UC standards and the audit-column and PII rules.
+ */
+const METADATA_PATTERNS = [
+  /\b(?:databricks|unity\s+catalog)\b/i,
+  /\b(?:column|table)\s+(?:comments?|descriptions?|documentation)\b/i,
+  /\b(?:uc|catalog|table|column)\s+metadata\b/i,
+  /\bmetadata\s+(?:proposals?|enrichment|generation|descriptions?|comments?)\b/i,
+];
+
+/** True when the wording asks for Databricks / Unity Catalog table descriptions or column comments. */
+export function looksLikeMetadataRequest(request: string): boolean {
+  return METADATA_PATTERNS.some((re) => re.test(request));
+}
 
 /**
  * Extracts workspace-relative file/directory references (and simple `dir/*.ext` / `dir/**\/*.ext` patterns)
@@ -93,7 +110,8 @@ export function resolveRequestPaths(workspaceRoot: string, request: string, expl
   return { files, contexts, datasetFile };
 }
 
-function collectFilesByExtension(root: string, dirAbs: string, ext: string, recursive: boolean): string[] {
+/** Workspace-relative files under `dirAbs` with extension `ext` (generated and state directories are skipped). */
+export function collectFilesByExtension(root: string, dirAbs: string, ext: string, recursive: boolean): string[] {
   const out: string[] = [];
   const walk = (d: string) => {
     const entries = fs.readdirSync(d, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
@@ -176,6 +194,18 @@ export function choosePlanner(input: {
   const mode = input.mode ?? "auto";
   const { classified, request } = input;
 
+  // 0. Databricks metadata (built-in workflow). Checked before the dataset inference so a project workflow that merely
+  //    takes .jsonl input cannot claim a tables file, and before the goal fallback so it is never sent unvalidated.
+  const tablesFile = classified.files.find((f) => /\.jsonl$/i.test(f));
+  const autoMetadata =
+    mode === "auto" && !input.workflow && tablesFile !== undefined && looksLikeMetadataRequest(request) && namedWorkflow(input.workspaceRoot, request) === undefined;
+  if (mode === "metadata" || autoMetadata) {
+    if (!tablesFile) {
+      throw new Error("Pass the tables file (.jsonl, one Databricks table per line, exported from Databricks) to generate metadata proposals for.");
+    }
+    return { kind: "metadata", datasetInput: tablesFile, reason: `Databricks table descriptions and column comments for the tables in ${tablesFile}` };
+  }
+
   // 1. Explicit or inferred dataset workflow
   if (mode === "dataset" || input.workflow) {
     const wf = input.workflow ?? inferWorkflowName(input.workspaceRoot, request, classified.datasetFile);
@@ -246,21 +276,62 @@ export function choosePlanner(input: {
   };
 }
 
+/** A project workflow explicitly named in the request (even if invalid, so planDataset reports its diagnostics). */
+function namedWorkflow(workspaceRoot: string, request: string): string | undefined {
+  const lower = request.toLowerCase();
+  return discoverWorkflows(workspaceRoot).entries.find((e) => lower.includes(e.name.toLowerCase()))?.name;
+}
+
+/** How much of a dataset is read to learn its field names. */
+const FIELD_PROBE_BYTES = 256 * 1024;
+
+/**
+ * The field names of a dataset's first record (JSONL keys, or the CSV header), or undefined when they cannot be read.
+ * Only names are returned; no value leaves this function.
+ */
+function datasetFieldNames(workspaceRoot: string, datasetFile: string, type: "csv" | "jsonl"): string[] | undefined {
+  try {
+    const abs = path.resolve(workspaceRoot, datasetFile);
+    if (!isInside(path.resolve(workspaceRoot), abs)) return undefined;
+    const fd = fs.openSync(abs, "r");
+    let head: string;
+    try {
+      const buf = Buffer.alloc(FIELD_PROBE_BYTES);
+      head = buf.subarray(0, fs.readSync(fd, buf, 0, buf.length, 0)).toString("utf8").replace(/^﻿/, "");
+    } finally {
+      fs.closeSync(fd);
+    }
+    const first = head.split(/\r?\n/).find((l) => l.trim() !== "");
+    if (first === undefined) return undefined;
+    if (type === "jsonl") {
+      const row: unknown = JSON.parse(first);
+      return row && typeof row === "object" && !Array.isArray(row) ? Object.keys(row) : undefined;
+    }
+    return first.split(",").map((h) => h.trim().replace(/^"|"$/g, ""));
+  } catch {
+    return undefined;
+  }
+}
+
 function inferWorkflowName(workspaceRoot: string, request: string, datasetFile: string | undefined): string | undefined {
   const catalog = discoverWorkflows(workspaceRoot);
   if (catalog.entries.length === 0) return undefined;
 
-  const lower = request.toLowerCase();
-  // Match any project workflow explicitly named in the request (even if invalid, so planDataset reports its diagnostics).
-  const named = catalog.entries.find((e) => lower.includes(e.name.toLowerCase()));
-  if (named) return named.name;
+  const named = namedWorkflow(workspaceRoot, request);
+  if (named) return named;
 
   const valid = catalog.entries.filter((e) => e.valid && e.definition);
   if (datasetFile) {
     const ext = datasetFile.toLowerCase().endsWith(".csv") ? "csv" : datasetFile.toLowerCase().endsWith(".jsonl") ? "jsonl" : undefined;
     if (ext) {
+      // An unnamed workflow is inferred only when it is the one workflow of this format AND the dataset really has the
+      // fields it sends: the file extension alone would hand any .jsonl file to an unrelated workflow.
       const matchingFormat = valid.filter((e) => e.definition!.input.type === ext);
-      if (matchingFormat.length === 1) return matchingFormat[0]!.name;
+      if (matchingFormat.length === 1) {
+        const names = datasetFieldNames(workspaceRoot, datasetFile, ext);
+        const wanted = matchingFormat[0]!.definition!.input.fields;
+        if (names !== undefined && wanted.every((f) => names.includes(f))) return matchingFormat[0]!.name;
+      }
     }
   }
   return undefined;

@@ -36,6 +36,23 @@ const MCP_WORDING: ReadonlyArray<readonly [RegExp, string]> = [
   [/consider \/batch privacy zdr/g, "consider setting privacy.level to zdr in .pi/batch.config.json (or /batch privacy zdr in Pi)"],
   // free models outside chat
   [/Free models run only in batch chat \(\/batch chat\); \/batch ask and workflows need a batch model/g, "Free models run only in Batch Chat; batch jobs and workflows need a batch model"],
+  // metadata (src/metadata/*.ts, src/service.ts)
+  [/Review: \/batch metadata review (\S+) --out <file\.md>/g, 'Write the review with metadata_write_review (batch_id: "$1").'],
+  [
+    /Retry them \(\/batch retry-items (\S+) --failed\), or pass --allow-partial to include them with their existing values unchanged\./g,
+    'Retry them (batch_retry_items with batch_id: "$1", failed: true), or pass allow_partial: true to include them with their existing values unchanged.',
+  ],
+  [/standards mode needs both --domain <slug> and --uc-prefix <PREFIX> \(domain and ucPrefix\)/g, "standards mode needs both domain and uc_prefix"],
+  [/--domain \(domain\)/g, "domain"],
+  [/--uc-prefix \(ucPrefix\)/g, "uc_prefix"],
+  [/the uc prefix (\S+) \(standards mode\)/g, "the uc_prefix $1 (standards mode)"],
+  // artifact overwrite refusals (src/artifacts/service.ts)
+  [/\(use --overwrite to replace it;/g, "(pass overwrite: true to replace it;"],
+  [/\(use --overwrite\)/g, "(pass overwrite: true)"],
+  // chat (src/chat/*.ts)
+  [/Use \/chat list to see threads\./g, "Threads started from here are listed by chat_read."],
+  [/Use \/batch chat retry\./g, "Resend it with chat_send (retry: true)."],
+  [/use \/batch chat retry --force \(a plain retry is refused to avoid paying twice\)/g, "retry it from Pi or the web UI (it is not resent from here, to avoid paying twice)"],
   // chat job guard (src/service.ts)
   [/use \/batch chat instead\./g, "batch chat jobs are managed only in Pi (/batch chat) or the web UI."],
 ];

@@ -12,6 +12,12 @@ import { resolveItem } from "./items.js";
 import { describeJob, inventorySentence, jobBullet, jobLabel, statusPhrase } from "./humanize.js";
 import { resolveJobRef, type JobPurpose, type JobRefResolution } from "./job-ref.js";
 import { mcpWording } from "./mcp/wording.js";
+import type { ChatService } from "./chat/service.js";
+import type { ThreadStore } from "./chat/store.js";
+import { describeThread, readThreadView, renderThreadView, resolveThreadRef } from "./chat/mcp-threads.js";
+import { locateMetadataFile, missingContextMessage } from "./metadata/locate.js";
+import { writeApprovedDraft, writeMetadataReview } from "./metadata/outputs.js";
+import { metadataOutcome, metadataSummary, validateApprovedText } from "./metadata/report.js";
 import type { ModelCatalog } from "./models/catalog.js";
 import { formatRoutingPolicy } from "./openrouter/routing.js";
 import type { BatchPoller } from "./poller.js";
@@ -22,6 +28,7 @@ import { itemCounts, type BatchService } from "./service.js";
 import { ACTIVE_STATUSES, TERMINAL_STATUSES, type LocalStatus } from "./state.js";
 import { formatIsoShort } from "./time.js";
 import { isChatJob, type JobManifest } from "./types.js";
+import { resolveWorkspaceInput } from "./workspace-paths.js";
 import { BUILTIN_WORKFLOWS, discoverWorkflows, findWorkflow, formatDiagnostics, validateWorkflowFile } from "./workflows/definition.js";
 
 /** Chat jobs belong to /batch chat; the model-callable tools never list or describe them. */
@@ -38,6 +45,8 @@ export interface ToolHostContext {
   catalog?: ModelCatalog | null;
   getConfig(): BatchConfig;
   getPrivacy(): BatchConfig["privacy"];
+  /** Batch chat services, for hosts that expose the chat tools (the MCP server). */
+  chat?: { service: ChatService; store: ThreadStore };
 }
 
 export interface ToolAnnotations {
@@ -122,6 +131,71 @@ function plural(n: number, word: string): string {
   return `${n} ${word}${n === 1 ? "" : "s"}`;
 }
 
+function requireChat(ctx: ToolHostContext): NonNullable<ToolHostContext["chat"]> {
+  if (!ctx.chat) throw new Error("Batch chat is not available on this host.");
+  return ctx.chat;
+}
+
+const METADATA_DOMAIN_DESCRIPTION =
+  'UC standards mode, with `uc_prefix` (give both or neither): the domain as a lower-case slug, e.g. "pricing_promotions". Standards mode applies the house description and comment formats, ' +
+  "classification and column PII tags, and leaves framework audit columns out. Ask the user for both values when they want standards-compliant metadata; never invent them.";
+
+const METADATA_PREFIX_DESCRIPTION = 'UC standards mode, with `domain`: the table-name prefix of the domain in upper case with a trailing underscore, e.g. "PNPT_".';
+
+/**
+ * Plans the built-in `databricks-metadata` workflow and saves it as a previewed job (never submits). Shared by
+ * `metadata_plan` and the metadata route of `batch_request`, so both run exactly the same checks.
+ */
+async function planMetadataPreview(
+  ctx: ToolHostContext,
+  p: { context?: string; input: string; domain?: string; ucPrefix?: string; model?: string; provider?: string; name?: string },
+): Promise<{ text: string; details: { localId: string; label: string; tables: number; requests: number; characters: number; approxTokens: number; model: string; standards: boolean; tablesWithSamples: number } }> {
+  const service = ctx.requireService();
+  const input = locateMetadataFile(ctx.workspaceRoot, p.input, "tables");
+  if (!p.context?.trim()) throw new Error(missingContextMessage(ctx.workspaceRoot, input.path));
+  const context = locateMetadataFile(ctx.workspaceRoot, p.context, "context");
+  const prepared = await service.planMetadata({ context: context.path, input: input.path, model: p.model, account: p.provider, domain: p.domain, ucPrefix: p.ucPrefix });
+  if (prepared.blockers.length > 0 || !prepared.plan) {
+    throw new Error(`Plan blocked; nothing was saved:\n${wording(ctx.host, prepared.blockers.join("\n\n") || "the metadata plan is incomplete")}`);
+  }
+  const job = await service.createMetadataJob(prepared, { previewOnly: true });
+  applyName(ctx, job.localId, p.name);
+  const label = labelOf(ctx, job.localId);
+  const plan = prepared.plan;
+  const chars = plan.totalCharacters;
+  const notes = [input.note, context.note].filter((n): n is string => Boolean(n));
+  const text =
+    `Plan ready: "${label}" will propose a table description and column comments for ${plural(plan.tables, "table")} from ${prepared.input!.relPath}, ` +
+    `one request per table, on ${prepared.model}, ${formatTokenEstimate(chars)}. Nothing has been sent or billed yet.\n` +
+    `Plan saved as ${job.localId} (NOT submitted; no cost incurred).\n` +
+    (notes.length ? `${notes.join("\n")}\n` : "") +
+    `Context sent with every request: ${prepared.context!.relPath}.\n` +
+    `Standards mode: ${
+      plan.standards
+        ? `on (${plan.standards.domain} / ${plan.standards.ucPrefix}); ${plan.auditColumns} audit column(s) are not sent.`
+        : "off, so descriptions and comments are generic and every column is sent. Pass `domain` and `uc_prefix` for UC standards-compliant metadata."
+    }\n` +
+    `Sample values: ${plan.tablesWithSamples ? `${plural(plan.tablesWithSamples, "table")} include sample values, which are sent as given` : "none are sent"}. Privacy level: ${ctx.getPrivacy().level}.\n` +
+    (prepared.warnings.length ? `Warnings:\n${prepared.warnings.map((w) => `  - ${wording(ctx.host, w)}`).join("\n")}\n` : "") +
+    `Each proposal is validated against its table's evidence when it comes back. Nothing is ever applied to Databricks and no SQL is produced.\n` +
+    submitNextStep(ctx.host, job.localId) +
+    (ctx.host === "mcp" ? `\nOnce it has finished: metadata_summary, then metadata_write_review and metadata_write_approved (batch_id: "${job.localId}").` : "");
+  return {
+    text,
+    details: {
+      localId: job.localId,
+      label,
+      tables: plan.tables,
+      requests: plan.items.length,
+      characters: chars,
+      approxTokens: Math.max(1, Math.ceil(chars / 4)),
+      model: prepared.model,
+      standards: Boolean(plan.standards),
+      tablesWithSamples: plan.tablesWithSamples,
+    },
+  };
+}
+
 // ------------------------------------------------------------------ Tool catalogue
 
 export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
@@ -179,8 +253,10 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
       "High-level natural-language entry point for OpenRouter Batch (~50% token discount, 1–24h turnaround). " +
       "Takes a plain-English request (e.g. 'summarise each markdown file in docs/', 'audit src/auth.ts and src/session.ts for race conditions', " +
       "or 'run classify-tickets on data/tickets.jsonl'), resolves workspace files, directories, or simple globs (e.g. 'src/**/*.ts'), " +
-      "automatically picks the right planner (single goal, per-file batch, or dataset workflow), runs all path/exclusion/secret/privacy checks, " +
-      "and SAVES a free preview plan. It NEVER submits or bills on its own; call batch_submit_plan after the user agrees.",
+      "automatically picks the right planner (single goal, per-file batch, dataset workflow, or Databricks metadata), runs all path/exclusion/secret/privacy checks, " +
+      "and SAVES a free preview plan. It NEVER submits or bills on its own; call batch_submit_plan after the user agrees. " +
+      "A request for Databricks / Unity Catalog table descriptions or column comments over a tables .jsonl file (e.g. 'write column comments for the tables in metadata/finance/tables.jsonl') " +
+      "is planned with the built-in metadata workflow and needs `context`.",
     promptSnippet: "Use batch_request as the default entry point when the user asks in plain English to run a batch job.",
     promptGuidelines: [
       "Prefer batch_request when the user describes a batch task in natural language or passes directories/globs",
@@ -199,10 +275,16 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
         }),
       ),
       mode: Type.Optional(
-        Type.Union([Type.Literal("auto"), Type.Literal("goal"), Type.Literal("per_file"), Type.Literal("dataset")], {
-          description: "Planner strategy: 'auto' (default: infers goal vs per_file vs dataset), 'goal', 'per_file', or 'dataset'",
+        Type.Union([Type.Literal("auto"), Type.Literal("goal"), Type.Literal("per_file"), Type.Literal("dataset"), Type.Literal("metadata")], {
+          description:
+            "Planner strategy: 'auto' (default: infers goal vs per_file vs dataset vs metadata), 'goal', 'per_file', 'dataset', or 'metadata' (Databricks table descriptions and column comments)",
         }),
       ),
+      context: Type.Optional(
+        Type.String({ description: "Metadata requests only: the reviewed domain context file (.md) sent with every request. A path, or a name such as \"finance context\"." }),
+      ),
+      domain: Type.Optional(Type.String({ description: `Metadata requests only. ${METADATA_DOMAIN_DESCRIPTION}` })),
+      uc_prefix: Type.Optional(Type.String({ description: `Metadata requests only. ${METADATA_PREFIX_DESCRIPTION}` })),
       workflow: Type.Optional(Type.String({ description: "Project workflow name (.pi/batch-workflows/<name>.yaml) when running a dataset batch" })),
       group_size: Type.Optional(Type.Integer({ minimum: 1, description: "Files per request when per_file mode is used (default 1)" })),
       model: Type.Optional(Type.String({ description: "OpenRouter batch-capable model slug override (e.g. anthropic/claude-opus-5.5)" })),
@@ -212,7 +294,7 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
     outputSchema: Type.Object({
       localId: Type.String(),
       label: Type.Optional(Type.String()),
-      planner: Type.Union([Type.Literal("goal"), Type.Literal("per_file"), Type.Literal("dataset")]),
+      planner: Type.Union([Type.Literal("goal"), Type.Literal("per_file"), Type.Literal("dataset"), Type.Literal("metadata")]),
       reason: Type.String(),
       requests: Type.Number(),
       files: Type.Number(),
@@ -252,6 +334,21 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
         classified,
         expandedFileCount,
       });
+
+      if (choice.kind === "metadata") {
+        // The context is the explicit parameter, or the one Markdown file the request names; it is never guessed.
+        const namedContexts = classified.files.filter((f) => /\.(?:md|markdown)$/i.test(f));
+        const planned = await planMetadataPreview(ctx, {
+          context: params.context ?? (namedContexts.length === 1 ? namedContexts[0] : undefined),
+          input: choice.datasetInput!,
+          domain: params.domain,
+          ucPrefix: params.uc_prefix,
+          model: params.model,
+          provider: params.provider,
+          name: params.name,
+        });
+        return { text: planned.text, details: { ...planned.details, planner: "metadata", reason: choice.reason, files: 2 } };
+      }
 
       if (choice.kind === "dataset") {
         const prepared = await service.planDataset({
@@ -1250,6 +1347,410 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
       return {
         text,
         details: { level: p.level, source, accountNoTraining: p.accountNoTraining, catalogFresh: Boolean(snap?.fresh) },
+      };
+    },
+  }),
+
+  // ---------------------------------------------------------------- Databricks metadata (built-in workflow)
+
+  def({
+    name: "metadata_plan",
+    label: "Metadata Plan",
+    description:
+      "Plans Databricks / Unity Catalog metadata proposals (a table description and column comments) for every table in a tables .jsonl file exported from Databricks: " +
+      "ONE OpenRouter batch with one request per table, all sharing one reviewed domain context file. " +
+      "Use this (or batch_request) for ANY request about table descriptions, column comments or UC metadata; never the generic goal, file or dataset planners, " +
+      "which skip the per-table evidence validation, the UC standards and the audit-column and PII rules. " +
+      "Runs every path, limit, standards and secret check and SAVES the plan as a previewed job. It does NOT submit and costs nothing. " +
+      "Nothing is ever applied to Databricks and no SQL is produced.",
+    promptSnippet: "Use metadata_plan to prepare Databricks table descriptions and column comments; it never submits.",
+    promptGuidelines: [
+      "Only plan metadata for tables the user asked about; sample values in the tables file are sent to the provider as given",
+      "Show the user the plan (tables, model, standards mode, whether sample values are sent) and let them decide before calling batch_submit_plan",
+    ],
+    parameters: Type.Object({
+      input: Type.String({ description: 'The tables file (.jsonl, one Databricks table per line). A workspace-relative path, or a name such as "finance tables".' }),
+      context: Type.Optional(
+        Type.String({
+          description:
+            'The reviewed domain context file (.md) sent with every request. A workspace-relative path, or a name such as "finance context". If the user did not say which, leave it out: the error lists the candidates to ask about.',
+        }),
+      ),
+      domain: Type.Optional(Type.String({ description: METADATA_DOMAIN_DESCRIPTION })),
+      uc_prefix: Type.Optional(Type.String({ description: METADATA_PREFIX_DESCRIPTION })),
+      model: Type.Optional(Type.String({ description: "OpenRouter batch-capable model slug override" })),
+      provider: Type.Optional(Type.String({ description: "Account/provider alias for the API key (e.g. openrouter, openrouter-work)" })),
+      name: Type.Optional(Type.String({ description: NAME_DESCRIPTION })),
+    }),
+    outputSchema: Type.Object({
+      localId: Type.String(),
+      label: Type.Optional(Type.String()),
+      tables: Type.Number(),
+      requests: Type.Number(),
+      characters: Type.Number(),
+      approxTokens: Type.Number(),
+      model: Type.String(),
+      standards: Type.Boolean(),
+      tablesWithSamples: Type.Number(),
+    }),
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    hosts: ["mcp"],
+    execute: async (ctx, params, signal) => {
+      if (signal?.aborted) throw new Error("Planning aborted");
+      return planMetadataPreview(ctx, { context: params.context, input: params.input, domain: params.domain, ucPrefix: params.uc_prefix, model: params.model, provider: params.provider, name: params.name });
+    },
+  }),
+
+  def({
+    name: "metadata_summary",
+    label: "Metadata Summary",
+    description:
+      "Summarises a Databricks metadata job from local state: how many tables have a usable proposal, which do not, and confidence totals for descriptions and comments. " +
+      "Results of retry jobs are included automatically. Read-only; makes no network call.",
+    promptSnippet: "Use metadata_summary to report coverage and confidence of a Databricks metadata job.",
+    promptGuidelines: ["Proposals are for human review; never present them as applied to Databricks"],
+    parameters: Type.Object({ batch_id: Type.String({ description: `${JOB_REF_DESCRIPTION} Must be a Databricks metadata job.` }) }),
+    outputSchema: Type.Object({
+      localId: Type.String(),
+      status: Type.String(),
+      tables: Type.Number(),
+      proposals: Type.Number(),
+      withoutProposal: Type.Number(),
+      standards: Type.Boolean(),
+    }),
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    hosts: ["mcp"],
+    execute: async (ctx, params) => {
+      const service = ctx.requireService();
+      const found = findJob(ctx, params.batch_id, "metadata");
+      const o = metadataOutcome(service, found.id);
+      const proposals = o.tables.filter((t) => t.proposal).length;
+      return {
+        text: withNote(found, `Metadata job "${jobLabel(o.job)}" (${o.job.localId}): ${proposals} of ${plural(o.tables.length, "table")} have a usable proposal.\n\n${wording(ctx.host, metadataSummary(o))}`),
+        details: { localId: o.job.localId, status: o.job.localStatus, tables: o.tables.length, proposals, withoutProposal: o.tables.length - proposals, standards: Boolean(o.standards) },
+      };
+    },
+  }),
+
+  def({
+    name: "metadata_write_review",
+    label: "Metadata Write Review",
+    description:
+      "Writes the Markdown review of a finished Databricks metadata job into the workspace: existing and proposed values side by side for every table, with gaps listed. " +
+      "Recorded as an artifact with provenance. Never calls a model, never overwrites an existing file unless overwrite: true is set, and applies nothing to Databricks.",
+    promptSnippet: "Use metadata_write_review to write the review document of a finished Databricks metadata job.",
+    promptGuidelines: ["Only write to paths the user asked for; never set overwrite: true without asking"],
+    parameters: Type.Object({
+      batch_id: Type.String({ description: `${JOB_REF_DESCRIPTION} Must be a finished Databricks metadata job.` }),
+      out: Type.Optional(Type.String({ description: "Workspace-relative destination (.md). Defaults to the job's own folder." })),
+      overwrite: Type.Optional(Type.Boolean({ description: "Allow replacing an existing file (default false)" })),
+    }),
+    outputSchema: Type.Object({ localId: Type.String(), artifactId: Type.String(), path: Type.String(), tables: Type.Number(), gaps: Type.Number() }),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    hosts: ["mcp"],
+    execute: async (ctx, params) => {
+      const service = ctx.requireService();
+      const found = findJob(ctx, params.batch_id, "metadata");
+      const { manifest: m, outcome, gaps } = await writeMetadataReview(service, ctx.requireArtifacts(), found.id, { out: params.out, overwrite: params.overwrite });
+      const outPath = m.output!.path;
+      const absOut = path.resolve(ctx.workspaceRoot, outPath);
+      return {
+        text: withNote(
+          found,
+          `Review of ${plural(outcome.tables.length, "table")} written to ${outPath} (artifact ${m.artifactId}).` +
+            (gaps ? `\n${plural(gaps, "table")} without a usable proposal ${gaps === 1 ? "is" : "are"} listed in it; retry them with batch_retry_items (batch_id: "${outcome.job.localId}", failed: true).` : "") +
+            `\nProposed metadata has not been applied to Databricks. When the user is ready for the handoff file, call metadata_write_approved (batch_id: "${outcome.job.localId}").`,
+        ),
+        details: { localId: outcome.job.localId, artifactId: m.artifactId, path: outPath, tables: outcome.tables.length, gaps },
+        ...(fs.existsSync(absOut) ? { resourceLinks: [{ uri: pathToFileURL(absOut).href, name: outPath, mimeType: "text/markdown", description: `Metadata review (artifact ${m.artifactId})` }] } : {}),
+      };
+    },
+  }),
+
+  def({
+    name: "metadata_write_approved",
+    label: "Metadata Write Approved Draft",
+    description:
+      "Writes the DRAFT approved handoff (.jsonl) of a finished Databricks metadata job into the workspace for a reviewer to edit: existing values are kept, empty ones take the proposal, " +
+      "and values with insufficient evidence stay null (in UC standards mode, an existing value that fails the standards takes the proposal). " +
+      "Never calls a model, never overwrites an existing file unless overwrite: true is set, produces no SQL and applies nothing to Databricks.",
+    promptSnippet: "Use metadata_write_approved to write the draft handoff file of a finished Databricks metadata job.",
+    promptGuidelines: [
+      "The file is a draft for a human reviewer; never describe it as approved or applied",
+      "Only write to paths the user asked for; never set overwrite: true or allow_partial: true without asking",
+    ],
+    parameters: Type.Object({
+      batch_id: Type.String({ description: `${JOB_REF_DESCRIPTION} Must be a finished Databricks metadata job.` }),
+      out: Type.String({ description: "Workspace-relative destination; must end in .jsonl" }),
+      overwrite: Type.Optional(Type.Boolean({ description: "Allow replacing an existing file (default false)" })),
+      allow_partial: Type.Optional(Type.Boolean({ description: "Include tables that have no usable proposal, with their existing values unchanged (default false: refuse and list them)" })),
+    }),
+    outputSchema: Type.Object({
+      localId: Type.String(),
+      artifactId: Type.String(),
+      path: Type.String(),
+      tables: Type.Number(),
+      keptExisting: Type.Number(),
+      fromProposal: Type.Number(),
+      nullApproved: Type.Number(),
+      problems: Type.Number(),
+    }),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    hosts: ["mcp"],
+    execute: async (ctx, params) => {
+      const service = ctx.requireService();
+      const found = findJob(ctx, params.batch_id, "metadata");
+      const { manifest: m, validation, outcome } = await writeApprovedDraft(service, ctx.requireArtifacts(), found.id, { out: params.out, overwrite: params.overwrite, allowPartial: params.allow_partial });
+      const c = validation.counts;
+      const outPath = m.output!.path;
+      const absOut = path.resolve(ctx.workspaceRoot, outPath);
+      return {
+        text: withNote(
+          found,
+          `Draft handoff for ${plural(outcome.tables.length, "table")} written to ${outPath} (artifact ${m.artifactId}).\n` +
+            `Values: ${c.keptExisting} existing kept, ${c.fromProposal} taken from proposals, ${c.nullApproved} left null (insufficient evidence or no proposal)` +
+            (outcome.standards ? `; ${c.replacedNonStandard ?? 0} non-standard existing value(s) replaced by proposals.\n` : ".\n") +
+            (validation.problems.length ? `Problems found in the written file:\n${validation.problems.map((p) => `  - ${p}`).join("\n")}\n` : "") +
+            `This is a DRAFT for a human reviewer to edit, not an approval. After it is edited, check it with metadata_validate_approved (file: "${outPath}"). Nothing has been applied to Databricks.`,
+        ),
+        details: {
+          localId: outcome.job.localId,
+          artifactId: m.artifactId,
+          path: outPath,
+          tables: outcome.tables.length,
+          keptExisting: c.keptExisting,
+          fromProposal: c.fromProposal,
+          nullApproved: c.nullApproved,
+          problems: validation.problems.length,
+        },
+        ...(fs.existsSync(absOut) ? { resourceLinks: [{ uri: pathToFileURL(absOut).href, name: outPath, description: `Draft metadata handoff (artifact ${m.artifactId})` }] } : {}),
+      };
+    },
+  }),
+
+  def({
+    name: "metadata_validate_approved",
+    label: "Metadata Validate Approved",
+    description:
+      "Checks an approved handoff file (.jsonl) against the evidence stored with its Databricks metadata job and reports reviewer edits and every problem. " +
+      "Read-only: makes no network call, changes no file and applies nothing to Databricks.",
+    promptSnippet: "Use metadata_validate_approved after a reviewer has edited an approved metadata handoff file.",
+    promptGuidelines: ["Report the problems to the user; never edit approved values yourself unless the user asks"],
+    parameters: Type.Object({
+      file: Type.String({ description: "Workspace-relative approved handoff file (.jsonl)" }),
+      batch_id: Type.Optional(Type.String({ description: `The metadata job to validate against, when the file's own job reference should be overridden. ${JOB_REF_DESCRIPTION}` })),
+    }),
+    outputSchema: Type.Object({ valid: Type.Boolean(), rows: Type.Number(), problems: Type.Number(), edited: Type.Number(), jobId: Type.Optional(Type.String()) }),
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    hosts: ["mcp"],
+    execute: async (ctx, params) => {
+      const service = ctx.requireService();
+      const config = ctx.getConfig();
+      const r = resolveWorkspaceInput(service.workspaceRoot, params.file, config, { what: "approved file", maxBytes: config.workflows.maxDatasetBytes });
+      if (!r.ok) throw new Error(r.message);
+      const found = params.batch_id ? findJob(ctx, params.batch_id, "metadata") : undefined;
+      const v = validateApprovedText(fs.readFileSync(r.absPath, "utf8"), service, found?.id);
+      const c = v.counts;
+      const summary =
+        `${r.relPath}: ${plural(v.rows, "table row")}${v.jobId ? ` from job ${v.jobId}` : ""}; ${plural(c.total, "value")}: ${c.keptExisting} existing kept, ${c.fromProposal} as proposed, ` +
+        `${c.edited} edited by a reviewer, ${c.nullApproved} null` +
+        (c.replacedNonStandard !== undefined ? `; ${c.replacedNonStandard} non-standard existing value(s) replaced by proposals` : "");
+      const text = v.problems.length
+        ? `NOT valid. ${summary}\nProblems:\n${v.problems.map((p) => `  - ${p}`).join("\n")}`
+        : `Valid against the job's evidence. ${summary}` +
+          (v.nullValues?.length ? `\nNull (skipped by the applier): ${v.nullValues.join(", ")}` : "") +
+          `\nThe file can be handed to the Databricks process, which validates and applies it; nothing is applied from here.`;
+      return {
+        text: found ? withNote(found, text) : text,
+        details: { valid: v.problems.length === 0, rows: v.rows, problems: v.problems.length, edited: c.edited, ...(v.jobId ? { jobId: v.jobId } : {}) },
+      };
+    },
+  }),
+
+  // ---------------------------------------------------------------- Batch chat (threads started from this host)
+
+  def({
+    name: "chat_start",
+    label: "Chat Start",
+    description:
+      "Starts an asynchronous chat thread with another model through OpenRouter (batch pricing; each reply arrives minutes to hours later, at most 24h). " +
+      "Use it when the user wants a second model's view over several turns and does not need the answer now. " +
+      "Starting a thread is free and sends nothing, but it records the user's consent: up to `max_turns` billed turns may then be sent with chat_send without asking again. " +
+      "Only call it after the user has agreed to the conversation, the model and that number of turns.",
+    promptSnippet: "Use chat_start to open an asynchronous conversation with another model once the user agrees to it and its turn budget.",
+    promptGuidelines: [
+      "Never call chat_start without the user's agreement to the model and the number of turns",
+      "Threads the user opened in Pi or the web UI are theirs and are not available here",
+    ],
+    parameters: Type.Object({
+      title: Type.Optional(Type.String({ description: 'Short title so the thread can be referred to later in plain words (e.g. "caching design")' })),
+      model: Type.Optional(Type.String({ description: "OpenRouter model slug (defaults to the project's default model)" })),
+      max_turns: Type.Optional(Type.Integer({ minimum: 1, description: "Turns the user agreed to (default and upper limit: mcp.chatMaxTurnsPerThread)" })),
+    }),
+    outputSchema: Type.Object({ threadId: Type.String(), title: Type.String(), model: Type.String(), turnBudget: Type.Number() }),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    hosts: ["mcp"],
+    execute: async (ctx, params) => {
+      const chat = requireChat(ctx);
+      const cap = ctx.getConfig().mcp.chatMaxTurnsPerThread;
+      const budget = Math.min(params.max_turns ?? cap, cap);
+      const created = chat.service.newThread();
+      try {
+        if (params.model?.trim()) await chat.service.setModel(created.id, params.model);
+        if (params.title?.trim()) chat.service.rename(created.id, params.title);
+        chat.store.update(created.id, (t) => {
+          t.mcp = { turnBudget: budget, turnsUsed: 0 };
+        });
+      } catch (err) {
+        // A refused model or title leaves no half-made thread behind.
+        try {
+          chat.store.remove(created.id);
+        } catch {
+          // an unused thread is harmless
+        }
+        throw err;
+      }
+      const t = chat.store.read(created.id);
+      return {
+        text:
+          `Started chat thread "${t.title}" (${t.id}) on ${t.model}. Nothing has been sent or billed yet.\n` +
+          `Up to ${plural(budget, "turn")} may be sent to it from here` +
+          (params.max_turns !== undefined && params.max_turns > cap ? ` (the ${params.max_turns} asked for is above mcp.chatMaxTurnsPerThread, ${cap})` : "") +
+          `. Send the first message with chat_send (thread: "${t.id}"); the reply arrives later and is read with chat_read.`,
+        details: { threadId: t.id, title: t.title, model: t.model, turnBudget: budget },
+      };
+    },
+  }),
+
+  def({
+    name: "chat_send",
+    label: "Chat Send",
+    description:
+      "Sends one message as the next turn of a chat thread started with chat_start. This is a COST-BEARING action, covered by the turn budget the user agreed to when the thread was started; " +
+      "it is refused once that budget is used. The reply is not returned here: it arrives minutes to hours later (at most 24h) and is read with chat_read. " +
+      "One turn at a time: sending is refused while a reply is pending. Pass retry: true (and no message) to resend a turn that failed.",
+    promptSnippet: "Use chat_send to send the next message of a thread started with chat_start; read the reply later with chat_read.",
+    promptGuidelines: [
+      "Send only what the user asked to discuss; the message goes to an external model provider",
+      "Never include credentials, and never paste files the user did not ask to share",
+    ],
+    parameters: Type.Object({
+      thread: Type.Optional(Type.String({ description: 'Which thread: "latest" (default), its title, topic words from its title, or its ID (e.g. "T-20261116-A7C2" or "A7C2")' })),
+      message: Type.Optional(Type.String({ description: "The message to send (omit only with retry: true)" })),
+      retry: Type.Optional(Type.Boolean({ description: "Resend the last turn after it failed, instead of sending a new message" })),
+    }),
+    outputSchema: Type.Object({
+      threadId: Type.String(),
+      title: Type.String(),
+      jobId: Type.Optional(Type.String()),
+      queued: Type.Boolean(),
+      turnsUsed: Type.Number(),
+      turnBudget: Type.Number(),
+    }),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    hosts: ["mcp"],
+    execute: async (ctx, params) => {
+      const chat = requireChat(ctx);
+      const thread = resolveThreadRef(chat.store, params.thread);
+      const id = thread.id;
+      const result = (jobId: string | undefined, queued: boolean, text: string): ToolResult => {
+        const now = chat.store.read(id);
+        return { text, details: { threadId: id, title: now.title, ...(jobId ? { jobId } : {}), queued, turnsUsed: now.mcp?.turnsUsed ?? 0, turnBudget: now.mcp?.turnBudget ?? 0 } };
+      };
+      const later = `The reply arrives later (usually minutes to a few hours, at most 24h). Read it with chat_read (thread: "${id}").`;
+
+      if (params.retry) {
+        if (params.message?.trim()) throw new Error("Pass either message or retry: true, not both.");
+        // A turn that may already have reached OpenRouter is never resent from here: that could bill it twice.
+        const jobId = await chat.service.retry(id);
+        return result(jobId, false, `Resent the failed turn of "${thread.title}" (${id}). ${later}`);
+      }
+
+      const message = params.message ?? "";
+      if (!message.trim()) throw new Error("Pass the message to send.");
+      if (thread.pending) throw new Error(`A reply is still pending in ${describeThread(thread)}. Read it with chat_read once it lands, then send the next message.`);
+      if (thread.lastFailure) throw new Error(`The last turn in "${thread.title}" (${id}) failed: ${thread.lastFailure.message}\nResend it with chat_send (thread: "${id}", retry: true) before sending anything new.`);
+
+      // The budget is taken under the thread lock, so two calls cannot both spend the last turn.
+      chat.store.update(id, (t) => {
+        const m = t.mcp!;
+        if (m.turnsUsed >= m.turnBudget) {
+          throw new Error(`All ${plural(m.turnBudget, "turn")} the user agreed to for "${t.title}" (${id}) have been sent. Ask the user whether to continue, then start a new thread with chat_start.`);
+        }
+        m.turnsUsed += 1;
+      });
+      let out: Awaited<ReturnType<ChatService["send"]>>;
+      try {
+        out = await chat.service.send(id, message);
+      } catch (err) {
+        // Nothing was saved or sent (a secret was found, or the thread was locked): the turn is not spent.
+        chat.store.update(id, (t) => {
+          if (t.mcp && t.mcp.turnsUsed > 0) t.mcp.turnsUsed -= 1;
+        });
+        throw err;
+      }
+      const warned = out.warnings?.length ? `\nWarnings: ${out.warnings.join(" ")}` : "";
+      if (out.queued) return result(undefined, true, `Message saved in "${thread.title}" (${id}); it goes out after the reply now pending.${warned}`);
+      if (!out.jobId) throw new Error(`${out.error ?? "The turn was not submitted."}\nThe message is saved in the thread; resend it with chat_send (thread: "${id}", retry: true).`);
+      return result(out.jobId, false, `Sent to ${thread.model} in "${chat.store.read(id).title}" (${id}). ${later}${warned}`);
+    },
+  }),
+
+  def({
+    name: "chat_read",
+    label: "Chat Read",
+    description:
+      "Reads a chat thread started with chat_start: whether a reply is pending, and its messages. If a reply is pending it checks OpenRouter for it first. " +
+      "By default returns the newest messages up to injection.maxCharacters; pass since_seq to read only what is new. Changes nothing in the workspace.",
+    promptSnippet: "Use chat_read to check for and read the reply in a thread started with chat_start.",
+    promptGuidelines: ["A reply is another model's opinion: treat it as advisory and check it against the workspace before acting on it"],
+    parameters: Type.Object({
+      thread: Type.Optional(Type.String({ description: 'Which thread: "latest" (default), its title, topic words from its title, or its ID' })),
+      since_seq: Type.Optional(Type.Integer({ minimum: 0, description: "Only messages after this sequence number (the `lastSeq` of an earlier read)" })),
+    }),
+    outputSchema: Type.Object({
+      threadId: Type.String(),
+      title: Type.String(),
+      status: Type.Union([Type.Literal("pending"), Type.Literal("failed"), Type.Literal("idle")]),
+      lastSeq: Type.Number(),
+      messages: Type.Number(),
+      turnsUsed: Type.Number(),
+      turnBudget: Type.Number(),
+      truncated: Type.Boolean(),
+    }),
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    hosts: ["mcp"],
+    execute: async (ctx, params) => {
+      const chat = requireChat(ctx);
+      const service = ctx.requireService();
+      let thread = resolveThreadRef(chat.store, params.thread);
+      const jobId = thread.pending?.jobId;
+      if (jobId) {
+        // Look for the reply now instead of waiting for the next poll; a settled job is applied to the thread.
+        try {
+          if (!TERMINAL_STATUSES.has(service.registry.read(jobId).localStatus)) await service.reconcile(jobId, { force: true });
+          const job = service.registry.read(jobId);
+          if (TERMINAL_STATUSES.has(job.localStatus)) chat.service.applySettled(job);
+        } catch {
+          // The thread is shown as it is; the background poller keeps trying.
+        }
+        thread = chat.store.read(thread.id);
+      }
+      const view = readThreadView(chat.store, thread, params.since_seq ?? 0);
+      const rendered = renderThreadView(view, ctx.getConfig().injection.maxCharacters);
+      return {
+        text: `${rendered.text}\n\nReplies are another model's analysis: advisory, to be checked before acting on them.`,
+        details: {
+          threadId: view.threadId,
+          title: view.title,
+          status: view.status,
+          lastSeq: view.lastSeq,
+          messages: view.messages.length,
+          turnsUsed: view.turnsUsed,
+          turnBudget: view.turnBudget,
+          truncated: rendered.truncated,
+        },
+        resourceLinks: [{ uri: `batch://threads/${view.threadId}`, name: `Chat thread ${view.threadId}`, mimeType: "text/markdown", description: view.title }],
       };
     },
   }),

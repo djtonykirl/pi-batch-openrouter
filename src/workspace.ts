@@ -5,6 +5,7 @@ import { ArtifactService } from "./artifacts/service.js";
 import { ArtifactStore } from "./artifacts/store.js";
 import { ChatService } from "./chat/service.js";
 import { ThreadStore } from "./chat/store.js";
+import type { ThreadState } from "./chat/types.js";
 import { loadConfig, readPrivacyConfig, type BatchConfig, type LoadedConfig } from "./config.js";
 import { FileLogger, type Logger } from "./logger.js";
 import { fetchCatalogData, ModelCatalog, type CatalogData } from "./models/catalog.js";
@@ -74,6 +75,11 @@ export interface WorkspaceServicesOptions {
   onBadge?: (text: string | undefined) => void;
   /** Called after each poller tick (after the chat tick). */
   onTick?: () => void;
+  /**
+   * Whether this host may send a thread's queued chat messages on its own (see `ChatServiceDeps.maySendQueued`).
+   * Read with the current config on every decision. Defaults to always.
+   */
+  maySendQueuedChat?: (thread: ThreadState, config: BatchConfig) => boolean;
 }
 
 export interface WorkspaceServices {
@@ -145,6 +151,7 @@ export function createWorkspaceServices(workspaceRoot: string, opts: WorkspaceSe
     workspaceRoot,
     getConfig: () => loaded.config,
     getPrivacy,
+    ...(opts.maySendQueuedChat ? { maySendQueued: (thread: ThreadState) => opts.maySendQueuedChat!(thread, loaded.config) } : {}),
     logger,
   });
   const poller = new BatchPoller(

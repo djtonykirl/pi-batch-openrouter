@@ -4,7 +4,9 @@ description: >-
   Use this skill when the user wants to run a non-urgent or token-heavy code review, multi-file audit,
   or CSV/JSONL dataset job via the OpenRouter Batch API (~50% cheaper), check whether a batch job has
   finished, read results from a batch job by name or description, retry failed items, synthesise
-  multi-file results, or export batch reports to Markdown/HTML/PDF/CSV/JSONL.
+  multi-file results, export batch reports to Markdown/HTML/PDF/CSV/JSONL, generate Databricks / Unity
+  Catalog table descriptions and column comments from a tables file, or hold an asynchronous multi-turn
+  chat with another model.
 ---
 
 # Natural-Language OpenRouter Batch (`pi-batch` MCP)
@@ -27,6 +29,8 @@ Use the `pi-batch` MCP server to offload heavy analysis to OpenRouter Batch (~50
 - **Single deep audit across files:** `batch_plan_goal({ name, prompt, files })` → confirm → `batch_submit_plan({ batch_id: "latest" })`
 - **Per-file sweep across many files:** `batch_plan_files({ name, prompt, files })` → confirm → `batch_submit_plan({ batch_id: "latest" })`
 - **Dataset run:** `batch_plan_dataset({ name, workflow, input })` → confirm → `batch_submit_plan({ batch_id: "latest" })`
+- **Databricks / Unity Catalog table descriptions and column comments:** `metadata_plan({ name, input, context, domain?, uc_prefix? })` → confirm → `batch_submit_plan({ batch_id: "latest" })` → once finished `metadata_summary`, `metadata_write_review`, `metadata_write_approved({ batch_id: "latest", out: "….jsonl" })`, and `metadata_validate_approved({ file })` after a reviewer edits it. Never use the generic planners for this; nothing is applied to Databricks.
+- **Multi-turn chat with another model (answers arrive later):** agree model and turns with the user → `chat_start({ title, model, max_turns })` → `chat_send({ thread: "latest", message })` → later `chat_read({ thread: "latest" })`; a failed turn: `chat_send({ thread, retry: true })`
 - **Check progress:** `batch_check_jobs({})` (or `batch_check_jobs({ batch_id: "the security audit" })`)
 - **Read findings:** `batch_read_result({ batch_id: "latest", mode: "summary" })` (or `mode: "item", item: "auth.ts"`, or `mode: "synthesis"`)
 - **Retry failed items + synthesise:** `batch_retry_items({ batch_id: "latest", failed: true })` → confirm & submit → `batch_plan_synthesis({ batch_id: "<parent job>" })` → confirm & submit

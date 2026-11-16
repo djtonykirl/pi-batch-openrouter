@@ -12,7 +12,10 @@ export interface InitOptions {
 
 export interface InitResult {
   written: string[];
+  /** Files left as they were because they already exist (includes every `outdated` file). */
   skipped: string[];
+  /** Skipped files whose content differs from the packaged version: an older install, or one edited locally. */
+  outdated: string[];
 }
 
 function packageRoot(): string {
@@ -29,11 +32,18 @@ function packageRoot(): string {
 
 function copyTemplate(pkgRoot: string, templateRel: string, destAbs: string, workspaceRoot: string, overwrite: boolean, result: InitResult): void {
   const relOut = path.relative(workspaceRoot, destAbs).replace(/\\/g, "/");
+  const srcAbs = path.join(pkgRoot, templateRel);
   if (fs.existsSync(destAbs) && !overwrite) {
     result.skipped.push(relOut);
+    // Line endings are ignored: a checkout may have converted them.
+    const norm = (file: string) => fs.readFileSync(file, "utf8").replace(/\r\n/g, "\n");
+    try {
+      if (norm(destAbs) !== norm(srcAbs)) result.outdated.push(relOut);
+    } catch {
+      // unreadable: reported as skipped only
+    }
     return;
   }
-  const srcAbs = path.join(pkgRoot, templateRel);
   fs.mkdirSync(path.dirname(destAbs), { recursive: true });
   fs.copyFileSync(srcAbs, destAbs);
   result.written.push(relOut);
@@ -48,7 +58,7 @@ export function initAgentInstructions(opts: InitOptions): InitResult {
   const client = opts.client ?? "all";
   const overwrite = Boolean(opts.overwrite);
   const pkgRoot = packageRoot();
-  const result: InitResult = { written: [], skipped: [] };
+  const result: InitResult = { written: [], skipped: [], outdated: [] };
 
   if (client === "vscode" || client === "all") {
     copyTemplate(

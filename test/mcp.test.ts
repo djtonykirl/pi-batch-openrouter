@@ -351,7 +351,7 @@ test("MCP roots/list fallback resolves workspace when --cwd is omitted, and prom
       assert.equal(path.resolve(m.server.workspaceRoot), path.resolve(root));
 
       const prompts = await m.client.listPrompts();
-      assert.deepEqual(prompts.prompts.map((p) => p.name).sort(), ["bring-result", "review-files", "status"]);
+      assert.deepEqual(prompts.prompts.map((p) => p.name).sort(), ["bring-result", "metadata", "review-files", "status"]);
       const p = await m.client.getPrompt({ name: "review-files", arguments: { objective: "find bugs", files: "src/index.ts" } });
       assert.match((p.messages[0]!.content as { text: string }).text, /batch_plan_files/);
     } finally {

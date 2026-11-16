@@ -9,7 +9,8 @@ import { resolveJobRef } from "../job-ref.js";
 import { itemCounts } from "../service.js";
 import { formatIsoShort } from "../time.js";
 import { TOOL_SPECS, visibleToModel, type ToolHostContext } from "../tools.js";
-import { isChatJob, type JobManifest } from "../types.js";
+import { isChatJob, isMetadataWorkflow, type JobManifest } from "../types.js";
+import { describeThread, mcpThreads, readThreadView, renderThreadView, resolveThreadRef } from "../chat/mcp-threads.js";
 import { createWorkspaceServices, type WorkspaceServices, type WorkspaceServicesOptions } from "../workspace.js";
 import { mcpWording } from "./wording.js";
 
@@ -66,7 +67,11 @@ export class BatchMcpServer {
           "Every tool that accepts `batch_id` or `job_id` accepts natural references such as \"latest\", \"the latest finished job\", \"yesterday's review\", a job's `name`, or a topic phrase. " +
           "Use `batch_request` as the high-level entry point for any plain-English batch request (it resolves files, directories, and globs and automatically chooses between single goal, per-file batch, or dataset workflow), or call `batch_plan_goal`, `batch_plan_files`, or `batch_plan_dataset` directly. " +
           "Always plan first (free, read-only), summarise the plan in plain words (what will be sent, how many requests, which model), and call `batch_submit_plan` only after the user agrees. " +
-          "Never apply batch results to workspace files without the user asking.",
+          "Never apply batch results to workspace files without the user asking. " +
+          "For Databricks or Unity Catalog table descriptions and column comments, always use `metadata_plan` (or `batch_request`, which routes such requests to it), never `batch_plan_goal`, `batch_plan_files` or `batch_plan_dataset`: " +
+          "only the metadata workflow validates each proposal against its table's evidence. After the job finishes use `metadata_summary`, `metadata_write_review` and `metadata_write_approved`; nothing is ever applied to Databricks. " +
+          "For a multi-turn conversation with another model whose answers can wait, use `chat_start` (only after the user agrees to the model and a number of turns), then `chat_send` and `chat_read`; " +
+          "replies arrive later, so tell the user and check back with `chat_read` instead of waiting.",
       },
     );
 
@@ -95,8 +100,13 @@ export class BatchMcpServer {
       onSettled: (job) => {
         if (!isChatJob(job)) {
           this.notifyJobUpdated(job.localId);
+        } else if (job.chat) {
+          this.notifyThreadUpdated(job.chat.threadId);
         }
       },
+      // This process applies replies for every thread, but on its own it sends only for threads started here with an
+      // agreed budget (chat_start); the user's Pi and web threads wait for a Pi or web process unless configured.
+      maySendQueuedChat: (thread, config) => config.mcp.sendQueuedChat || thread.mcp !== undefined,
     });
   }
 
@@ -154,6 +164,7 @@ export class BatchMcpServer {
       catalog: this.ws.catalog,
       getConfig: () => this.ws.getConfig(),
       getPrivacy: () => this.ws.service.privacyConfig(),
+      chat: { service: this.ws.chat, store: this.ws.chatStore },
     };
   }
 
@@ -182,6 +193,20 @@ export class BatchMcpServer {
       if (this.subscriptions.size === 0 || this.subscriptions.has(uri)) {
         void this.mcp.server.sendResourceUpdated({ uri }).catch(() => {});
       }
+    }
+  }
+
+  /** A reply (or a failure) landed in a chat thread. Only threads started from this server are announced. */
+  private notifyThreadUpdated(threadId: string): void {
+    if (!this.mcp.isConnected()) return;
+    try {
+      if (this.ws.chatStore.read(threadId).mcp === undefined) return;
+    } catch {
+      return;
+    }
+    const uri = `batch://threads/${threadId}`;
+    if (this.subscriptions.size === 0 || this.subscriptions.has(uri)) {
+      void this.mcp.server.sendResourceUpdated({ uri }).catch(() => {});
     }
   }
 
@@ -217,6 +242,10 @@ export class BatchMcpServer {
               const gate = this.checkSubmitElicitation(args as { batch_id: string }, reqCtx);
               if (gate) return gate;
             }
+            if (spec.name === "chat_start" && this.opts.elicitSubmitConfirmation !== false) {
+              const gate = this.checkChatStartElicitation(args as { title?: string; model?: string; max_turns?: number }, reqCtx);
+              if (gate) return gate;
+            }
 
             const res = await spec.execute(this.hostContext(), args, reqCtx.mcpReq.signal);
             const content: CallToolResult["content"] = [{ type: "text", text: res.text }];
@@ -233,6 +262,7 @@ export class BatchMcpServer {
               spec.name === "batch_request" ||
               spec.name === "batch_submit_plan" ||
               spec.name.startsWith("batch_plan_") ||
+              spec.name === "metadata_plan" ||
               spec.name === "batch_retry_items" ||
               spec.name === "batch_cancel"
             ) {
@@ -263,31 +293,55 @@ export class BatchMcpServer {
     const { id, job } = resolveJobRef(service.registry, args.batch_id, { purpose: "submit" });
     if (job.localStatus !== "previewed") return undefined; // service.submit will report the status error
 
-    const responses = (reqCtx.mcpReq as { inputResponses?: Record<string, unknown> }).inputResponses;
-    if (responses && Object.prototype.hasOwnProperty.call(responses, "confirm")) {
-      const accepted = acceptedContent(responses, "confirm", CONFIRM_SUBMIT_SCHEMA);
-      if (accepted?.confirm === true) return undefined;
-      return {
-        isError: true,
-        content: [{ type: "text", text: `Submission of "${jobLabel(job)}" (${id}) was cancelled by the user (nothing was sent to OpenRouter).` }],
-      };
-    }
-
     const privacy = service.privacyConfig().level;
+    // A metadata plan sends table evidence, and possibly sample values: the user confirms knowing that.
+    const w = isMetadataWorkflow(job.workflow) ? job.workflow : undefined;
     const summary =
       `Submit batch plan "${jobLabel(job)}" (${job.localId}) to OpenRouter? (Cost-bearing)\n` +
       `• Model: ${job.model}\n` +
       `• Requests: ${job.requestCount}\n` +
       `• Characters: ${job.context.characters}\n` +
       `• Privacy level: ${privacy}\n` +
+      (w
+        ? `• Databricks metadata: ${w.input.tables} table(s) from ${w.input.path}, context ${w.context.path}\n` +
+          `• UC standards mode: ${w.standards ? `${w.standards.domain} / ${w.standards.ucPrefix}` : "off"}\n` +
+          `• Sample values: ${w.input.tablesWithSamples ? `sent as given for ${w.input.tablesWithSamples} table(s)` : "none sent"}\n`
+        : "") +
       `• Objective: ${job.objective.replace(/\s+/g, " ").slice(0, 140)}`;
 
+    return this.confirmByElicitation(reqCtx, summary, `Submission of "${jobLabel(job)}" (${id}) was cancelled by the user (nothing was sent to OpenRouter).`);
+  }
+
+  /**
+   * `chat_start` records consent to a number of billed turns, so a client that can ask the user is made to: the
+   * thread is created only after they accept the model and the turn budget.
+   */
+  private checkChatStartElicitation(args: { title?: string; model?: string; max_turns?: number }, reqCtx: ServerContext): ReturnType<typeof inputRequired> | CallToolResult | undefined {
+    const caps = this.mcp.server.getClientCapabilities();
+    if (!caps?.elicitation) return undefined;
+    const config = this.ws.getConfig();
+    const cap = config.mcp.chatMaxTurnsPerThread;
+    const turns = Math.min(typeof args.max_turns === "number" && args.max_turns >= 1 ? args.max_turns : cap, cap);
+    const summary =
+      `Start a batch chat thread${args.title?.trim() ? ` "${args.title.trim().slice(0, 80)}"` : ""} with another model through OpenRouter?\n` +
+      `• Model: ${args.model?.trim() || config.defaultModel}\n` +
+      `• Up to ${turns} turn(s) may be sent without asking again; each is billed by OpenRouter\n` +
+      `• Privacy level: ${this.ws.service.privacyConfig().level}\n` +
+      `• Replies arrive asynchronously (minutes to 24h)`;
+    return this.confirmByElicitation(reqCtx, summary, "Starting the chat thread was cancelled by the user (nothing was created or sent).");
+  }
+
+  /** Undefined once the user has accepted; otherwise the elicitation request, or the cancellation result. */
+  private confirmByElicitation(reqCtx: ServerContext, message: string, cancelled: string): ReturnType<typeof inputRequired> | CallToolResult | undefined {
+    const responses = (reqCtx.mcpReq as { inputResponses?: Record<string, unknown> }).inputResponses;
+    if (responses && Object.prototype.hasOwnProperty.call(responses, "confirm")) {
+      const accepted = acceptedContent(responses, "confirm", CONFIRM_SUBMIT_SCHEMA);
+      if (accepted?.confirm === true) return undefined;
+      return { isError: true, content: [{ type: "text", text: cancelled }] };
+    }
     return inputRequired({
       inputRequests: {
-        confirm: inputRequired.elicit({
-          message: summary,
-          requestedSchema: CONFIRM_SUBMIT_SCHEMA,
-        }),
+        confirm: inputRequired.elicit({ message, requestedSchema: CONFIRM_SUBMIT_SCHEMA }),
       },
     });
   }
@@ -416,6 +470,40 @@ export class BatchMcpServer {
         };
       },
     );
+
+    this.mcp.registerResource(
+      "batch-chat-thread",
+      new ResourceTemplate("batch://threads/{id}", {
+        list: async () => ({
+          resources: mcpThreads(this.ws.chatStore)
+            .slice(0, 50)
+            .map((t) => ({
+              uri: `batch://threads/${t.id}`,
+              name: describeThread(t),
+              description: `Chat thread on ${t.model}`,
+              mimeType: "text/markdown",
+            })),
+        }),
+        complete: {
+          id: (prefix) =>
+            mcpThreads(this.ws.chatStore)
+              .map((t) => t.id)
+              .filter((id) => id.toLowerCase().includes(prefix.toLowerCase())),
+        },
+      }),
+      {
+        title: "Batch Chat Thread",
+        description: "Messages and reply status of a chat thread started with chat_start. Threads opened in Pi or the web UI are not listed.",
+        mimeType: "text/markdown",
+      },
+      async (uri, vars) => {
+        const thread = resolveThreadRef(this.ws.chatStore, String(vars.id ?? ""));
+        const view = readThreadView(this.ws.chatStore, thread);
+        return {
+          contents: [{ uri: uri.href, mimeType: "text/markdown", text: renderThreadView(view, this.ws.getConfig().injection.maxCharacters).text }],
+        };
+      },
+    );
   }
 
   private jobSummaryObject(j: JobManifest): Record<string, unknown> {
@@ -445,6 +533,17 @@ export class BatchMcpServer {
       ...this.jobSummaryObject(j),
       providerBatchId: j.providerBatchId ?? null,
       workflow: j.workflow?.name ?? null,
+      ...(isMetadataWorkflow(j.workflow)
+        ? {
+            metadata: {
+              tables: j.workflow.input.tables,
+              tablesWithSamples: j.workflow.input.tablesWithSamples,
+              input: j.workflow.input.path,
+              context: j.workflow.context.path,
+              standards: j.workflow.standards ?? null,
+            },
+          }
+        : {}),
       privacy: j.privacy ?? null,
       context: j.context,
       usage: j.usage ?? null,
@@ -494,6 +593,41 @@ export class BatchMcpServer {
                 `1. Resolve the concrete workspace-relative file list and call batch_plan_files (this saves a preview and costs nothing).\n` +
                 `2. Show me the saved job ID, request count, model, total characters, and any excluded files or warnings.\n` +
                 `3. Ask for my confirmation before calling batch_submit_plan.`,
+            },
+          },
+        ],
+      }),
+    );
+
+    this.mcp.registerPrompt(
+      "metadata",
+      {
+        title: "Batch Databricks Metadata",
+        description: "Plan Databricks / Unity Catalog table descriptions and column comments for a tables file, show the plan, and wait for confirmation before submitting.",
+        argsSchema: fromJsonSchema<{ tables: string; context?: string; domain?: string; uc_prefix?: string }>(
+          Type.Object({
+            tables: Type.String({ description: 'The tables file (.jsonl exported from Databricks), as a path or a name such as "finance tables"' }),
+            context: Type.Optional(Type.String({ description: "The reviewed domain context file (.md), as a path or a name" })),
+            domain: Type.Optional(Type.String({ description: "UC standards mode: domain slug (give together with uc_prefix)" })),
+            uc_prefix: Type.Optional(Type.String({ description: "UC standards mode: table prefix such as PNPT_ (give together with domain)" })),
+          }) as unknown as JsonSchemaType,
+        ),
+      },
+      async ({ tables, context, domain, uc_prefix }) => ({
+        messages: [
+          {
+            role: "user",
+            content: {
+              type: "text",
+              text:
+                `Plan Databricks metadata proposals (a table description and column comments per table) for the tables in: ${tables}\n` +
+                (context ? `Domain context file: ${context}\n` : "") +
+                (domain || uc_prefix ? `UC standards mode: domain ${domain ?? "(ask me)"}, prefix ${uc_prefix ?? "(ask me)"}\n` : "") +
+                `\nSteps:\n` +
+                `1. Call metadata_plan (this saves a preview and costs nothing). If it asks which context file to use, show me the candidates and ask; never pick one for me.\n` +
+                `2. Tell me in plain words how many tables will be sent, the model, whether UC standards mode is on, and whether sample values are sent.\n` +
+                `3. Ask for my confirmation before calling batch_submit_plan.\n` +
+                `4. When the job has finished, call metadata_summary and offer to write the review with metadata_write_review. Nothing is applied to Databricks.`,
             },
           },
         ],

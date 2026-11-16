@@ -1473,7 +1473,9 @@ You never need to know which planner to call or copy `B-YYYYMMDD-XXXX` IDs or it
 
 1. **Single high-level entry tool (`batch_request`):** Pass a free-text `request` (such as *"summarise each markdown file in `docs/`"*, *"audit `src/auth.ts` and `src/session.ts` for race conditions"*, or *"run `classify-tickets` on `data/tickets.jsonl`"*). `batch_request`:
    - Extracts workspace files, directories (expanded with `.gitignore`/`.pi/batchignore` filtering), or simple globs (`"src/**/*.ts"`) from `files` or directly from the `request` text.
-   - Automatically selects the right planner (`goal`, `per_file`, or `dataset`), or respects an explicit `mode` override.
+   - Automatically selects the right planner (`goal`, `per_file`, `dataset`, or `metadata`), or respects an explicit `mode` override.
+   - Routes a request for Databricks / Unity Catalog table descriptions or column comments over a tables `.jsonl` file to the built-in metadata workflow (see 2.6), never to the generic planners.
+   - Infers an unnamed project workflow only when it is the single workflow for that file format **and** the dataset's first record has every field the workflow sends.
    - Runs every path, exclusion, secret, and privacy check locally and returns a conversational summary (`Plan ready: "..." — N request(s) on <model>, ~X,XXX tokens, ~50% OpenRouter Batch discount, results typically in 1–24h. Nothing has been sent or billed yet. Submit?`).
 2. **Human-readable labels:** Every job automatically gets a short label derived from its objective (or an explicit `name` passed to `batch_request`, `batch_plan_goal`, `batch_plan_files`, or `batch_plan_dataset`, such as `"auth security audit"`).
 3. **Natural `batch_id` / `job_id` resolution:** Every tool and `batch://jobs/{id}*` resource accepts:
@@ -1483,6 +1485,27 @@ You never need to know which planner to call or copy `B-YYYYMMDD-XXXX` IDs or it
    - **Ambiguity safety:** For cost-bearing (`batch_submit_plan`) or destructive (`batch_cancel`) actions, if a phrase matches more than one eligible job without a recency qualifier, the server refuses and lists the matching jobs so you can pick the right one.
 4. **Bare file names as item selectors:** In `batch_read_result(mode: "item")` and `batch_retry_items`, `item` / `items` accepts a bare file name (`"auth.ts"`), a trailing path suffix (`"api/auth.ts"`), a full workspace path, an item number (`1..N`), or `id:<sourceId>`.
 5. **Conversational tool outputs:** Every tool response starts with a plain-English summary sentence, while keeping machine-readable fields in `structuredContent`.
+
+#### 2.6 Databricks / Unity Catalog Metadata Over MCP
+
+The built-in `databricks-metadata` workflow (table descriptions and column comments, proposals only) is available over MCP with the same checks as `/batch metadata` in Pi:
+
+1. **Plan:** *"Write column comments for the tables in `metadata/finance/tables.jsonl` using the finance context"* → `metadata_plan` (or `batch_request`). One request per table, all sharing one reviewed context `.md`. Pass `domain` and `uc_prefix` together for UC standards mode.
+2. **Loose file names:** `input` and `context` accept a path or a name such as `"finance tables"`. One match is used and reported; several matches, or a missing `context`, are refused with the candidates listed. The context file is sent with every request, so it is never guessed.
+3. **Confirm and submit:** `batch_submit_plan` as usual. The elicitation form also shows the table count, standards mode, and how many tables send sample values.
+4. **After it finishes:** `metadata_summary` (coverage and confidence), `metadata_write_review` (Markdown review), `metadata_write_approved` (draft `.jsonl` handoff for a reviewer), and `metadata_validate_approved` once the reviewer has edited it. Retry gaps with `batch_retry_items`.
+
+Nothing is applied to Databricks and no SQL is produced. A plan is limited by `workflows.maxRequestsPerBatch` (one request per table) and, at submit, by `mcp.maxRequestsPerSubmit`.
+
+#### 2.7 Asynchronous Chat With Another Model Over MCP
+
+For a multi-turn conversation with a second model whose answers can wait:
+
+1. **`chat_start`** (`title`, `model`, `max_turns`) creates a thread and records the user's agreement to a turn budget. It sends nothing. With MCP `elicitation` the user confirms the model and the budget in a form first.
+2. **`chat_send`** sends one message as a billed turn, without a further prompt, until the budget is used. One turn at a time; `retry: true` resends a failed turn (a turn that may already have reached OpenRouter is never resent from here).
+3. **`chat_read`** checks OpenRouter for the pending reply and returns the thread's messages. Replies arrive minutes to hours later, so agents should report back and read again later, not wait in a loop. `batch://threads/{id}` is the same view as a resource, with an update notification when a reply lands.
+
+Only threads started with `chat_start` are visible to these tools. Threads you open in Pi or the web UI stay private to you, and by default the MCP server's poller **applies replies but never sends** their queued messages or starts their compactions (`mcp.sendQueuedChat`).
 
 ---
 
@@ -1501,12 +1524,14 @@ You never need to know which planner to call or copy `B-YYYYMMDD-XXXX` IDs or it
 |---|---|---|
 | `mcp.maxRequestsPerSubmit` | `100` | Largest request count `batch_submit_plan` will submit in one call over MCP. |
 | `mcp.disabledTools` | `[]` | Tool names to hide and block on the MCP server (e.g. `["batch_cancel", "batch_export"]`). |
+| `mcp.sendQueuedChat` | `false` | Let the MCP server's poller send queued messages (and start compactions) for chat threads opened in Pi or the web UI. Off: it only applies replies that have landed. Threads started with `chat_start` are always sent. |
+| `mcp.chatMaxTurnsPerThread` | `10` | Default and upper limit of the turn budget a `chat_start` thread may be given. |
 
 ---
 
 #### 4. Complete MCP Reference
 
-##### Tools (19)
+##### Tools (27)
 
 | Category | Tool | Annotations | Purpose |
 |---|---|---|---|
@@ -1531,8 +1556,16 @@ You never need to know which planner to call or copy `B-YYYYMMDD-XXXX` IDs or it
 | | `artifact_plan_render` | Read-only | Dry-run rendering a workspace Markdown `source` file to `html` or `pdf` in memory without writing. |
 | | `artifact_create` | Writes file | Render a controlled `markdown`, `html`, `pdf`, or `text` file from `job_id` (or `source_file`) with optional `template`, `item`, `synthesis`, `out`, `overwrite`. |
 | **Privacy** | `batch_privacy_status` | Read-only | Report effective privacy level (`standard`\|`no-training`\|`zdr`), attestation, routing policy, and catalog state. |
+| **Databricks metadata** | `metadata_plan` | Read-only | Plan table-description and column-comment proposals: one request per table of `input` (`.jsonl`) sharing `context` (`.md`); optional `domain` + `uc_prefix` (UC standards mode), `model`, `provider`, `name`. |
+| | `metadata_summary` | Read-only | Coverage, statuses and confidence totals of a metadata job (`batch_id`), retries included. |
+| | `metadata_write_review` | Writes file | Write the Markdown review (existing vs proposed values) of a finished metadata job (`batch_id`, optional `out`, `overwrite`). |
+| | `metadata_write_approved` | Writes file | Write the draft approved handoff `.jsonl` for a reviewer (`batch_id`, `out`, optional `overwrite`, `allow_partial`). |
+| | `metadata_validate_approved` | Read-only | Check an edited handoff `file` against the job's evidence and report reviewer edits and problems (optional `batch_id`). |
+| **Chat** | `chat_start` | Records consent | Start an asynchronous chat thread with another model and record the agreed turn budget (`title`, `model`, `max_turns`). Sends nothing. |
+| | `chat_send` | Cost-bearing | Send one message as the next turn of a `chat_start` thread (`thread`, `message`), or resend a failed turn (`retry: true`). |
+| | `chat_read` | Read-only (network) | Check for the pending reply and read a `chat_start` thread (`thread`, optional `since_seq`). |
 
-##### Resources (5 URIs / templates, with `resources/subscribe`)
+##### Resources (6 URIs / templates, with `resources/subscribe`)
 
 Attach these directly to your chat context (e.g. **Add Context → MCP Resources** in VS Code, or `@batch://...` in Claude Code) without spending a tool call:
 - `batch://jobs` — JSON inventory of all workspace batch jobs.
@@ -1540,6 +1573,7 @@ Attach these directly to your chat context (e.g. **Add Context → MCP Resources
 - `batch://jobs/{id}/result` — Bounded Markdown result of a finished job.
 - `batch://jobs/{id}/items/{n}` — Metadata and result text for item `n` (or `custom_id` / source path).
 - `batch://jobs/{id}/synthesis` — Newest synthesis result with its locally recorded coverage block.
+- `batch://threads/{id}` — Messages and reply status of a chat thread started with `chat_start`.
 
 When the background poller settles a job, the server emits `notifications/resources/updated` and `notifications/resources/list_changed`.
 
