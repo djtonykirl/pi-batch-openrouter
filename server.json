@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-10-17/server.schema.json",
   "name": "io.github.mastnacek/pi-batch-openrouter",
-  "description": "Deferred OpenRouter Batch jobs (~50% discount) with per-file/dataset fan-out, synthesis, privacy controls, and artifacts.",
+  "description": "Deferred OpenRouter Batch jobs (~50% discount) with per-file/dataset fan-out, synthesis, UC metadata, budgeted async chat, privacy controls, and artifacts.",
   "repository": {
     "url": "https://github.com/mastnacek/pi-batch-openrouter",
     "source": "github"

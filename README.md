@@ -533,7 +533,7 @@ workflow with `synthesis.enabled: false`.
 ### Export
 
 `/batch export <id> --format jsonl|csv` writes one record per item, but only when you run the command
-(there is no agent tool for it).
+(there is no Pi agent tool for it; over MCP, `batch_export` is available unless listed in `mcp.disabledTools`).
 
 | Column | Meaning |
 |---|---|
@@ -822,7 +822,10 @@ a finding is refused **before it is saved**: remove the secret and type it again
 
 **Chat jobs and other commands.** Chat jobs appear in `/batch list`, `show` and `view` and in the badge.
 `/batch inject`, `retry`, `retry-items`, `synthesize`, `export` and `artifact` refuse them, as do the extension's
-LLM tools. Use `/batch chat retry` and `/batch chat export` instead.
+LLM tools. Use `/batch chat retry` and `/batch chat export` instead. Over MCP, budgeted threads started via
+`chat_start` can be continued with `chat_send` and `chat_read` (see
+[Asynchronous Chat With Another Model Over MCP](#27-asynchronous-chat-with-another-model-over-mcp)), while threads
+opened in Pi or the web UI stay private to you.
 
 **Configuration** (`chat` section; defaults shown):
 
@@ -1274,7 +1277,8 @@ Invalid values fall back to the default and are reported. Legacy keys (`defaultP
   "submission": { "showPreview": true, "requireConfirmation": false },
   "workflows": { "maxRequestsPerBatch": 100, "maxCharactersPerItem": 500000, "maxTotalCharacters": 5000000, "maxSynthesisCharacters": 1000000, "maxRowsPerRun": 1000, "maxDatasetBytes": 20000000, "metadataStructuredOutput": false },
   "privacy": { "level": "standard", "accountNoTraining": false, "deleteRemoteBatches": true, "noticeShown": false },
-  "routing": { "allowedProviders": [], "allowFallbacks": true, "requireZdr": false, "accountZdrEnforced": false, "requireNoDataCollection": false, "accountDataCollectionDenied": false }
+  "routing": { "allowedProviders": [], "allowFallbacks": true, "requireZdr": false, "accountZdrEnforced": false, "requireNoDataCollection": false, "accountDataCollectionDenied": false },
+  "mcp": { "maxRequestsPerSubmit": 100, "disabledTools": [], "sendQueuedChat": false, "chatMaxTurnsPerThread": 10 }
 }
 ```
 
@@ -1293,7 +1297,7 @@ schema. The setting affects new plans only: a retry reuses the stored request bo
 A workflow's own `limits` can only lower these. The `routing` section is described in
 [Provider routing and account privacy](#provider-routing-and-account-privacy); with its defaults nothing changes.
 
-The `privacy` section is described in [Privacy levels and free models](#privacy-levels-and-free-models). `/batch privacy attest` also writes `privacy.attestedAt` (an ISO time) next to `accountNoTraining`.
+The `privacy` section is described in [Privacy levels and free models](#privacy-levels-and-free-models). `/batch privacy attest` also writes `privacy.attestedAt` (an ISO time) next to `accountNoTraining`. The `mcp` section is described in [Safety & Cost Model Over MCP](#3-safety--cost-model-over-mcp).
 
 ## LLM tools and MCP server
 
@@ -1460,7 +1464,7 @@ npx -y --package pi-batch-openrouter pi-batch-mcp init
 npx -y --package pi-batch-openrouter pi-batch-mcp init --client vscode --cwd .
 ```
 
-This copies the ready-made templates from [`integrations/`](./integrations) into your workspace (skipping any existing files unless `--force` is passed):
+This copies the ready-made templates from [`integrations/`](./integrations) into your workspace (skipping any existing files unless `--force` is passed; existing files that differ from the packaged templates are reported as `Outdated` so you know when to re-run with `--force`):
 - **VS Code Copilot:** `.github/skills/pi-batch/SKILL.md` (on-demand Agent Skill), `.github/prompts/batch.prompt.md` (`/batch` slash prompt), and `.github/instructions/pi-batch.instructions.md` (compact always-on pointer)
 - **Claude Code:** `.claude/skills/pi-batch/SKILL.md`
 - **Google Antigravity:** `.agents/plugins/pibatch/{plugin.json,mcp_config.json,rules/AGENTS.md,skills/pi-batch/SKILL.md}`
@@ -1477,7 +1481,7 @@ You never need to know which planner to call or copy `B-YYYYMMDD-XXXX` IDs or it
    - Routes a request for Databricks / Unity Catalog table descriptions or column comments over a tables `.jsonl` file to the built-in metadata workflow (see 2.6), never to the generic planners.
    - Infers an unnamed project workflow only when it is the single workflow for that file format **and** the dataset's first record has every field the workflow sends.
    - Runs every path, exclusion, secret, and privacy check locally and returns a conversational summary (`Plan ready: "..." — N request(s) on <model>, ~X,XXX tokens, ~50% OpenRouter Batch discount, results typically in 1–24h. Nothing has been sent or billed yet. Submit?`).
-2. **Human-readable labels:** Every job automatically gets a short label derived from its objective (or an explicit `name` passed to `batch_request`, `batch_plan_goal`, `batch_plan_files`, or `batch_plan_dataset`, such as `"auth security audit"`).
+2. **Human-readable labels:** Every job automatically gets a short label derived from its objective (or an explicit `name` passed to `batch_request`, `batch_plan_goal`, `batch_plan_files`, `batch_plan_dataset`, or `metadata_plan`, such as `"auth security audit"`).
 3. **Natural `batch_id` / `job_id` resolution:** Every tool and `batch://jobs/{id}*` resource accepts:
    - **Recency:** `"latest"`, `"the latest finished job"`, `"previous"`, `"oldest"`
    - **Status + topic phrases:** `"the security audit"`, `"the finished review of src/api"`, `"yesterday's audit"`, `"the unsubmitted plan"`
@@ -1511,12 +1515,15 @@ Only threads started with `chat_start` are visible to these tools. Threads you o
 
 #### 3. Safety & Cost Model Over MCP
 
-1. **Always plan → confirm → submit.** One-step `batch_submit_goal` is intentionally **not exposed** over MCP. Every planning tool (`batch_plan_goal`, `batch_plan_files`, `batch_plan_dataset`, `batch_retry_items`, `batch_plan_synthesis`) is marked `readOnlyHint: true`, makes zero OpenRouter requests, and costs nothing.
+1. **Always plan → confirm → submit.** One-step `batch_submit_goal` is intentionally **not exposed** over MCP. Every planning tool (`batch_request`, `batch_plan_goal`, `batch_plan_files`, `batch_plan_dataset`, `metadata_plan`, `batch_retry_items`, `batch_plan_synthesis`) is marked `readOnlyHint: true`, makes zero OpenRouter requests, and costs nothing.
 2. **Two-layer submission confirmation:**
    - `batch_submit_plan` is annotated as cost-bearing (`readOnlyHint: false`, `openWorldHint: true`), so MCP clients prompt before running it.
-   - When the client supports MCP `elicitation`, `batch_submit_plan` also sends an interactive confirmation form showing the job ID, model, request count, character count, privacy level, and objective before posting to OpenRouter.
-3. **Request-count cap:** `mcp.maxRequestsPerSubmit` (default `100` in `.pi/batch.config.json`) blocks oversized submissions over MCP.
-4. **Identical local guardrails:** Path containment, `.pi/batchignore`, `.gitignore`, hard-deny patterns (`.env`, keys, certs), high-confidence secret scanning, duplicate active-job detection, and `standard` / `no-training` / `zdr` privacy enforcement all run unchanged.
+   - When the client supports MCP `elicitation`, `batch_submit_plan` also sends an interactive confirmation form showing the job ID, model, request count, character count, privacy level, and objective (plus table count, UC standards mode, and how many tables send sample values for Databricks metadata jobs) before posting to OpenRouter.
+3. **Budgeted asynchronous chat consent:**
+   - `chat_start` records the user's consent to a model and turn budget (capped by `mcp.chatMaxTurnsPerThread`, default `10`), and prompts via MCP `elicitation` when supported before creating a thread.
+   - `chat_send` is cost-bearing and enforces that budget (one pending turn at a time; refuses new turns once the budget is spent). Threads opened in Pi or the web UI remain invisible to MCP tools and settle-only in the MCP poller unless `mcp.sendQueuedChat` is enabled.
+4. **Request-count cap:** `mcp.maxRequestsPerSubmit` (default `100` in `.pi/batch.config.json`) blocks oversized submissions over MCP.
+5. **Identical local guardrails:** Path containment, `.pi/batchignore`, `.gitignore`, hard-deny patterns (`.env`, keys, certs), high-confidence secret scanning, duplicate active-job detection, and `standard` / `no-training` / `zdr` privacy enforcement all run unchanged.
 
 **MCP configuration** (`mcp` section in `.pi/batch.config.json`):
 
@@ -1535,7 +1542,7 @@ Only threads started with `chat_start` are visible to these tools. Threads you o
 
 | Category | Tool | Annotations | Purpose |
 |---|---|---|---|
-| **Plan (free)** | `batch_request` | Read-only | High-level natural-language entry point: resolves files, directories, or globs from `request` / `files` and automatically plans a `goal`, `per_file`, or `dataset` batch job. |
+| **Plan (free)** | `batch_request` | Read-only | High-level natural-language entry point: resolves files, directories, or globs from `request` / `files` and automatically plans a `goal`, `per_file`, `dataset`, or `metadata` batch job (with optional `context`, `domain`, `uc_prefix`). |
 | | `batch_plan_goal` | Read-only | Plan a single deferred review/analysis goal over `files` (`prompt`, optional `files`, `model`, `provider`, `name`). |
 | | `batch_plan_files` | Read-only | Plan a `map-files` job: one request per file (or `group_size` files) sharing one `prompt`. |
 | | `batch_plan_dataset` | Read-only | Plan a `.pi/batch-workflows/*.yaml` workflow over a CSV/JSONL `input` file (optional `ids`, `from_row`, `to_row`, `model`). |
@@ -1575,11 +1582,12 @@ Attach these directly to your chat context (e.g. **Add Context → MCP Resources
 - `batch://jobs/{id}/synthesis` — Newest synthesis result with its locally recorded coverage block.
 - `batch://threads/{id}` — Messages and reply status of a chat thread started with `chat_start`.
 
-When the background poller settles a job, the server emits `notifications/resources/updated` and `notifications/resources/list_changed`.
+When the background poller settles a job, the server emits `notifications/resources/updated` and `notifications/resources/list_changed`. When a reply (or failure) lands in a `chat_start` thread, it emits `notifications/resources/updated` for `batch://threads/{id}`.
 
-##### Prompts / Slash Commands (3)
+##### Prompts / Slash Commands (4)
 
 - `review-files` (`objective`, `files`, optional `model`) — Instructs the agent to expand the file list, call `batch_plan_files`, present the plan, and wait for approval.
+- `metadata` (`tables`, optional `context`, `domain`, `uc_prefix`) — Plans Databricks / Unity Catalog table descriptions and column comments via `metadata_plan`, shows table count, model, UC standards mode, and whether sample values are sent, and waits for confirmation before submitting.
 - `status` — Reconciles active jobs via `batch_check_jobs` and summarises what finished.
 - `bring-result` (`batch_id`, optional `mode`) — Reads a finished job via `batch_read_result` and summarises findings as advisory analysis.
 
@@ -1587,31 +1595,33 @@ When the background poller settles a job, the server emits `notifications/resour
 
 #### 5. Optimal Usage Patterns & Examples
 
-OpenRouter Batch is asynchronous (typically minutes to a few hours, up to 24h) and ~50% cheaper per token. Use your editor's streaming chat model for interactive edits and debugging, and offload **high-token, fan-out, or deep-reasoning tasks** to `pi-batch-mcp`.
+OpenRouter Batch is asynchronous (typically minutes to a few hours, up to 24h) and ~50% cheaper per token. Use your editor's streaming chat model for interactive edits and debugging, and offload **high-token, fan-out, or deep-reasoning tasks** to `pi-batch-mcp` using plain English—no job IDs, item numbers, or planner names needed.
 
-##### Pattern 1: Deep architectural or security audit (`batch_plan_goal`)
+##### Pattern 1: Deep architectural or security audit (`batch_request` / `batch_plan_goal`)
 
 Best when you want a frontier reasoning model (`anthropic/claude-opus-5.5`, `deepseek/deepseek-r1`, etc.) to read several large files thoroughly while you keep working on something else, or even close your editor.
 
 > **You:** "Have Claude Opus do a deep batch audit of `src/service.ts`, `src/poller.ts`, and `src/registry.ts` for race conditions or crash-recovery gaps."
 >
-> **Agent:** Calls `batch_plan_goal(name: "race & recovery audit", ...)` → *"Plan ready: 'race & recovery audit' will send 1 request covering 3 files (162,400 chars) to `anthropic/claude-opus-5.5`. Nothing has been sent or billed yet. Would you like me to submit it?"*
+> **Agent:** Calls `batch_request(name: "race & recovery audit", request: ..., model: "anthropic/claude-opus-5.5")` → *"Plan ready: 'race & recovery audit' will send 1 request covering 3 files (~40,600 tokens, ~50% OpenRouter Batch discount, results typically in 1–24h). Nothing has been sent or billed yet. Submit?"*
 >
 > **You:** "Yes, go ahead." *(Approve the confirmation prompt.)*
 >
+> **Agent:** Calls `batch_submit_plan(batch_id: "race & recovery audit")`.
+>
 > *(Later — even after restarting VS Code / Claude Code / Antigravity)*
 >
-> **You:** "Is my batch done? If so, what did it find?"
+> **You:** "Is my audit done? If so, what did it find?"
 >
-> **Agent:** Calls `batch_check_jobs` → sees `"race & recovery audit"` is finished → calls `batch_read_result(batch_id: "latest", mode: "summary")` → summarises the findings and waits for your instructions before touching any code.
+> **Agent:** Calls `batch_check_jobs` → sees `"race & recovery audit"` is finished → calls `batch_read_result(batch_id: "the race & recovery audit", mode: "summary")` → summarises the findings and waits for your instructions before touching any code.
 
-##### Pattern 2: Repository-wide per-file fan-out, retry, and synthesis (`batch_plan_files`)
+##### Pattern 2: Repository-wide per-file fan-out, retry, and synthesis (`batch_request` / `batch_plan_files`)
 
-Instead of stuffing 30 files into one giant context window (where models lose attention in the middle), `map-files` sends **one independent request per file** in a single batch, then synthesizes the validated per-file results.
+Instead of stuffing 30 files into one giant context window (where models lose attention in the middle), `per_file` sends **one independent request per file** in a single batch, then synthesizes the validated per-file results.
 
 > **You:** "Review every `.ts` file under `src/workflows/` and `src/artifacts/` in a batch for untrusted-input handling bugs."
 >
-> **Agent:** Resolves the 11 files, calls `batch_plan_files(name: "input handling review", ...)`, and reports: *"Plan ready: 'input handling review' will review 11 requests (one per file, 94,100 total chars). Submit?"*
+> **Agent:** Calls `batch_request(name: "input handling review", request: ...)` (expands the directories and selects per-file mode) → *"Plan ready: 'input handling review' will send 11 requests (one per file, ~23,500 tokens, ~50% OpenRouter Batch discount). Submit?"*
 >
 > **You:** "Submit it."
 >
@@ -1619,37 +1629,65 @@ Instead of stuffing 30 files into one giant context window (where models lose at
 >
 > **You:** "How did the input handling review go?"
 >
-> **Agent:** Calls `batch_check_jobs(batch_id: "the input handling review")` and `batch_get_items`.
-> - If 10/11 succeeded and 1 failed, you can simply say: *"Retry the one that failed, and once it's done combine all 11 into one report."*
-> - To inspect a single file's review at any time, ask: *"What did the batch say about `service.ts`?"* → `batch_read_result(batch_id: "the input handling review", mode: "item", item: "service.ts")`.
+> **Agent:** Calls `batch_check_jobs(batch_id: "the input handling review")` and `batch_get_items(batch_id: "the input handling review")`.
+> - If 10/11 succeeded and 1 failed, you can simply say: *"Retry the one that failed, and once it's done combine everything into one report."* (`batch_retry_items(batch_id: "the input handling review", failed: true)` → confirm & submit → `batch_plan_synthesis(batch_id: "the input handling review")` → confirm & submit.)
+> - To inspect a single file's review at any time, ask: *"What did the review say about `service.ts`?"* → `batch_read_result(batch_id: "the input handling review", mode: "item", item: "service.ts")`.
 
-##### Pattern 3: Schema-validated dataset processing & export (`batch_plan_dataset` + `batch_export`)
+##### Pattern 3: Schema-validated dataset processing & export (`batch_request` / `batch_plan_dataset` + `batch_export`)
 
 When processing CSV or JSONL datasets through a `.pi/batch-workflows/<name>.yaml` definition:
 
-> **You:** "Validate the `classify-tickets` workflow, plan it over `data/tickets.csv` for rows 1 to 50, and show me the plan."
+> **You:** "Run the `classify-tickets` workflow over `data/tickets.jsonl` and show me the plan."
 >
-> **Agent:** Calls `batch_validate_workflow(name: "classify-tickets")` → calls `batch_plan_dataset(workflow: "classify-tickets", input: "data/tickets.csv", from_row: 1, to_row: 50)` → reports selected rows, fields sent, and character count.
+> **Agent:** Calls `batch_request(name: "ticket classification", request: ...)` (or `batch_plan_dataset` when selecting `from_row` / `to_row` or specific `ids`) → reports row/request count, fields sent, and `~tokens`.
 >
-> **You:** "Submit the plan." → *(Once ready)* → "Export the results of `B-20261031-9P1Q` to `exports/tickets-classified.jsonl`."
+> **You:** "Submit it." → *(Once ready)* → "Export the ticket classification results to `exports/tickets-classified.jsonl`."
 >
-> **Agent:** Calls `batch_export`, writing schema-validated JSON objects with full item and retry provenance.
+> **Agent:** Calls `batch_export(batch_id: "the ticket classification job", format: "jsonl", out: "exports/tickets-classified.jsonl")`, writing schema-validated JSON objects with full item and retry provenance.
 
 ##### Pattern 4: Generating controlled PDF / HTML deliverables (`artifact_create`)
 
 Turn a finished batch result or synthesis into a clean Markdown, HTML, or PDF report without sending another model request:
 
-> **You:** "Create a Markdown report from the synthesis of `B-20261031-8K2M` at `reports/security-review.md`, then render it to `reports/security-review.pdf`."
+> **You:** "Turn the synthesis from the input handling review into a Markdown report at `reports/security-review.md`, then render it to `reports/security-review.pdf`."
 >
 > **Agent:**
-> 1. Calls `artifact_create(job_id: "B-20261031-8K2M", synthesis: true, format: "markdown", out: "reports/security-review.md")`.
+> 1. Calls `artifact_create(job_id: "the input handling review", synthesis: true, format: "markdown", out: "reports/security-review.md")`.
 > 2. *(Optional: you or the agent can edit `reports/security-review.md` locally — provenance tracks that the source was modified after generation.)*
 > 3. Calls `artifact_create(source_file: "reports/security-review.md", format: "pdf", out: "reports/security-review.pdf")`.
+
+##### Pattern 5: Databricks / Unity Catalog metadata proposals & reviewer handoff (`metadata_plan` / `batch_request`)
+
+Generate validated table descriptions and column comments from a Databricks `tables.jsonl` export and reviewed domain context `.md` using loose file names, without connecting to Databricks or generating SQL:
+
+> **You:** "Write UC metadata comments for the finance tables using the finance context in standards mode (`finance`, `FIN_`)."
+>
+> **Agent:** Calls `metadata_plan(name: "finance metadata", input: "finance tables", context: "finance context", domain: "finance", uc_prefix: "FIN_")` *(resolves both loose names and reports the exact paths; if the context file is missing or ambiguous, it refuses and lists the candidates for you to choose)* → reports table count, model, `~tokens`, UC standards mode, and whether sample values are sent → asks for confirmation before calling `batch_submit_plan(batch_id: "finance metadata")`.
+>
+> *(Once the batch completes)*
+>
+> **You:** "Summarise the finance metadata job, write the review, and create the draft handoff at `metadata/finance/approved.jsonl`."
+>
+> **Agent:** Calls `metadata_summary(batch_id: "the finance metadata job")` → `metadata_write_review(batch_id: "the finance metadata job")` → `metadata_write_approved(batch_id: "the finance metadata job", out: "metadata/finance/approved.jsonl")`. After a human reviewer edits the handoff file, say *"Validate `metadata/finance/approved.jsonl`"* → `metadata_validate_approved(file: "metadata/finance/approved.jsonl")`.
+
+##### Pattern 6: Budgeted asynchronous chat with a second model (`chat_start` → `chat_send` → `chat_read`)
+
+Hold a multi-turn conversation with another model at batch pricing when you do not need an immediate reply:
+
+> **You:** "Discuss our caching design with `google/gemini-3.8-pro` over at most 4 turns and send the first question."
+>
+> **Agent:** Calls `chat_start(title: "caching design", model: "google/gemini-3.8-pro", max_turns: 4)` *(user confirms the model and turn budget in the elicitation form if supported)* → calls `chat_send(thread: "the caching design", message: "...")` → reports that the reply arrives asynchronously (minutes to 24h) and does not wait in a loop.
+>
+> *(Later in the session, or after a `batch://threads/{id}` update)*
+>
+> **You:** "Did Gemini reply yet?"
+>
+> **Agent:** Calls `chat_read(thread: "the caching design")` → returns the reply and turns used (`1 of 4 agreed`).
 
 ##### Best-practice tips for MCP users
 
 - **Keep context lean:** Always start with `batch_read_result` in `mode: "summary"` (the default, capped at `injection.maxCharacters`, 30,000 chars). For multi-file jobs, inspect `batch_get_items` first and pull only the items you need with `mode: "item"`.
-- **Attach resources directly:** In VS Code Copilot (`Add Context → MCP Resources`) or Claude Code (`@batch://jobs/<id>/result`), you can attach a finished job's result directly into your prompt without waiting for an agent tool round-trip.
+- **Attach resources directly:** In VS Code Copilot (`Add Context → MCP Resources`) or Claude Code (`@batch://jobs/latest/result`, or by job name/ID), you can attach a finished job's result or a `batch://threads/latest` transcript directly into your prompt without waiting for an agent tool round-trip.
 - **Check privacy before sending sensitive code:** Ask the agent to call `batch_privacy_status` first. If your project requires Zero Data Retention (`zdr`) or `no-training`, configure it in Pi (`/batch privacy zdr`) or `.pi/batch.config.json` — the MCP server enforces the project's privacy level on every plan and submission and cannot weaken it.
 - **Co-exist with the Web UI:** Run `npm run web` (or `npx pi-batch-web --cwd .`) alongside your IDE if you want a live browser dashboard for inspecting jobs, items, and rendered artifacts while your MCP agent works.
 
