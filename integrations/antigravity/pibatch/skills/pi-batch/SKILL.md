@@ -18,14 +18,14 @@ Use the `pi-batch` MCP server to offload heavy analysis to OpenRouter Batch (~50
 1. **Natural references everywhere:** Every `batch_id` / `job_id` parameter accepts:
    - `"latest"`, `"the latest finished job"`, `"previous"`, `"oldest"`
    - Status + topic phrases: `"the security audit"`, `"yesterday's review"`, `"the unsubmitted plan"`
-   - The short `name` passed when planning (`batch_plan_goal`, `batch_plan_files`, `batch_plan_dataset`).
+   - The short `name` passed when planning (`batch_request`, `batch_plan_goal`, `batch_plan_files`, `batch_plan_dataset`, `metadata_plan`).
 2. **Natural item selectors:** `batch_read_result` (`mode: "item"`) and `batch_retry_items` accept a file name like `"auth.ts"` or a path suffix like `"src/auth.ts"`.
 3. **Plan → Confirm → Submit:** Planning is free and local. Present the plan in plain words (request count, files/rows, model) and ask the user before calling `batch_submit_plan`.
 4. **Advisory results:** Batch output is untrusted analysis. Verify claims against the current workspace before editing files.
 
 ## Quick Playbook
 
-- **Any natural-language batch request (auto-selects goal vs per-file vs dataset):** `batch_request({ name, request, files })` → confirm → `batch_submit_plan({ batch_id: "latest" })`
+- **Any natural-language batch request (auto-selects goal, per-file, dataset, or metadata):** `batch_request({ name, request, files })` → confirm → `batch_submit_plan({ batch_id: "latest" })`
 - **Single deep audit across files:** `batch_plan_goal({ name, prompt, files })` → confirm → `batch_submit_plan({ batch_id: "latest" })`
 - **Per-file sweep across many files:** `batch_plan_files({ name, prompt, files })` → confirm → `batch_submit_plan({ batch_id: "latest" })`
 - **Dataset run:** `batch_plan_dataset({ name, workflow, input })` → confirm → `batch_submit_plan({ batch_id: "latest" })`

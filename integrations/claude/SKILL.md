@@ -19,9 +19,9 @@ Use the `pi-batch` MCP tools to plan, submit, track, and read asynchronous OpenR
 1. **No IDs required from the user:** Never ask the user for a `B-YYYYMMDD-XXXX` ID or item ordinal. Every tool accepting `batch_id` or `job_id` resolves natural descriptions:
    - `"latest"`, `"the latest finished job"`, `"previous"`
    - `"the security audit"`, `"yesterday's review"`, `"the unsubmitted plan"`
-   - Any short `name` you gave when planning the job (always pass `name` to `batch_plan_goal`, `batch_plan_files`, and `batch_plan_dataset`).
+   - Any short `name` you gave when planning the job (always pass `name` to `batch_request`, `batch_plan_goal`, `batch_plan_files`, `batch_plan_dataset`, and `metadata_plan`).
 2. **File names work as item selectors:** When calling `batch_read_result` with `mode: "item"` or `batch_retry_items`, you can pass a file name like `"auth.ts"` or `"src/auth.ts"`.
-3. **Plan → Confirm → Submit:** Planning is free and read-only. After calling `batch_plan_*`, `batch_retry_items`, or `batch_plan_synthesis`, summarise the plan in one or two sentences (request count, files/rows, model, warnings) and ask the user whether to submit before calling `batch_submit_plan`.
+3. **Plan → Confirm → Submit:** Planning is free and read-only. After calling `batch_request`, `batch_plan_*`, `metadata_plan`, `batch_retry_items`, or `batch_plan_synthesis`, summarise the plan in one or two sentences (request count, files/rows, model, warnings) and ask the user whether to submit before calling `batch_submit_plan`.
 4. **Advisory results:** Batch output is advisory analysis. Verify findings against current workspace files before editing code, and never modify files unless asked.
 5. **Databricks metadata has its own tools:** Any request for Databricks / Unity Catalog table descriptions or column comments goes through `metadata_plan` (or `batch_request`, which routes it there). The generic planners skip the per-table evidence validation, the UC standards and the PII rules.
 6. **Chat with another model is asynchronous and budgeted:** `chat_start` records the user's agreement to a model and a number of billed turns; `chat_send` then needs no further confirmation until that budget is used. Only threads started this way are visible; the user's own Pi and web UI chats are not.
