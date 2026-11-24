@@ -33,7 +33,7 @@ export const SENSITIVITIES = ["low", "medium", "high"] as const;
 export const BOOLEAN_TAG = ["true", "false"] as const;
 export const MEDALLION_LAYERS = ["bronze", "silver", "gold"] as const;
 /** Lighthouse framework audit columns: never sent to the model; the applier assigns their standard definitions. */
-export const FRAMEWORK_AUDIT_COLUMNS = ["fw_pipelinerowchecksum", "fw_ingestdate", "pipeline_timestamp"] as const;
+export const FRAMEWORK_AUDIT_COLUMNS = ["fw_pipelinerowchecksum", "fw_ingestdate", "fw_lighthouse_version", "pipeline_timestamp"] as const;
 
 export type Classification = (typeof CLASSIFICATIONS)[number];
 export type MedallionLayer = (typeof MEDALLION_LAYERS)[number];
