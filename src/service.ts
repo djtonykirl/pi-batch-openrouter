@@ -22,7 +22,7 @@ import { planDatasetRun, type DatasetPlan, type EffectiveLimits } from "./workfl
 import { resolveWorkspaceInput, resolveWorkspaceOutput } from "./workspace-paths.js";
 import { decodeDatasetBytes } from "./datasets/dataset.js";
 import { promptEvidence, proposalProblems, type TableEvidence } from "./metadata/contract.js";
-import { metadataWorkflow, planMetadataRun, type MetadataPlan, type MetadataWorkflowId } from "./metadata/plan.js";
+import { metadataItemMaxTokens, metadataMessages, metadataWorkflow, planMetadataRun, proposalResponseFormat, renderMetadataPrompt, type MetadataPlan, type MetadataWorkflowId } from "./metadata/plan.js";
 import { standardsFromOptions, type MetadataStandards } from "./metadata/standards.js";
 import { buildExportRows, toCsv, toJsonl, writeExport } from "./export.js";
 import { inventoryLegacyJobs, type LegacyInventory } from "./legacy.js";
@@ -2013,10 +2013,45 @@ export class BatchService {
     const srcBodyText = fs.readFileSync(this.registry.artefact(localId, "submittedRequest"), "utf8");
     const srcBody = JSON.parse(srcBodyText) as SubmitBody;
     const objective = fs.readFileSync(this.registry.artefact(localId, "objective"), "utf8");
+
+    let metadataRetryContext: { text: string; standards?: MetadataStandards; byTable: Map<string, TableEvidence> } | undefined;
+    if (source.workflow?.name === "databricks-metadata") {
+      const contextPath = this.registry.artefact(localId, "context");
+      const planPath = this.registry.artefact(localId, "metadataPlan");
+      if (fs.existsSync(contextPath) && fs.existsSync(planPath)) {
+        const storedPlan = JSON.parse(fs.readFileSync(planPath, "utf8")) as {
+          standards?: MetadataStandards;
+          tables?: Array<{ table: string; evidence?: TableEvidence }>;
+        };
+        metadataRetryContext = {
+          text: fs.readFileSync(contextPath, "utf8"),
+          standards: storedPlan.standards,
+          byTable: new Map(
+            (storedPlan.tables ?? [])
+              .filter((t): t is { table: string; evidence: TableEvidence } => Boolean(t.evidence))
+              .map((t) => [t.table, t.evidence]),
+          ),
+        };
+      }
+    }
+
+    const promptOf = (body: BatchRequestItem["body"]) => body.messages.filter((m) => m.role === "user").map((m) => messageText(m)).join("\n\n");
     const bodies = selected.map((it) => {
       const req = srcBody.requests.find((r) => r.custom_id === it.customId);
       if (!req) throw new Error(`${localId}: item ${it.ordinal} (${it.customId}) is not in submitted-request.json; cannot retry it.`);
-      return { item: it, body: req.body };
+      const evidence = it.source.sourceId ? metadataRetryContext?.byTable.get(it.source.sourceId) : undefined;
+      if (metadataRetryContext && evidence) {
+        const standards = metadataRetryContext.standards;
+        const sent = promptEvidence(evidence, standards);
+        const messages = metadataMessages(renderMetadataPrompt(metadataRetryContext.text, evidence, standards));
+        const body: BatchRequestItem["body"] = {
+          messages,
+          max_tokens: metadataItemMaxTokens(config.request.maxTokens, sent.columns.length),
+          ...(standards && config.workflows.metadataStructuredOutput ? { response_format: proposalResponseFormat() } : {}),
+        };
+        return { item: it, body, characters: messages.reduce((n, m) => n + m.content.length, 0) };
+      }
+      return { item: it, body: req.body, characters: it.characters ?? promptOf(req.body).length };
     });
 
     // The copied request bodies are re-scanned: secret rules may have changed since the original was built.
@@ -2030,7 +2065,6 @@ export class BatchService {
     }
 
     const model = opts.model ? normalizeBatchModelSlug(opts.model) : srcBody.model;
-    const promptOf = (body: BatchRequestItem["body"]) => body.messages.filter((m) => m.role === "user").map((m) => messageText(m)).join("\n\n");
     const child = await this.persistJob({
       kind: source.kind ?? "goal",
       objective: source.objective,
@@ -2040,10 +2074,10 @@ export class BatchService {
       // A retry never drops below the level its source was sent at (e.g. a zdr thread under a standard project).
       ...(source.privacy ? { privacyLevel: source.privacy.level } : {}),
       format: source.format,
-      items: bodies.map(({ item, body }) => ({
+      items: bodies.map(({ item, body, characters }) => ({
         source: item.source,
         body,
-        characters: item.characters ?? promptOf(body).length,
+        characters,
         prompt: promptOf(body),
         replaces: { jobId: localId, customId: item.customId, ordinal: item.ordinal },
         ...(item.inputSha256 ? { inputSha256: item.inputSha256 } : {}),
@@ -2055,7 +2089,7 @@ export class BatchService {
         opts.mode === "items"
           ? {
               fileCount: new Set(selected.flatMap((s) => (s.source.path ? [s.source.path] : (s.source.paths ?? [])))).size,
-              characters: bodies.reduce((n, { item, body }) => n + (item.characters ?? promptOf(body).length), 0),
+              characters: bodies.reduce((n, b) => n + b.characters, 0),
               excludedCount: 0,
             }
           : { ...source.context },

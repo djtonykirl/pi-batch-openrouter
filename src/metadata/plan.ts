@@ -238,6 +238,13 @@ export function metadataMessages(prompt: string): ChatMessage[] {
   ];
 }
 
+export const METADATA_MAX_TOKENS_CAP = 64_000;
+
+/** Scales completion budget with non-audit column count so wide tables do not truncate mid-JSON. */
+export function metadataItemMaxTokens(baseMaxTokens: number, columnCount: number): number {
+  return Math.max(baseMaxTokens, Math.min(METADATA_MAX_TOKENS_CAP, 4_000 + columnCount * 350));
+}
+
 export function planMetadataRun(input: MetadataPlanInput): MetadataPlan {
   const blockers: string[] = [];
   const warnings: string[] = [];
@@ -279,7 +286,7 @@ export function planMetadataRun(input: MetadataPlanInput): MetadataPlan {
       const prompt = renderMetadataPrompt(input.context.text, evidence, standards);
       const messages = metadataMessages(prompt);
       // Standards mode only: the proposal schema as a structured output (v1 bodies, and their hashes, are unchanged).
-      const body: BatchRequestItem["body"] = { messages, max_tokens: input.maxTokens, ...(standards && input.structuredOutput ? { response_format: proposalResponseFormat() } : {}) };
+      const body: BatchRequestItem["body"] = { messages, max_tokens: metadataItemMaxTokens(input.maxTokens, sent.columns.length), ...(standards && input.structuredOutput ? { response_format: proposalResponseFormat() } : {}) };
       items.push({
         ordinal: items.length + 1,
         evidence,

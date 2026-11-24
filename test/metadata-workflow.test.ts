@@ -4,9 +4,9 @@ import * as path from "node:path";
 import test from "node:test";
 import { normaliseBatchResult } from "../src/openrouter/normalise-result.js";
 import { proposalProblems, tableEvidenceProblems, type TableEvidence } from "../src/metadata/contract.js";
-import { parseTables, renderMetadataPrompt } from "../src/metadata/plan.js";
+import { METADATA_MAX_TOKENS_CAP, metadataItemMaxTokens, parseTables, renderMetadataPrompt } from "../src/metadata/plan.js";
 import type { BatchService } from "../src/service.js";
-import { FakeOpenRouter, makeConfig, makeService } from "./fixtures/fake-openrouter.js";
+import { FakeOpenRouter, accepted, makeConfig, makeService } from "./fixtures/fake-openrouter.js";
 import { CONTEXT_MD, TABLES, TABLES_JSONL, metadataWorkspace, proposalFor } from "./fixtures/metadata.js";
 import { completed, successItem } from "./fixtures/openrouter.js";
 import { rm } from "./helpers.js";
@@ -132,4 +132,67 @@ test("normaliser: a proposal whose table claim differs from the item's own table
   const n = normaliseBatchResult(raw, { localJobId: "L", providerBatchId: "batch_123", expectedCustomIds: ["c_1"], format: "json", validateJson: (v, cid) => proposalProblems(v, ev.get(cid!)!) });
   assert.equal(n.items[0]!.status, "corrupt");
   assert.equal(n.outcome, "corrupt");
+});
+
+test("metadataItemMaxTokens: keeps base up to 34 columns, scales wide tables, and caps at 64_000", () => {
+  assert.equal(metadataItemMaxTokens(16_000, 0), 16_000);
+  assert.equal(metadataItemMaxTokens(16_000, 34), 16_000);
+  assert.equal(metadataItemMaxTokens(16_000, 78), 31_300);
+  assert.equal(metadataItemMaxTokens(16_000, 87), 34_450);
+  assert.equal(metadataItemMaxTokens(16_000, 200), METADATA_MAX_TOKENS_CAP);
+});
+
+test("retryItems: databricks-metadata retries re-render prompts with current standards and scale max_tokens", () => {
+  const wideCols = Array.from({ length: 86 }, (_, i) => ({
+    name: `col_${String(i).padStart(2, "0")}`,
+    data_type: "STRING",
+    nullable: true,
+    existing_comment: null,
+  }));
+  const wideTable: TableEvidence = {
+    table: "uc_dev_global_rnd_mdip_01.lighthouse_bronze.PNPT_wide",
+    existing_description: null,
+    existing_tags: {},
+    columns: [...wideCols, { name: "fw_lighthouse_version", data_type: "STRING", nullable: true, existing_comment: null }],
+  };
+  return withMetadata(
+    async (_root, service, fake) => {
+      const prepared = await service.planMetadata({
+        context: "metadata/pinpoint/context.md",
+        input: "metadata/pinpoint/tables.jsonl",
+        domain: "pinpoint",
+        ucPrefix: "PNPT_",
+      });
+      assert.deepEqual(prepared.blockers, []);
+      assert.equal(prepared.plan!.items[0]!.body.max_tokens, 34_100);
+      const preview = await service.createMetadataJob(prepared, { previewOnly: true });
+      fake.submitReplies = [accepted("batch_parent")];
+      const job = await service.submit(preview.localId);
+
+      // Simulate a parent job whose submitted-request.json had stale fw_lighthouse_version and uncapped 16_000 max_tokens.
+      const reqPath = service.registry.artefact(job.localId, "submittedRequest");
+      const staleReq = JSON.parse(fs.readFileSync(reqPath, "utf8")) as {
+        requests: Array<{ custom_id: string; body: { max_tokens: number; messages: Array<{ role: string; content: string }> } }>;
+      };
+      staleReq.requests[0]!.body.max_tokens = 16_000;
+      staleReq.requests[0]!.body.messages[1]!.content += '\n"name": "fw_lighthouse_version"';
+      fs.writeFileSync(reqPath, JSON.stringify(staleReq, null, 2), "utf8");
+
+      fake.getReplies = [{ status: 200, body: completed([successItem(job.customIds[0]!, "{not valid json")], { id: "batch_parent" }) }];
+      await service.reconcile(job.localId, { force: true });
+
+      const retry = await service.retryItems(job.localId, { failed: true, previewOnly: true });
+      const retryReq = JSON.parse(fs.readFileSync(service.registry.artefact(retry.localId, "submittedRequest"), "utf8")) as {
+        requests: Array<{ custom_id: string; body: { max_tokens: number; messages: Array<{ role: string; content: string }> } }>;
+      };
+      const userPrompt = retryReq.requests[0]!.body.messages[1]!.content;
+      assert.equal(retryReq.requests[0]!.body.max_tokens, 34_100);
+      assert.doesNotMatch(userPrompt, /fw_lighthouse_version/);
+      assert.match(userPrompt, /col_85/);
+    },
+    {
+      "metadata/pinpoint/context.md": "# Pinpoint\n\nWide bronze table test context.\n",
+      "metadata/pinpoint/tables.jsonl": JSON.stringify(wideTable) + "\n",
+    },
+  );
 });
