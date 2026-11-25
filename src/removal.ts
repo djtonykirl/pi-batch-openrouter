@@ -16,6 +16,19 @@ export async function removeDirRobust(dir: string, attempts = 5, delayMs = 100):
   }
 }
 
+/** Renames `from` to `to`, retrying briefly when Windows (antivirus, an indexer) still holds a handle. */
+export async function renameRobust(from: string, to: string, attempts = 5, delayMs = 100): Promise<void> {
+  for (let i = 1; ; i++) {
+    try {
+      fs.renameSync(from, to);
+      return;
+    } catch (err) {
+      if (i >= attempts || !RETRYABLE.has((err as NodeJS.ErrnoException).code ?? "")) throw err;
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+}
+
 /** Total size in bytes of every file under `dir` (0 when it does not exist). */
 export function dirSizeBytes(dir: string): number {
   let total = 0;

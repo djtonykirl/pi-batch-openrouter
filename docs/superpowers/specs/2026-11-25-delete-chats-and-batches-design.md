@@ -53,7 +53,7 @@ job; jobs younger than the age filter (clean only).
 **How a delete happens (my call).** Under the job/thread lock, re-read status, rename the folder to
 `.deleting-<id>`, then remove it (retrying on `EBUSY`/`EPERM`, which is common on Windows). `registry.list` and
 `threads` listing skip `.deleting-*`, so a crash mid-removal leaves nothing half-visible; a leftover folder is swept
-by the next `clean`. A thread is removed only after its jobs.
+by the next `clean`. A chat is removed before its jobs (if it cannot be, its jobs stay with it), and a job whose chat is gone can be deleted on its own.
 
 **Output.** The plan shows, per item: id, short label, status, age, size; totals; and what is skipped. The result says
 how many were deleted, how many skipped, how much space was freed.

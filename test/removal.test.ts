@@ -84,3 +84,20 @@ test("dirSizeBytes sums nested files and is 0 for a missing folder", () => {
     rm(ws);
   }
 });
+
+test("a stale .deleting-<id> folder does not stop the delete of the same id", async () => {
+  const { ws, registry, threads } = setup();
+  try {
+    const job = mkJob(registry);
+    fs.mkdirSync(path.join(registry.root, `.deleting-${job.localId}`));
+    await registry.removeJob(job.localId);
+    assert.equal(fs.existsSync(path.join(registry.root, job.localId)), false);
+    assert.deepEqual(fs.readdirSync(registry.root).filter((n) => n.startsWith(".deleting-")), []);
+    const t = threads.create({ model: "m/x", account: "default" });
+    fs.mkdirSync(path.join(threads.root, `.deleting-${t.id}`));
+    await threads.removeThread(t.id);
+    assert.deepEqual(fs.readdirSync(threads.root).filter((n) => n.startsWith(".deleting-")), []);
+  } finally {
+    rm(ws);
+  }
+});

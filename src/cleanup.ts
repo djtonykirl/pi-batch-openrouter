@@ -84,6 +84,7 @@ export class CleanupService {
 
   public plan(target: CleanupTarget, opts: { remote?: boolean } = {}): CleanupPlan {
     const { registry, threads } = this.deps;
+    for (const [id, p] of this.plans) if (this.now().getTime() - p.createdAt > PLAN_TTL_MS) this.plans.delete(id);
     const isFilter = "olderThanMs" in target;
     const listed = registry.list();
     const jobs = new Map(listed.jobs.map((j) => [j.localId, j]));
@@ -132,8 +133,9 @@ export class CleanupService {
     const threadJobs = new Map<string, string[]>();
     const nowMs = this.now().getTime();
 
-    for (const root of roots) {
-      const members: Array<{ kind: Kind; id: string; via?: string }> = [];
+    type Member = { kind: Kind; id: string; via?: string };
+    const groups: Member[][] = roots.map((root) => {
+      const members: Member[] = [];
       const seen = new Set<string>();
       const add = (kind: Kind, id: string, via?: string) => {
         if (seen.has(`${kind}:${id}`)) return;
@@ -156,16 +158,43 @@ export class CleanupService {
           }
         }
       }
+      return members;
+    });
 
-      const blocker = members.find((m) => this.blockedReason(m.kind, m.id, jobs, threadList));
-      if (blocker) {
-        const why = this.blockedReason(blocker.kind, blocker.id, jobs, threadList)!;
+    // A group is blocked when one of its members is active; a group that shares a member with a blocked group is
+    // blocked too (so naming a job on its own cannot slip past the group that holds it back). Repeat until stable.
+    const blocked = new Map<string, { kind: Kind; reason: string }>();
+    const blockedGroups = new Set<number>();
+    for (let changed = true; changed; ) {
+      changed = false;
+      groups.forEach((members, gi) => {
+        if (blockedGroups.has(gi)) return;
+        const own = members.find((m) => this.blockedReason(m.kind, m.id, jobs, threadList));
+        const shared = own ? undefined : members.find((m) => blocked.has(m.id));
+        const cause = own
+          ? { kind: own.kind, id: own.id, why: this.blockedReason(own.kind, own.id, jobs, threadList)! }
+          : shared
+            ? { kind: shared.kind, id: shared.id, why: blocked.get(shared.id)!.reason }
+            : undefined;
+        if (!cause) return;
+        blockedGroups.add(gi);
+        changed = true;
         for (const m of members) {
-          if (skipped.has(m.id) || items.has(m.id)) continue;
-          skipped.set(m.id, { kind: m.kind, id: m.id, reason: m.id === blocker.id ? why : `linked ${blocker.kind} ${blocker.id} is ${why}` });
+          if (!blocked.has(m.id)) blocked.set(m.id, { kind: m.kind, reason: m.id === cause.id ? cause.why : `linked ${cause.kind} ${cause.id} is ${cause.why}` });
         }
-        continue;
+      });
+    }
+    for (const [id, b] of blocked) if (!skipped.has(id)) skipped.set(id, { kind: b.kind, id, reason: b.reason });
+
+    // A filter-based clean-up cannot tell what an unreadable folder belongs to: say so rather than leave it unmentioned.
+    if (isFilter) {
+      for (const [id, why] of unreadable) {
+        if (!skipped.has(id)) skipped.set(id, { kind: "job", id, reason: `manifest is unreadable (${why}); not deleted blindly` });
       }
+    }
+
+    groups.forEach((members, gi) => {
+      if (blockedGroups.has(gi)) return;
       for (const m of members) {
         if (items.has(m.id)) continue;
         if (m.kind === "job") {
@@ -193,7 +222,7 @@ export class CleanupService {
           });
         }
       }
-    }
+    });
 
     const ordered = [...items.values()].sort((a, b) => (a.kind === b.kind ? a.id.localeCompare(b.id) : a.kind === "job" ? -1 : 1));
     const plan: CleanupPlan = {
@@ -225,27 +254,30 @@ export class CleanupService {
     threads.sweepDeleting();
     const deleted: CleanupItem[] = [];
     const skipped: CleanupSkip[] = [...stored.plan.skipped];
-    const failedJobs = new Set<string>();
 
-    for (const item of stored.plan.items.filter((i) => i.kind === "job")) {
-      try {
-        await registry.removeJob(item.id);
-        deleted.push(item);
-      } catch (err) {
-        failedJobs.add(item.id);
-        skipped.push({ kind: "job", id: item.id, reason: (err as Error).message });
-      }
-    }
+    // A chat goes first: if it cannot be deleted (a turn started since the plan) its jobs stay with it, so no
+    // transcript is ever left pointing at a missing job. A job whose chat is already gone is deletable on its own.
+    const keptChats = new Set<string>();
     for (const item of stored.plan.items.filter((i) => i.kind === "thread")) {
-      if ((stored.threadJobs.get(item.id) ?? []).some((j) => failedJobs.has(j))) {
-        skipped.push({ kind: "thread", id: item.id, reason: "one of its jobs could not be deleted" });
-        continue;
-      }
       try {
         await threads.removeThread(item.id);
         deleted.push(item);
       } catch (err) {
+        keptChats.add(item.id);
         skipped.push({ kind: "thread", id: item.id, reason: (err as Error).message });
+      }
+    }
+    for (const item of stored.plan.items.filter((i) => i.kind === "job")) {
+      const chat = [...keptChats].find((t) => (stored.threadJobs.get(t) ?? []).includes(item.id));
+      if (chat) {
+        skipped.push({ kind: "job", id: item.id, reason: `its chat ${chat} could not be deleted` });
+        continue;
+      }
+      try {
+        await registry.removeJob(item.id);
+        deleted.push(item);
+      } catch (err) {
+        skipped.push({ kind: "job", id: item.id, reason: (err as Error).message });
       }
     }
 
@@ -279,19 +311,24 @@ export class CleanupService {
     jobs: Map<string, JobManifest>,
     unreadable: Map<string, string>,
   ): { kind: Kind | "unreadable"; id: string } {
+    let jobId: string | undefined;
     try {
       const id = this.deps.registry.resolveId(ref);
-      if (jobs.has(id)) return { kind: "job", id };
+      if (jobs.has(id)) jobId = id;
     } catch {
       /* not a job: try the other kinds */
     }
     const wanted = ref.trim().toUpperCase();
-    for (const id of unreadable.keys()) if (id === wanted || id.endsWith(wanted)) return { kind: "unreadable", id };
+    if (!jobId) for (const id of unreadable.keys()) if (id === wanted || id.endsWith(wanted)) return { kind: "unreadable", id };
+    let threadId: string | undefined;
     try {
-      return { kind: "thread", id: this.deps.threads.resolve(ref) };
+      threadId = this.deps.threads.resolve(ref);
     } catch (err) {
       if (/ambiguous/.test((err as Error).message)) throw err;
     }
+    if (jobId && threadId) throw new Error(`"${ref}" is ambiguous: job ${jobId} and chat ${threadId}. Use the full id.`);
+    if (jobId) return { kind: "job", id: jobId };
+    if (threadId) return { kind: "thread", id: threadId };
     // "latest", "the failed audit", "yesterday's review": the job resolver, strict about ambiguity.
     try {
       return { kind: "job", id: resolveJobRef(this.deps.registry, ref, { purpose: "delete" }).id };

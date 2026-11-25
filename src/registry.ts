@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { acquireLock, appendJsonl, atomicWriteFile, atomicWriteJson, readJsonl, tryAcquireLock, type FileLock } from "./fsutil.js";
 import { isLocalJobId, newLocalJobId } from "./ids.js";
-import { removeDirRobust, DELETING_PREFIX } from "./removal.js";
+import { removeDirRobust, renameRobust, DELETING_PREFIX } from "./removal.js";
 import { ACTIVE_STATUSES, assertTransition, isLocalStatus, type LocalStatus } from "./state.js";
 import { nowIso } from "./time.js";
 import type { JobEvent, JobManifest } from "./types.js";
@@ -266,11 +266,11 @@ export class JobRegistry {
     const parked = path.join(this.root, `${DELETING_PREFIX}${localId}`);
     try {
       if (ACTIVE_STATUSES.has(this.read(localId).localStatus)) throw new Error(`Job ${localId} is active and was not removed.`);
-      lock.release();
-      fs.renameSync(dir, parked);
-    } catch (err) {
-      lock.release();
-      throw err;
+      // Renamed while the lock is still held, so nothing can touch the job between the check and the move.
+      if (fs.existsSync(parked)) await removeDirRobust(parked); // a stale leftover of an earlier attempt
+      await renameRobust(dir, parked);
+    } finally {
+      lock.release(); // the lock file moved with the folder; unlinking the old path is a harmless no-op
     }
     await removeDirRobust(parked);
   }

@@ -3,7 +3,7 @@ import * as path from "node:path";
 import { acquireLock, appendJsonl, LockTimeoutError, atomicWriteJson, readJsonl } from "../fsutil.js";
 import { isThreadId, newThreadId } from "../ids.js";
 import type { ProviderPin } from "../openrouter/types.js";
-import { DELETING_PREFIX, removeDirRobust } from "../removal.js";
+import { DELETING_PREFIX, removeDirRobust, renameRobust } from "../removal.js";
 import { nowIso } from "../time.js";
 import type { ThreadState, TranscriptEntry, TranscriptEntryInput } from "./types.js";
 
@@ -123,11 +123,11 @@ export class ThreadStore {
     try {
       const t = this.read(id);
       if (t.pending || t.compacting) throw new Error(`Thread ${id} is in use and was not removed.`);
+      // Renamed while the lock is still held, so a turn cannot start between the check and the move.
+      if (fs.existsSync(parked)) await removeDirRobust(parked); // a stale leftover of an earlier attempt
+      await renameRobust(dir, parked);
+    } finally {
       lock.release();
-      fs.renameSync(dir, parked);
-    } catch (err) {
-      lock.release();
-      throw err;
     }
     await removeDirRobust(parked);
   }

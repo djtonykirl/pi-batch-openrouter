@@ -140,14 +140,14 @@ test("an unresolvable ref throws naming it", () => {
   }
 });
 
-test("apply deletes the planned list; threads go after their jobs", async () => {
+test("apply deletes the planned list; a chat goes before its jobs", async () => {
   const { ws, registry, threads, svc, exists } = setup();
   try {
     const t = threads.create({ model: "m/x", account: "default" });
     const turn = mkJob(registry, { threadId: t.id });
     const keep = mkJob(registry);
     const res = await svc.apply(svc.plan({ refs: [t.id] }).planId);
-    assert.deepEqual(res.deleted.map((d) => d.kind), ["job", "thread"]);
+    assert.deepEqual(res.deleted.map((d) => d.kind), ["thread", "job"]);
     assert.equal(exists(t.id), false);
     assert.equal(exists(turn.localId), false);
     assert.equal(exists(keep.localId), true);
@@ -170,24 +170,6 @@ test("a job that becomes active between plan and apply is skipped, the rest stil
     assert.deepEqual(res.deleted.map((d) => d.id), [a.localId]);
     assert.deepEqual(res.skipped.map((s) => s.id), [b.localId]);
     assert.equal(exists(b.localId), true);
-  } finally {
-    rm(ws);
-  }
-});
-
-test("a thread is kept when one of its jobs could not be deleted", async () => {
-  const { ws, registry, threads, svc, exists } = setup();
-  try {
-    const t = threads.create({ model: "m/x", account: "default" });
-    const turn = mkJob(registry, { threadId: t.id });
-    const plan = svc.plan({ refs: [t.id] });
-    registry.update(turn.localId, (u) => {
-      u.manifest.localStatus = "polling";
-    });
-    const res = await svc.apply(plan.planId);
-    assert.deepEqual(res.deleted, []);
-    assert.equal(exists(t.id), true);
-    assert.match(res.skipped.find((s) => s.id === t.id)!.reason, /job/);
   } finally {
     rm(ws);
   }
@@ -314,6 +296,87 @@ test("an ambiguous description is refused with the candidates, not guessed", () 
     mkJob(registry, { createdAt: ago(3) });
     mkJob(registry, { createdAt: ago(3) });
     assert.throws(() => svc.plan({ refs: ["the finished job"] }), /more than one|Which one/);
+  } finally {
+    rm(ws);
+  }
+});
+
+test("naming a busy chat together with its turn job deletes neither", () => {
+  const { ws, registry, threads, svc } = setup();
+  try {
+    const t = threads.create({ model: "m/x", account: "default" });
+    const turn = mkJob(registry, { threadId: t.id });
+    threads.update(t.id, (s) => {
+      s.pending = { throughSeq: 1, claimedAt: ago(0) };
+    });
+    for (const refs of [[t.id, turn.localId], [turn.localId, t.id]]) {
+      const plan = svc.plan({ refs });
+      assert.deepEqual(plan.items, []);
+      assert.deepEqual(ids(plan.skipped), [t.id, turn.localId].sort());
+    }
+  } finally {
+    rm(ws);
+  }
+});
+
+test("a job whose group is blocked stays out even when it is also named on its own", () => {
+  const { ws, registry, svc } = setup();
+  try {
+    const a = mkJob(registry);
+    const b = mkJob(registry, { parentJobId: a.localId });
+    const c = mkJob(registry, { parentJobId: a.localId, status: "polling" });
+    const plan = svc.plan({ refs: [a.localId, b.localId] });
+    assert.deepEqual(plan.items, []);
+    assert.deepEqual(ids(plan.skipped), [a.localId, b.localId, c.localId].sort());
+  } finally {
+    rm(ws);
+  }
+});
+
+test("apply deletes a chat before its jobs: a chat that became busy keeps its jobs too", async () => {
+  const { ws, registry, threads, svc, exists } = setup();
+  try {
+    const t = threads.create({ model: "m/x", account: "default" });
+    const turn = mkJob(registry, { threadId: t.id });
+    const plan = svc.plan({ refs: [t.id] });
+    threads.update(t.id, (s) => {
+      s.pending = { throughSeq: 1, claimedAt: ago(0) };
+    });
+    const res = await svc.apply(plan.planId);
+    assert.deepEqual(res.deleted, []);
+    assert.equal(exists(t.id), true);
+    assert.equal(exists(turn.localId), true);
+    assert.match(res.skipped.find((s) => s.id === turn.localId)!.reason, /chat/);
+  } finally {
+    rm(ws);
+  }
+});
+
+test("a short ref matching both a job and a chat is ambiguous, not silently the job", () => {
+  const { ws, registry, threads, svc } = setup();
+  try {
+    const j = mkJob(registry, { createdAt: ago(3) });
+    const t = threads.create({ model: "m/x", account: "default" });
+    const tail = j.localId.slice(-4);
+    threads.update(t.id, (s) => {
+      s.title = tail;
+    });
+    assert.throws(() => svc.plan({ refs: [tail] }), /ambiguous/);
+    assert.deepEqual(ids(svc.plan({ refs: [j.localId] }).items), [j.localId]);
+  } finally {
+    rm(ws);
+  }
+});
+
+test("a clean-up reports unreadable job folders instead of silently leaving them", () => {
+  const { ws, root, registry, svc } = setup();
+  try {
+    const bad = mkJob(registry, { createdAt: ago(10) });
+    fs.writeFileSync(path.join(root, bad.localId, "manifest.json"), "{ not json");
+    const plan = svc.plan({ olderThanMs: 0, include: "all" });
+    assert.deepEqual(plan.items, []);
+    assert.equal(plan.skipped[0]!.id, bad.localId);
+    assert.match(plan.skipped[0]!.reason, /unreadable/);
   } finally {
     rm(ws);
   }
