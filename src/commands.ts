@@ -1,6 +1,7 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { parseArgs, tokenize, type ParsedArgs } from "./args.js";
+import { runClean, runDelete } from "./cleanup-commands.js";
 import { saveConfigUpdate } from "./config.js";
 import { previewPin } from "./openrouter/routing.js";
 import type { PrivacyLevel } from "./privacy/policy.js";
@@ -39,6 +40,8 @@ const SUBCOMMANDS: Record<string, { desc: string; nonTerminal: boolean }> = {
   metadata: { desc: "Databricks table descriptions/column comments: metadata plan|summary|review|approved|validate-approved", nonTerminal: true },
   "import-legacy": { desc: "Inventory a pre-Release-1 jobs.json (read-only): import-legacy <path> --preview", nonTerminal: true },
   chat: { desc: "Chat with a model at batch prices: chat [continue|resume|clear|rename|model|compact|context|cost|export|off|retry|help]", nonTerminal: true },
+  delete: { desc: "Delete finished jobs/chats (asks once): delete <job-or-chat>... [--remote] [--yes]", nonTerminal: true },
+  clean: { desc: "Delete all finished jobs/chats older than a cutoff: clean [--older-than 7d] [--chats|--jobs] [--yes]", nonTerminal: true },
   items: { desc: "List a job's request items", nonTerminal: true },
   item: { desc: "Inspect one item: item <id> <n|custom_id|path> [--text] [--raw]", nonTerminal: true },
   "retry-items": { desc: "Re-run failed/selected items as a new linked job: retry-items <id> --failed | --item n", nonTerminal: true },
@@ -63,6 +66,7 @@ const ID_COMMANDS: Record<string, (j: JobManifest) => boolean> = {
   "retry-items": (j) => TERMINAL_STATUSES.has(j.localStatus),
   synthesize: (j) => j.kind !== "synthesis" && (j.localStatus === "ready" || j.localStatus === "partial"),
   export: (j) => TERMINAL_STATUSES.has(j.localStatus),
+  delete: (j) => TERMINAL_STATUSES.has(j.localStatus),
   artifact: (j) => j.localStatus === "ready" || j.localStatus === "partial",
 };
 
@@ -107,6 +111,10 @@ const HELP = `/batch — deferred OpenRouter Batch goals
                                      add a result to THIS conversation's context
   check [id]                         reconcile with OpenRouter now
   cancel <id>                        request cancellation; history is kept
+  delete <job-or-chat>... [--remote] [--yes]
+                                     delete finished jobs/chats (a chat takes its turn jobs, a job its retries)
+  clean [--older-than 7d] [--chats|--jobs] [--remote] [--yes]
+                                     delete all finished jobs and idle chats older than the cutoff (default 7d)
   retry <id> [--model <slug>]        new linked job from the exact original request
   retry-items <id> --failed | --item <sel> ... [--model <slug>] [--preview]
   synthesize <id> [--allow-partial] [--model] [--account] [--provider] [--preview]
@@ -270,6 +278,11 @@ async function dispatch(rt: BatchRuntime, args: string, ctx: ExtensionCommandCon
       return cmdCheck(rt, rest);
     case "cancel":
       return cmdCancel(rt, rest);
+    case "delete":
+    case "rm":
+      return cmdCleanup(rt, ctx, rest, "delete");
+    case "clean":
+      return cmdCleanup(rt, ctx, rest, "clean");
     case "retry":
       return cmdRetry(rt, rest);
     case "view":
@@ -566,6 +579,20 @@ async function cmdCancel(rt: BatchRuntime, rest: string[]): Promise<void> {
   const { message } = await rt.requireService().cancel(id);
   rt.poller.updateBadge();
   rt.notify(`${id}: ${message}`, "info");
+}
+
+/** `/batch delete` and `/batch clean`: the plan is shown, confirmed once (or `--yes`), then deleted. */
+async function cmdCleanup(rt: BatchRuntime, ctx: ExtensionCommandContext, rest: string[], which: "delete" | "clean"): Promise<void> {
+  const deps = {
+    cleanup: rt.requireCleanup(),
+    confirm: async (title: string, body: string) => (ctx.hasUI ? ctx.ui.confirm(title, body) : false),
+  };
+  const { text } = await (which === "delete" ? runDelete(deps, rest) : runClean(deps, rest));
+  const hint = ctx.hasUI || /deleted,|Nothing to delete/.test(text) ? "" : `
+
+No interactive session to confirm in: re-run with --yes to delete.`;
+  rt.notify(text + hint, "info");
+  rt.poller.updateBadge();
 }
 
 async function cmdRetry(rt: BatchRuntime, rest: string[]): Promise<void> {
