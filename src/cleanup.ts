@@ -105,6 +105,16 @@ export class CleanupService {
           roots.push({ kind: found.kind, id: found.id });
         }
       }
+      // A chat turn's job is part of its chat: on its own it would leave the transcript pointing at a missing job.
+      const named = new Set(roots.filter((r) => r.kind === "thread").map((r) => r.id));
+      for (let i = roots.length - 1; i >= 0; i--) {
+        const r = roots[i]!;
+        const threadId = r.kind === "job" ? jobs.get(r.id)?.chat?.threadId : undefined;
+        if (threadId && threadList.has(threadId) && !named.has(threadId)) {
+          skipped.set(r.id, { kind: "job", id: r.id, reason: `belongs to chat ${threadId}; delete the chat instead` });
+          roots.splice(i, 1);
+        }
+      }
     } else {
       const cutoff = this.now().getTime() - target.olderThanMs;
       if (target.include !== "chats") {

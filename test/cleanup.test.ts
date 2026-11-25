@@ -272,3 +272,19 @@ test("remote: jobs that never reached OpenRouter are not sent, and nothing is ca
     rm(ws);
   }
 });
+
+test("a chat turn job on its own is refused (delete the chat); naming the chat and its job together is fine; an orphaned turn job can go", () => {
+  const { ws, registry, threads, svc } = setup();
+  try {
+    const t = threads.create({ model: "m/x", account: "default" });
+    const turn = mkJob(registry, { threadId: t.id });
+    const alone = svc.plan({ refs: [turn.localId] });
+    assert.deepEqual(alone.items, []);
+    assert.match(alone.skipped[0]!.reason, new RegExp(`belongs to chat ${t.id}`));
+    assert.deepEqual(ids(svc.plan({ refs: [turn.localId, t.id] }).items), [t.id, turn.localId].sort());
+    const orphan = mkJob(registry, { threadId: "T-20260101-GONE" });
+    assert.deepEqual(ids(svc.plan({ refs: [orphan.localId] }).items), [orphan.localId]);
+  } finally {
+    rm(ws);
+  }
+});
