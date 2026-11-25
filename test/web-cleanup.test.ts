@@ -1,3 +1,4 @@
+import * as vm from "node:vm";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import { join } from "node:path";
@@ -148,5 +149,20 @@ test(
     const bad = await post("/api/cleanup/plan", { olderThan: "soon" });
     assert.equal(bad.status, 400);
     assert.match(((await bad.json()) as { error: string }).error, /older-than/);
+  }),
+);
+
+test(
+  "the page carries the cleanup dialog, its buttons and a whitelisted action, and its script still parses",
+  withWeb(async ({ get }) => {
+    const html = await (await get("/")).text();
+    for (const marker of ["id=\"cleanupModal\"", "id=\"cleanupConfirmBtn\"", "id=\"deleteThreadBtn\"", "window.openCleanupDialog", "/api/cleanup/plan", "/api/cleanup/apply"]) {
+      assert.ok(html.includes(marker), `page lacks ${marker}`);
+    }
+    assert.ok(/ACTIONS = new Set\(\[[^\]]*"openCleanupDialog"/.test(html), "openCleanupDialog is not in the ACTIONS whitelist");
+    assert.ok((html.match(/data-action="openCleanupDialog"/g) ?? []).length >= 2, "both sidebar Clean up buttons");
+    const scripts = [...html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/g)].map((m) => m[1]!).filter((c) => c.trim());
+    assert.ok(scripts.length > 0);
+    for (const code of scripts) assert.doesNotThrow(() => new vm.Script(code));
   }),
 );
