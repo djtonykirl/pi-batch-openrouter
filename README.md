@@ -1192,7 +1192,8 @@ the whole list:
 /batch clean [--older-than 7d|12h|0] [--chats | --jobs] [--remote] [--yes]
 ```
 
-- `delete` takes job ids or unique id suffixes (as `show` does) and chat ids or titles. A **chat** takes the batch jobs
+- `delete` takes job ids or unique id suffixes, chat ids or titles, or a description such as `latest` or `the failed
+  audit` (finished jobs only; an ambiguous description is refused and lists the candidates). A **chat** takes the batch jobs
   of its turns with it; a **job** takes its linked retries and synthesis jobs. Deleting a retry or a synthesis alone
   leaves the source.
 - `clean` selects every **finished** job and **idle** chat older than the cutoff (default `7d`, `0` means everything
@@ -1214,7 +1215,7 @@ skipped, and why); one **Delete N items** button deletes exactly that list. The 
 (7 days, 30 days, everything finished), what to include, and the OpenRouter-copy checkbox; changing an option re-plans.
 
 **In the TUI dashboard** (`/batch view`): `d` deletes the selected job (with what is linked to it) and `x` cleans every
-finished job older than 7 days. Either shows the list (first 10, then a count) and waits for `y`; any other key cancels.
+finished job older than 7 days, `X` every finished job whatever its age. Either shows the list (first 10, then a count) and waits for `y`; any other key cancels.
 The dashboard lists jobs only, so a chat's turn jobs are removed with the chat, from the web UI or `/batch delete`.
 
 ## Storage

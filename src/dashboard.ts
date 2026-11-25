@@ -12,8 +12,8 @@ import { isDatasetWorkflow, isMetadataWorkflow, type JobManifest } from "./types
 export interface DashboardActions {
   refresh(): Promise<JobManifest[]>;
   cancel(localId: string): Promise<string>;
-  /** Plans deleting one job (with what is linked to it), or, with null, every finished job older than 7 days. Read-only. */
-  planDelete(localId: string | null): CleanupPlan;
+  /** Plans deleting one job (with what is linked to it), or, with null, every finished job older than `olderThanDays` (0 = all finished). Read-only. */
+  planDelete(localId: string | null, olderThanDays?: number): CleanupPlan;
   /** Deletes exactly the items of a plan from `planDelete`. */
   applyDelete(planId: string): Promise<CleanupResult>;
   /** Close the dashboard and open the result viewer. */
@@ -54,10 +54,10 @@ export class BatchDashboardComponent implements Component {
   }
 
   /** Plans a delete and puts the list on screen for a `y`; anything that cannot be deleted is explained instead. */
-  private startDelete(localId: string | null): void {
+  private startDelete(localId: string | null, olderThanDays = 7): void {
     let plan: CleanupPlan;
     try {
-      plan = this.actions.planDelete(localId);
+      plan = this.actions.planDelete(localId, olderThanDays);
     } catch (err) {
       this.setFlash(`Cannot plan the delete: ${(err as Error).message}`);
       return;
@@ -123,8 +123,12 @@ export class BatchDashboardComponent implements Component {
       );
       return;
     }
-    if (data === "x" || data === "X") {
-      this.startDelete(null);
+    if (data === "x") {
+      this.startDelete(null, 7);
+      return;
+    }
+    if (data === "X") {
+      this.startDelete(null, 0);
       return;
     }
     if (!job) return;
@@ -179,7 +183,7 @@ export class BatchDashboardComponent implements Component {
     });
     lines.push(hr);
     if (this.flash) lines.push(`\x1b[33m${this.flash}\x1b[0m`);
-    lines.push("\x1b[90m[↑/↓] Move  [Enter] Details  [o] Read  [i] Inject  [c] Cancel  [d] Delete  [x] Clean up 7d+  [r] Refresh  [q] Close\x1b[0m");
+    lines.push("\x1b[90m[↑/↓] Move  [Enter] Details  [o] Read  [i] Inject  [c] Cancel  [d] Delete  [x] Clean 7d+  [X] Clean all finished  [r] Refresh  [q] Close\x1b[0m");
     return lines.map(fit);
   }
 

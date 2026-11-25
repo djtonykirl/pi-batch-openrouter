@@ -1,5 +1,5 @@
 import { JobNotFoundError, type JobRegistry } from "./registry.js";
-import { ACTIVE_STATUSES, type LocalStatus } from "./state.js";
+import { ACTIVE_STATUSES, TERMINAL_STATUSES, type LocalStatus } from "./state.js";
 import { isChatJob, isMetadataWorkflow, type JobManifest } from "./types.js";
 import { jobLabel, relativeTime, statusPhrase } from "./humanize.js";
 
@@ -8,11 +8,11 @@ import { jobLabel, relativeTime, statusPhrase } from "./humanize.js";
  * a user-given name, or a plain ID/suffix) to a local job ID.
  *
  * The resolver is deliberately conservative: when a reference is ambiguous for a cost-bearing or destructive
- * purpose (`submit`, `cancel`) it refuses and lists the candidates instead of guessing.
+ * purpose (`submit`, `cancel`, `delete`) it refuses and lists the candidates instead of guessing.
  */
 
 /** What the caller is about to do with the job; used to prefer (and, for submit/cancel, require) suitable jobs. */
-export type JobPurpose = "any" | "result" | "submit" | "cancel" | "multi-item" | "metadata";
+export type JobPurpose = "any" | "result" | "submit" | "cancel" | "multi-item" | "metadata" | "delete";
 
 export interface JobRefResolution {
   id: string;
@@ -38,6 +38,8 @@ const PURPOSE_FILTER: Record<JobPurpose, (j: JobManifest) => boolean> = {
   submit: (j) => j.localStatus === "previewed",
   cancel: (j) => j.localStatus === "previewed" || ACTIVE_STATUSES.has(j.localStatus),
   "multi-item": (j) => FINISHED.has(j.localStatus) && j.requestCount > 1,
+  // Finished work only; a chat turn is deleted with its chat.
+  delete: (j) => TERMINAL_STATUSES.has(j.localStatus) && !isChatJob(j),
   // The original metadata job; its retries are combined into it and are never addressed on their own.
   metadata: (j) => isMetadataWorkflow(j.workflow) && !j.parentJobId,
 };
@@ -48,11 +50,12 @@ const PURPOSE_NOUN: Record<JobPurpose, string> = {
   submit: "saved plan that has not been submitted",
   cancel: "running job or unsubmitted plan",
   "multi-item": "finished multi-item batch job",
+  delete: "finished batch job that can be deleted",
   metadata: "Databricks metadata job",
 };
 
 /** Purposes where guessing between several matches is not acceptable. */
-const STRICT: ReadonlySet<JobPurpose> = new Set<JobPurpose>(["submit", "cancel"]);
+const STRICT: ReadonlySet<JobPurpose> = new Set<JobPurpose>(["submit", "cancel", "delete"]);
 
 const STATUS_WORDS: Array<{ words: string[]; match: (s: LocalStatus) => boolean }> = [
   { words: ["ready", "finished", "done", "completed", "complete", "succeeded", "successful"], match: (s) => FINISHED.has(s) },

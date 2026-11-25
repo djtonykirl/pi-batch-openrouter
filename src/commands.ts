@@ -1018,7 +1018,7 @@ async function cmdView(rt: BatchRuntime, ctx: ExtensionCommandContext): Promise<
           rt.poller.updateBadge();
           return message;
         },
-        planDelete: (id) => rt.requireCleanup().plan(id ? { refs: [id] } : { olderThanMs: 7 * 86_400_000, include: "jobs" }),
+        planDelete: (id, days = 7) => rt.requireCleanup().plan(id ? { refs: [id] } : { olderThanMs: days * 86_400_000, include: "jobs" }),
         applyDelete: async (planId) => {
           const res = await rt.requireCleanup().apply(planId);
           comp.updateJobs(service.registry.list().jobs);

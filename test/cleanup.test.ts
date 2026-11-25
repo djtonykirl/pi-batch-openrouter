@@ -218,13 +218,17 @@ test("a plan can be applied only once", async () => {
   }
 });
 
-test("a clean plan sweeps leftover .deleting-* folders", () => {
+test("planning leaves .deleting-* leftovers alone; apply sweeps them", async () => {
   const { ws, root, registry, svc } = setup();
   try {
-    mkJob(registry);
-    fs.mkdirSync(path.join(root, ".deleting-B-20261101-ABCD"));
-    svc.plan({ olderThanMs: 0, include: "all" });
-    assert.equal(fs.existsSync(path.join(root, ".deleting-B-20261101-ABCD")), false);
+    const j = mkJob(registry, { createdAt: ago(1) });
+    const left = path.join(root, ".deleting-B-20261101-ABCD");
+    fs.mkdirSync(left);
+    const plan = svc.plan({ olderThanMs: 0, include: "all" });
+    assert.equal(fs.existsSync(left), true, "planning must stay read-only");
+    await svc.apply(plan.planId);
+    assert.equal(fs.existsSync(left), false);
+    assert.deepEqual(ids(plan.items), [j.localId]);
   } finally {
     rm(ws);
   }
@@ -284,6 +288,32 @@ test("a chat turn job on its own is refused (delete the chat); naming the chat a
     assert.deepEqual(ids(svc.plan({ refs: [turn.localId, t.id] }).items), [t.id, turn.localId].sort());
     const orphan = mkJob(registry, { threadId: "T-20260101-GONE" });
     assert.deepEqual(ids(svc.plan({ refs: [orphan.localId] }).items), [orphan.localId]);
+  } finally {
+    rm(ws);
+  }
+});
+
+test("natural references: latest picks the newest finished job; running jobs and chat turns are never matched", () => {
+  const { ws, registry, threads, svc } = setup();
+  try {
+    const older = mkJob(registry, { createdAt: ago(5) });
+    const newest = mkJob(registry, { createdAt: ago(1) });
+    mkJob(registry, { createdAt: ago(0), status: "polling" });
+    const t = threads.create({ model: "m/x", account: "default" });
+    mkJob(registry, { threadId: t.id, createdAt: ago(0) });
+    assert.deepEqual(ids(svc.plan({ refs: ["latest"] }).items), [newest.localId]);
+    assert.ok(!ids(svc.plan({ refs: ["latest"] }).items).includes(older.localId));
+  } finally {
+    rm(ws);
+  }
+});
+
+test("an ambiguous description is refused with the candidates, not guessed", () => {
+  const { ws, registry, svc } = setup();
+  try {
+    mkJob(registry, { createdAt: ago(3) });
+    mkJob(registry, { createdAt: ago(3) });
+    assert.throws(() => svc.plan({ refs: ["the finished job"] }), /more than one|Which one/);
   } finally {
     rm(ws);
   }

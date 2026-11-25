@@ -17,12 +17,13 @@ const plan = (ids: string[], extra: Partial<CleanupPlan> = {}): CleanupPlan => (
 });
 
 function harness(planFor: (id: string | null) => CleanupPlan) {
-  const calls: { planned: Array<string | null>; applied: string[]; renders: number } = { planned: [], applied: [], renders: 0 };
+  const calls: { planned: Array<string | null>; days: Array<number | undefined>; applied: string[]; renders: number } = { planned: [], days: [], applied: [], renders: 0 };
   const actions: DashboardActions = {
     refresh: async () => [],
     cancel: async () => "cancelled",
-    planDelete: (id) => {
+    planDelete: (id, days) => {
       calls.planned.push(id);
+      calls.days.push(days);
       return planFor(id);
     },
     applyDelete: async (planId): Promise<CleanupResult> => {
@@ -34,7 +35,7 @@ function harness(planFor: (id: string | null) => CleanupPlan) {
     close: () => {},
   };
   const comp = new BatchDashboardComponent([job("B-1"), job("B-2")], actions, () => void calls.renders++);
-  const text = () => comp.render(120).join("\n").replace(/\x1b\[[0-9;]*m/g, "");
+  const text = () => comp.render(200).join("\n").replace(/\x1b\[[0-9;]*m/g, "");
   return { comp, calls, text };
 }
 
@@ -62,11 +63,17 @@ test("any key other than y cancels and deletes nothing", () => {
   assert.deepEqual(h.calls.applied, []);
 });
 
-test("x plans the 7 day clean-up (no id) and lists at most 10 items with a count of the rest", () => {
+test("x plans the 7 day clean-up, X every finished job; at most 10 items are listed with a count of the rest", () => {
   const ids = Array.from({ length: 13 }, (_, i) => `B-${i}`);
   const h = harness(() => plan(ids));
   h.comp.handleInput("x");
   assert.deepEqual(h.calls.planned, [null]);
+  assert.deepEqual(h.calls.days, [7]);
+  h.comp.handleInput("n");
+  h.comp.handleInput("X");
+  assert.deepEqual(h.calls.days, [7, 0]);
+  h.comp.handleInput("n");
+  h.comp.handleInput("x");
   const out = h.text();
   assert.match(out, /Delete 13 items/);
   assert.ok(out.includes("B-9") && !out.includes("B-10"));
@@ -88,5 +95,5 @@ test("nothing to clean says so", () => {
 
 test("the footer advertises the delete keys", () => {
   const h = harness(() => plan([]));
-  assert.match(h.text(), /\[d\] Delete {2}\[x\] Clean up 7d\+/);
+  assert.match(h.text(), /\[d\] Delete {2}\[x\] Clean 7d\+ {2}\[X\] Clean all finished/);
 });

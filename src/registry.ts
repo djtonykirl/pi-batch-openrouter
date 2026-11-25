@@ -258,15 +258,14 @@ export class JobRegistry {
   /**
    * Deletes a job's folder. Under the job lock it re-reads the status and refuses an active job, then renames the
    * folder to `.deleting-<id>` (so a crash mid-removal never leaves a half-visible job) and removes it.
-   * `force` skips the status read, for an explicitly named job whose manifest is corrupt.
    */
-  public async removeJob(localId: string, opts: { force?: boolean } = {}): Promise<void> {
+  public async removeJob(localId: string): Promise<void> {
     const dir = this.jobDir(localId);
     if (!fs.existsSync(dir)) return;
     const lock = this.lock(localId);
     const parked = path.join(this.root, `${DELETING_PREFIX}${localId}`);
     try {
-      if (!opts.force && ACTIVE_STATUSES.has(this.read(localId).localStatus)) throw new Error(`Job ${localId} is active and was not removed.`);
+      if (ACTIVE_STATUSES.has(this.read(localId).localStatus)) throw new Error(`Job ${localId} is active and was not removed.`);
       lock.release();
       fs.renameSync(dir, parked);
     } catch (err) {

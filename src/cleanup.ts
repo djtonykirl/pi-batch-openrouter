@@ -3,6 +3,7 @@ import * as path from "node:path";
 import type { ThreadStore } from "./chat/store.js";
 import type { ThreadState } from "./chat/types.js";
 import { jobLabel } from "./humanize.js";
+import { resolveJobRef } from "./job-ref.js";
 import { neverReachedOpenRouter } from "./privacy/policy.js";
 import type { JobRegistry } from "./registry.js";
 import { dirSizeBytes } from "./removal.js";
@@ -84,10 +85,6 @@ export class CleanupService {
   public plan(target: CleanupTarget, opts: { remote?: boolean } = {}): CleanupPlan {
     const { registry, threads } = this.deps;
     const isFilter = "olderThanMs" in target;
-    if (isFilter) {
-      registry.sweepDeleting();
-      threads.sweepDeleting();
-    }
     const listed = registry.list();
     const jobs = new Map(listed.jobs.map((j) => [j.localId, j]));
     const unreadable = new Map(listed.unreadable.map((u) => [u.localId, u.reason]));
@@ -223,6 +220,9 @@ export class CleanupService {
       throw new Error("That cleanup plan is unknown or has expired; re-plan it and confirm again.");
     }
     const { registry, threads } = this.deps;
+    // Leftovers of an interrupted delete are swept here, so planning stays read-only.
+    registry.sweepDeleting();
+    threads.sweepDeleting();
     const deleted: CleanupItem[] = [];
     const skipped: CleanupSkip[] = [...stored.plan.skipped];
     const failedJobs = new Set<string>();
@@ -291,6 +291,12 @@ export class CleanupService {
       return { kind: "thread", id: this.deps.threads.resolve(ref) };
     } catch (err) {
       if (/ambiguous/.test((err as Error).message)) throw err;
+    }
+    // "latest", "the failed audit", "yesterday's review": the job resolver, strict about ambiguity.
+    try {
+      return { kind: "job", id: resolveJobRef(this.deps.registry, ref, { purpose: "delete" }).id };
+    } catch (err) {
+      if (/more than one/.test((err as Error).message)) throw err;
       throw new Error(`No chat or batch job matches "${ref}".`);
     }
   }
