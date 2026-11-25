@@ -1028,20 +1028,24 @@ guidance can appear in one prompt. Audit columns are left out with their profile
 
 **Tags.**
 - Table tags are exactly `classification` (`public|internal|confidential|restricted|pii_scan_required`), `data_domain`,
-  `uc_prefix`, `medallion_layer` (`bronze|silver|gold`) and `pii` (`true|false`).
-- The model proposes **only** `classification` and the column PII tags. Pi derives `data_domain`, `uc_prefix`,
-  `medallion_layer` (from the schema name) and the table `pii` (`true` if and only if some column is PII).
-- **Sparse PII column tags.** A column carries either no tags or exactly `pii: "true"` with `pii_type` (`email`,
-  `phone`, `ssn`, `name`, `address`, `dob`, `ip_address`, `device_id`, `financial`, `health`, `biometric`,
-  `location`), `sensitivity` (`low|medium|high`) and `requires_masking` (`true|false`). `pii: "false"` is never
-  emitted. A PII column in a `public` table, or a column with `pii: "false"`, makes the item `corrupt` and retryable.
+  `uc_prefix` and `medallion_layer` (`bronze|silver|gold`). A table's PII status is its classification.
+- The model proposes **only** `classification` and the column PII tags. Pi derives `data_domain`, `uc_prefix` and
+  `medallion_layer` (from the schema name).
+- **Sparse PII column tags.** A column is PII when it carries `pii_type` (`email`, `phone`, `ssn`, `name`, `address`,
+  `dob`, `ip_address`, `device_id`, `financial`, `health`, `biometric`, `location`) together with `sensitivity`
+  (`low|medium|high`) and `requires_masking` (`true|false`); a non-PII column carries `{}`. A PII column in a `public`
+  table makes the item `corrupt` and retryable.
+- **The `pii` tag key is retired** (2026-11-25, matching the Lighthouse contract): the workspace's governed `pii` tag
+  only allows its own values, so `pii=true|false` could never be applied. Pi never writes or requires it; an approved
+  row that still carries it fails `validate-approved` as an unknown key, and existing tags that carry it are dropped
+  from the draft without showing as a change.
 
 **Audit columns.** `fw_pipelinerowchecksum`, `fw_ingestdate` and `pipeline_timestamp` (any case) are never sent to the
 model, and their approved values are their existing values. The Lighthouse applier assigns their standard definitions.
 
 **The draft rule.** In standards mode the `approved` draft keeps an existing value only if it passes the standards
 checks, and otherwise takes the proposal. The review marks such a value as replacing a non-standard one, and
-`validate-approved` reports any non-standard approved value. A valid existing PII tag is never dropped. A table with no
+`validate-approved` reports any non-standard approved value. A valid existing PII tag (`pii_type` with its companions) is never dropped. A table with no
 proposal gets derived tags with classification `pii_scan_required` (or its existing taxonomy value). A description whose
 `CLASSIFICATION:` line conflicts with the tags is withheld (null) and marked. In a table with no proposal, non-standard
 existing text is withheld (null) and marked. `validate-approved` checks every non-null value; only the framework audit

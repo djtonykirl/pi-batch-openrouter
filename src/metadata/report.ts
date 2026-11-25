@@ -6,6 +6,7 @@ import { isMetadataWorkflow, type JobManifest } from "../types.js";
 import { approvedRowProblems, evidenceHash, identityKey, type ApprovedColumn, type ApprovedRow, type Confidence, type TableEvidence, type TableProposal, type TagMap } from "./contract.js";
 import {
   CLASSIFICATIONS,
+  RETIRED_TAG_KEYS,
   TABLE_TAG_KEYS,
   columnCommentProblems,
   columnTagProblems,
@@ -16,6 +17,7 @@ import {
   isAuditColumn,
   piiTextProblems,
   tableTagProblems,
+  withoutRetiredTags,
   type MetadataStandards,
 } from "./standards.js";
 
@@ -106,6 +108,8 @@ function replacesNonStandard(existing: string | null, approved: string | null, p
 }
 
 const sameTags = (a: TagMap | undefined, b: TagMap | undefined) => canonicalJson(a ?? {}) === canonicalJson(b ?? {});
+/** Tag maps for a review comparison: a retired key (pii) is dropped, never shown as a change. */
+const sameTagsIgnoringRetired = (a: TagMap | undefined, b: TagMap | undefined) => sameTags(withoutRetiredTags(a), withoutRetiredTags(b));
 const fmtTags = (t: TagMap | undefined) => {
   const entries = Object.entries(t ?? {});
   return entries.length ? `\`${entries.map(([k, v]) => `${k}=${v}`).join(", ").replace(/`/g, "'").replace(/\r?\n/g, " ")}\`` : "none";
@@ -163,10 +167,10 @@ const tagsChangedMark = (existing: TagMap | undefined, approved: TagMap | undefi
 
 /** Standards review: the table's tag change, and which existing tags fell outside the taxonomy. */
 function reviewTagLines(row: ApprovedRow): string[] {
-  const lines = [sameTags(row.existing_tags, row.approved_tags) ? `**Tags:** ${fmtTags(row.approved_tags)} _(unchanged)_` : `**Tags:** ${tagsChangedMark(row.existing_tags, row.approved_tags)}`];
+  const lines = [sameTagsIgnoringRetired(row.existing_tags, row.approved_tags) ? `**Tags:** ${fmtTags(row.approved_tags)} _(unchanged)_` : `**Tags:** ${tagsChangedMark(withoutRetiredTags(row.existing_tags), row.approved_tags)}`];
   const dropped: string[] = [];
-  if (Object.keys(row.existing_tags ?? {}).some((k) => !(TABLE_TAG_KEYS as readonly string[]).includes(k))) dropped.push("table");
-  for (const c of row.columns) if (!isAuditColumn(c.name) && Object.keys(c.existing_tags ?? {}).length && columnTagProblems(c.existing_tags!).length) dropped.push(`column ${cell(c.name)}`);
+  if (Object.keys(row.existing_tags ?? {}).some((k) => !(TABLE_TAG_KEYS as readonly string[]).includes(k) && !(RETIRED_TAG_KEYS as readonly string[]).includes(k))) dropped.push("table");
+  for (const c of row.columns) if (!isAuditColumn(c.name) && Object.keys(c.existing_tags ?? {}).length && columnTagProblems(withoutRetiredTags(c.existing_tags)).length) dropped.push(`column ${cell(c.name)}`);
   if (dropped.length) lines.push("", `${DROPPED_MARK} (${dropped.join(", ")})`);
   return [...lines, ""];
 }
@@ -208,8 +212,8 @@ export function metadataReviewMarkdown(o: MetadataOutcome): string {
     if (!t.proposal) {
       out.push(`_No usable proposal (${t.status})._ Retry it with \`/batch retry-items ${o.job.localId} --failed\`.`);
       if (row) {
-        const changed = row.columns.filter((c) => !isAuditColumn(c.name) && !sameTags(c.existing_tags, c.approved_tags));
-        if (changed.length) out.push("", ...changed.map((c) => `- ${cell(c.name)}: ${tagsChangedMark(c.existing_tags, c.approved_tags)}`));
+        const changed = row.columns.filter((c) => !isAuditColumn(c.name) && !sameTagsIgnoringRetired(c.existing_tags, c.approved_tags));
+        if (changed.length) out.push("", ...changed.map((c) => `- ${cell(c.name)}: ${tagsChangedMark(withoutRetiredTags(c.existing_tags), c.approved_tags)}`));
         const withheld = [
           ...(row.approved_description === null && row.existing_description !== null ? ["description"] : []),
           ...row.columns.filter((c) => !isAuditColumn(c.name) && c.approved_comment === null && c.existing_comment !== null).map((c) => `column ${cell(c.name)}`),
@@ -248,8 +252,8 @@ export function metadataReviewMarkdown(o: MetadataOutcome): string {
       const replaced = replacesNonStandard(c.existing_comment, approvedByName.get(c.name)?.approved_comment ?? null, p.comment, commentIsStandard);
       const ac = approvedByName.get(c.name);
       const approvedTags = ac?.approved_tags ?? {};
-      const mark = !p.pii_tags && approvedTags.pii === "true" ? ` ${KEPT_PII_MARK}` : !sameTags(ac?.existing_tags, approvedTags) ? ` ${tagsChangedMark(ac?.existing_tags, approvedTags)}` : "";
-      const pii = cell(`${approvedTags.pii === "true" ? `${approvedTags.pii_type} (${approvedTags.sensitivity}, masking ${approvedTags.requires_masking})` : "—"}${mark}`);
+      const mark = !p.pii_tags && approvedTags.pii_type !== undefined ? ` ${KEPT_PII_MARK}` : !sameTagsIgnoringRetired(ac?.existing_tags, approvedTags) ? ` ${tagsChangedMark(withoutRetiredTags(ac?.existing_tags), approvedTags)}` : "";
+      const pii = cell(`${approvedTags.pii_type !== undefined ? `${approvedTags.pii_type} (${approvedTags.sensitivity}, masking ${approvedTags.requires_masking})` : "—"}${mark}`);
       out.push(`| ${cell(c.name)} | ${cell(c.data_type)} |${tier} ${cell(c.existing_comment)} | ${cell(p.comment)}${replaced ? ` ${REPLACES_MARK}` : ""} | ${p.confidence} | ${pii} |`);
     }
     const insufficient = t.proposal.columns.filter((c) => c.comment === null);
@@ -303,9 +307,9 @@ function draftProvenance(o: MetadataOutcome, t: TableOutcome): ApprovedRow["prov
  *   withheld as null (R5: the applier skips null, so the live value is left unchanged);
  * - column tags: the proposed pii_tags, else the existing tags when they are valid
  *   (a valid existing PII tag is never dropped), else {};
- * - table tags are always the five taxonomy keys: classification from the proposal (with
+ * - table tags are always the four taxonomy keys: classification from the proposal (with
  *   no proposal, the existing one when it is in the taxonomy, else pii_scan_required),
- *   the derived facts, and pii from the final column tags; other keys are dropped;
+ *   the derived facts, other keys (including the retired pii key) are dropped;
  * - audit columns always keep their existing comment and tags.
  * Key order follows TDD §3.3.
  */
@@ -318,12 +322,12 @@ function standardsDraftRow(o: MetadataOutcome, t: TableOutcome, standards: Metad
     const existing = { ...(c.existing_tags ?? {}) };
     if (isAuditColumn(c.name)) return { name: c.name, existing_comment: c.existing_comment, approved_comment: c.existing_comment, existing_tags: existing, approved_tags: { ...existing } };
     const pc = byName.get(c.name);
-    const approvedTags = pc?.pii_tags ? columnTagsFromProposal(pc.pii_tags) : validColumnTags(existing);
+    const approvedTags = pc?.pii_tags ? columnTagsFromProposal(pc.pii_tags) : validColumnTags(withoutRetiredTags(existing));
     const existingComment = c.existing_comment !== null && commentIsStandard(c.existing_comment) ? c.existing_comment : null;
     const approvedComment = pc ? standardsDraftValue(c.existing_comment, pc.comment, commentIsStandard) : existingComment;
     return { name: c.name, existing_comment: c.existing_comment, approved_comment: approvedComment, existing_tags: existing, approved_tags: approvedTags };
   });
-  const anyColumnPii = columns.some((c) => !isAuditColumn(c.name) && c.approved_tags?.pii === "true");
+  const anyColumnPii = columns.some((c) => !isAuditColumn(c.name) && c.approved_tags?.pii_type !== undefined);
   const existingClass = existingTags.classification;
   const base = p ? (p.classification ?? "") : existingClass !== undefined && (CLASSIFICATIONS as readonly string[]).includes(existingClass) ? existingClass : "pii_scan_required";
   // A kept PII tag never sits under "public" (tableTagProblems rejects it).
@@ -338,7 +342,7 @@ function standardsDraftRow(o: MetadataOutcome, t: TableOutcome, standards: Metad
     existing_description: ev.existing_description,
     approved_description: description,
     existing_tags: existingTags,
-    approved_tags: deriveTableTags(classification, standards, evidenceLayer(ev) ?? "", anyColumnPii),
+    approved_tags: deriveTableTags(classification, standards, evidenceLayer(ev) ?? ""),
     columns,
     provenance: draftProvenance(o, t),
   };
@@ -480,7 +484,7 @@ export function validateApprovedText(text: string, service: BatchService, jobOve
 /**
  * Standards-mode checks of one approved row, mirroring the TDD §5.1 L1 checks:
  * - existing_tags (table and columns) reproduce the evidence exactly;
- * - the table and column approved_tags follow the taxonomy (table pii from the column tags);
+ * - the table and column approved_tags follow the taxonomy (public never with a pii_type column);
  * - every non-null approved description and non-audit column comment follows the standard
  *   format and carries no PII-looking text.
  * Audit columns are locked: approved_comment and approved_tags must equal the existing
@@ -505,7 +509,7 @@ function standardsRowProblems(line: number, row: ApprovedRow, t: TableOutcome, s
     if (!sameTags(c.approved_tags, e.existing_tags)) problems.push(at(`column ${JSON.stringify(c.name)} is a framework audit column: approved_tags must equal existing_tags`));
   }
   const business = known.filter((c) => !isAuditColumn(c.name));
-  const anyColumnPii = business.some((c) => c.approved_tags?.pii === "true");
+  const anyColumnPii = business.some((c) => c.approved_tags?.pii_type !== undefined);
   const tags = row.approved_tags ?? {};
   problems.push(...tableTagProblems(tags, { ...std, layer: evidenceLayer(ev) }, anyColumnPii).map((m) => at(`approved_tags: ${m}`)));
 
