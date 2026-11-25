@@ -1,5 +1,7 @@
 import type { Component } from "@earendil-works/pi-tui";
 import { matchesKey, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import type { CleanupPlan, CleanupResult } from "./cleanup.js";
+import { formatBytes } from "./cleanup-commands.js";
 import { ACTIVE_STATUSES, TERMINAL_STATUSES as TERMINAL, type LocalStatus } from "./state.js";
 import { formatPin } from "./openrouter/routing.js";
 import { neverReachedOpenRouter, RETENTION_DELETED, RETENTION_KEPT, RETENTION_NOT_APPLICABLE } from "./privacy/policy.js";
@@ -10,6 +12,10 @@ import { isDatasetWorkflow, isMetadataWorkflow, type JobManifest } from "./types
 export interface DashboardActions {
   refresh(): Promise<JobManifest[]>;
   cancel(localId: string): Promise<string>;
+  /** Plans deleting one job (with what is linked to it), or, with null, every finished job older than 7 days. Read-only. */
+  planDelete(localId: string | null): CleanupPlan;
+  /** Deletes exactly the items of a plan from `planDelete`. */
+  applyDelete(planId: string): Promise<CleanupResult>;
   /** Close the dashboard and open the result viewer. */
   read(localId: string): void;
   /** Close the dashboard and inject (default mode). */
@@ -22,6 +28,8 @@ export class BatchDashboardComponent implements Component {
   private selectedIndex = 0;
   private isDetailed = false;
   private flash = "";
+  /** A delete waiting for `y`: the plan whose list is on screen. */
+  private confirm: CleanupPlan | null = null;
 
   constructor(
     private jobs: JobManifest[],
@@ -45,7 +53,40 @@ export class BatchDashboardComponent implements Component {
     this.requestRender();
   }
 
+  /** Plans a delete and puts the list on screen for a `y`; anything that cannot be deleted is explained instead. */
+  private startDelete(localId: string | null): void {
+    let plan: CleanupPlan;
+    try {
+      plan = this.actions.planDelete(localId);
+    } catch (err) {
+      this.setFlash(`Cannot plan the delete: ${(err as Error).message}`);
+      return;
+    }
+    if (plan.items.length === 0) {
+      this.setFlash(plan.skipped.length ? `Nothing deleted: ${plan.skipped.map((k) => `${k.id} ${k.reason}`).join("; ")}` : "Nothing to delete.");
+      return;
+    }
+    this.flash = "";
+    this.confirm = plan;
+    this.requestRender();
+  }
+
+  private finishDelete(plan: CleanupPlan): void {
+    this.setFlash("Deleting…");
+    void this.actions.applyDelete(plan.planId).then(
+      (res) => this.setFlash(`${res.deleted.length} deleted, ${res.skipped.length} skipped, ${formatBytes(res.freedBytes)} freed${res.skipped.length ? `: ${res.skipped.map((k) => `${k.id} ${k.reason}`).join("; ")}` : ""}`),
+      (err: Error) => this.setFlash(`Delete failed: ${err.message}`),
+    );
+  }
+
   public handleInput(data: string): void {
+    if (this.confirm) {
+      const plan = this.confirm;
+      this.confirm = null;
+      if (data === "y" || data === "Y") this.finishDelete(plan);
+      else this.setFlash("Cancelled; nothing was deleted.");
+      return;
+    }
     if (matchesKey(data, "escape") || data === "q" || data === "Q") {
       if (this.isDetailed && matchesKey(data, "escape")) {
         this.isDetailed = false;
@@ -82,7 +123,15 @@ export class BatchDashboardComponent implements Component {
       );
       return;
     }
+    if (data === "x" || data === "X") {
+      this.startDelete(null);
+      return;
+    }
     if (!job) return;
+    if (data === "d" || data === "D") {
+      this.startDelete(job.localId);
+      return;
+    }
     if (data === "c" || data === "C") {
       if (!ACTIVE_STATUSES.has(job.localStatus) && job.localStatus !== "previewed") {
         this.setFlash(`${job.localId} is ${job.localStatus}; nothing to cancel.`);
@@ -112,6 +161,7 @@ export class BatchDashboardComponent implements Component {
     const w = Math.max(20, width);
     const hr = "─".repeat(w);
     const fit = (s: string) => truncateToWidth(s, w);
+    if (this.confirm) return deleteConfirmLines(this.confirm, hr).map(fit);
     if (this.isDetailed && this.selected) return this.renderDetail(this.selected, w, hr).map(fit);
 
     const lines: string[] = [`\x1b[1;36m📦 Batch Jobs\x1b[0m  \x1b[90m(.pi/batches)\x1b[0m`, hr];
@@ -129,7 +179,7 @@ export class BatchDashboardComponent implements Component {
     });
     lines.push(hr);
     if (this.flash) lines.push(`\x1b[33m${this.flash}\x1b[0m`);
-    lines.push("\x1b[90m[↑/↓] Move  [Enter] Details  [o] Read  [i] Inject  [c] Cancel  [r] Refresh  [q] Close\x1b[0m");
+    lines.push("\x1b[90m[↑/↓] Move  [Enter] Details  [o] Read  [i] Inject  [c] Cancel  [d] Delete  [x] Clean up 7d+  [r] Refresh  [q] Close\x1b[0m");
     return lines.map(fit);
   }
 
@@ -147,9 +197,20 @@ export class BatchDashboardComponent implements Component {
     }
     lines.push(hr);
     if (this.flash) lines.push(`\x1b[33m${this.flash}\x1b[0m`);
-    lines.push("\x1b[90m[o] Read  [i] Inject  [c] Cancel  [Enter/b/Esc] Back  [q] Close\x1b[0m");
+    lines.push("\x1b[90m[o] Read  [i] Inject  [c] Cancel  [d] Delete  [Enter/b/Esc] Back  [q] Close\x1b[0m");
     return lines;
   }
+}
+
+/** The delete confirmation screen: the plan's list (first 10 lines) and the single key that confirms it. */
+export function deleteConfirmLines(plan: CleanupPlan, hr: string): string[] {
+  const shown = plan.items.slice(0, 10);
+  const lines = [`\x1b[1;31mDelete ${plan.items.length} item${plan.items.length === 1 ? "" : "s"} (${formatBytes(plan.totalBytes)})? This cannot be undone.\x1b[0m`, hr];
+  for (const i of shown) lines.push(`  ${i.kind === "thread" ? "chat" : "job "}  ${i.id}  ${i.label}  [${i.status}, ${i.ageDays}d old, ${formatBytes(i.bytes)}]${i.viaClosure ? ` (with ${i.viaClosure})` : ""}`);
+  if (plan.items.length > shown.length) lines.push(`  …and ${plan.items.length - shown.length} more`);
+  if (plan.skipped.length) lines.push("", `  Not deleted: ${plan.skipped.map((k) => `${k.id} (${k.reason})`).join("; ")}`);
+  lines.push(hr, "\x1b[90m[y] Delete exactly this list  [any other key] Cancel\x1b[0m");
+  return lines;
 }
 
 /**

@@ -1208,6 +1208,15 @@ the whole list:
 
 The MCP server exposes the same flow as `cleanup_plan` then `cleanup_apply` (see the tool table).
 
+**In the web UI** (`/batch web`): a **🗑 Delete…** button in a finished job's detail and in a chat's header, and a
+**🧹 Clean up…** button above the chat and job lists. The dialog shows the exact list (with sizes and anything that is
+skipped, and why); one **Delete N items** button deletes exactly that list. The clean-up dialog has the age cutoff
+(7 days, 30 days, everything finished), what to include, and the OpenRouter-copy checkbox; changing an option re-plans.
+
+**In the TUI dashboard** (`/batch view`): `d` deletes the selected job (with what is linked to it) and `x` cleans every
+finished job older than 7 days. Either shows the list (first 10, then a count) and waits for `y`; any other key cancels.
+The dashboard lists jobs only, so a chat's turn jobs are removed with the chat, from the web UI or `/batch delete`.
+
 ## Storage
 
 Everything is project-local in `.pi/batches/`. A `.gitignore` containing `*` is created there so job state isn't committed by accident.
