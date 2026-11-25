@@ -9,6 +9,7 @@ import { isPdfPath, MAX_PDF_BYTES, prepareAttachments, type AttachmentRequestInp
 import { exportMarkdown, formatCost } from "../chat/commands.js";
 import { conversationOrder, estimateTokens } from "../chat/request.js";
 import { ChatService, PROJECT_INSTRUCTIONS_FILE } from "../chat/service.js";
+import { CleanupService, parseOlderThan } from "../cleanup.js";
 import { ThreadStore } from "../chat/store.js";
 import { loadConfig, readPrivacyConfig, saveConfigUpdate, type BatchConfig } from "../config.js";
 import { allowListPin, allowedProviders, formatPin, formatPrivacyPolicy, formatRoutingPolicy } from "../openrouter/routing.js";
@@ -42,6 +43,8 @@ export interface WebServerDeps {
   service: BatchService;
   chat: ChatService;
   chatStore: ThreadStore;
+  /** Chat and batch deletion; created on demand from `service` and `chatStore` when absent. */
+  cleanup?: CleanupService;
   artifacts: ArtifactService;
   poller: BatchPoller;
   getConfig: () => BatchConfig;
@@ -1071,6 +1074,24 @@ export class BatchWebServer {
         return;
       }
 
+      // ---------------- Cleanup (delete chats and batches) ----------------
+      if (method === "POST" && pathname === "/api/cleanup/plan") {
+        const body = await this.readJson<{ refs?: string[]; olderThan?: string; include?: "all" | "jobs" | "chats"; remote?: boolean }>(req);
+        const target = body.refs?.length
+          ? { refs: body.refs.map(String) }
+          : { olderThanMs: parseOlderThan(body.olderThan ?? "7d"), include: body.include === "jobs" || body.include === "chats" ? body.include : ("all" as const) };
+        this.sendJson(res, 200, this.cleanupService().plan(target, { remote: body.remote === true }));
+        return;
+      }
+
+      if (method === "POST" && pathname === "/api/cleanup/apply") {
+        const body = await this.readJson<{ planId?: string }>(req);
+        const result = await this.cleanupService().apply(String(body.planId ?? ""));
+        this.broadcast({ type: "fs_change" });
+        this.sendJson(res, 200, result);
+        return;
+      }
+
       if (method === "POST" && pathname === "/api/jobs/check-all") {
         const outcomes = await this.deps.poller.checkNow(true);
         this.broadcast({ type: "jobs_checked" });
@@ -1554,6 +1575,19 @@ export class BatchWebServer {
       const message = err instanceof Error ? err.message : String(err);
       this.sendJson(res, 400, { error: message });
     }
+  }
+
+  private readonly cleanupServices = new WeakMap<WebServerDeps, CleanupService>();
+
+  /** One CleanupService per workspace deps object, so a plan made by one request can be applied by the next. */
+  private cleanupService(): CleanupService {
+    const deps = this.deps;
+    let svc = deps.cleanup ?? this.cleanupServices.get(deps);
+    if (!svc) {
+      svc = new CleanupService({ registry: deps.service.registry, threads: deps.chatStore, remoteDelete: (job) => deps.service.deleteProviderBatch(job) });
+      this.cleanupServices.set(deps, svc);
+    }
+    return svc;
   }
 
   private safeReadJob(localId: string): JobManifest | undefined {

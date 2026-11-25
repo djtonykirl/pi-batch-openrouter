@@ -1,6 +1,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Type, type Static, type TObject } from "typebox";
+import { parseOlderThan, type CleanupService } from "./cleanup.js";
+import { formatPlan, formatResult } from "./cleanup-commands.js";
 import { pathToFileURL } from "node:url";
 import { describeArtifact } from "./artifact-commands.js";
 import type { ArtifactService } from "./artifacts/service.js";
@@ -47,6 +49,8 @@ export interface ToolHostContext {
   getPrivacy(): BatchConfig["privacy"];
   /** Batch chat services, for hosts that expose the chat tools (the MCP server). */
   chat?: { service: ChatService; store: ThreadStore };
+  /** Chat and batch deletion, for hosts that expose the cleanup tools (the MCP server). */
+  cleanup?: CleanupService;
 }
 
 export interface ToolAnnotations {
@@ -104,6 +108,11 @@ const JOB_REF_DESCRIPTION =
 const NAME_DESCRIPTION = 'Optional short name for the job so it can be referred to later in plain words (e.g. "auth audit")';
 
 /** Resolves a natural-language job reference for a tool call. */
+function requireCleanup(ctx: ToolHostContext): CleanupService {
+  if (!ctx.cleanup) throw new Error("Chat and batch deletion is not available in this host.");
+  return ctx.cleanup;
+}
+
 function findJob(ctx: ToolHostContext, reference: string, purpose: JobPurpose = "any"): JobRefResolution {
   return resolveJobRef(ctx.requireService().registry, reference, { purpose });
 }
@@ -1172,6 +1181,60 @@ export const TOOL_SPECS: ReadonlyArray<ToolSpec<any>> = [
         text: withNote(found, `Cancelled "${label}" (${job.localId}): ${statusPhrase(job)}.\n${message}`),
         details: { localId: job.localId, label, status: job.localStatus },
       };
+    },
+  }),
+
+  def({
+    name: "cleanup_plan",
+    label: "Plan Cleanup of Chats and Batches",
+    description:
+      "Lists what deleting chats and batch jobs would remove, without deleting anything. Give `refs` (job or chat references) to delete those, " +
+      "or leave them out to plan a clean-up of every FINISHED job and idle chat older than `older_than` (default 7d). " +
+      "A chat includes its turn jobs; a job includes its retries and syntheses. Running jobs and busy chats are never included. " +
+      "Returns a plan_id for cleanup_apply. Local files only unless remote: true.",
+    promptSnippet: "Use cleanup_plan to show the user what a deletion of chats/batches would remove before anything is deleted.",
+    promptGuidelines: ["Show the user the whole list returned by cleanup_plan and get their agreement before cleanup_apply"],
+    parameters: Type.Object({
+      refs: Type.Optional(Type.Array(Type.String(), { description: "Job or chat references to delete (ids, suffixes, chat titles). Omit to plan an age-based clean-up." })),
+      older_than: Type.Optional(Type.String({ description: 'Age cutoff for a clean-up: "7d" (default), "12h" or "0". Ignored when refs are given.' })),
+      include: Type.Optional(Type.Union([Type.Literal("all"), Type.Literal("jobs"), Type.Literal("chats")], { description: "What an age-based clean-up covers (default all)." })),
+      remote: Type.Optional(Type.Boolean({ description: "Also delete the OpenRouter copy of each deleted job (best effort). Default false." })),
+    }),
+    outputSchema: Type.Object({ planId: Type.String(), toDelete: Type.Number(), skipped: Type.Number(), totalBytes: Type.Number() }),
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+    hosts: ["mcp"],
+    execute: async (ctx, params) => {
+      const cleanup = requireCleanup(ctx);
+      const target = params.refs?.length
+        ? { refs: params.refs }
+        : { olderThanMs: parseOlderThan(params.older_than ?? "7d"), include: params.include ?? ("all" as const) };
+      const plan = cleanup.plan(target, { remote: params.remote === true });
+      const text = plan.items.length || plan.skipped.length ? formatPlan(plan) : "Nothing to delete.";
+      return {
+        text: plan.items.length ? `${text}
+
+plan_id: ${plan.planId} (valid for 10 minutes). Nothing has been deleted yet.` : text,
+        details: { planId: plan.planId, toDelete: plan.items.length, skipped: plan.skipped.length, totalBytes: plan.totalBytes },
+      };
+    },
+  }),
+
+  def({
+    name: "cleanup_apply",
+    label: "Apply Cleanup of Chats and Batches",
+    description:
+      "Permanently deletes exactly the chats and batch jobs listed by cleanup_plan(plan_id). DESTRUCTIVE and not undoable. " +
+      "Anything that became active since the plan is skipped and reported. The user must have seen the list and agreed.",
+    promptSnippet: "Use cleanup_apply only after showing the user the cleanup_plan list and getting their agreement.",
+    promptGuidelines: ["Never call cleanup_apply without showing the user the plan first", "Never call cleanup_apply on a plan the user did not agree to"],
+    parameters: Type.Object({ plan_id: Type.String({ description: "The plan_id returned by cleanup_plan." }) }),
+    outputSchema: Type.Object({ deleted: Type.Number(), skipped: Type.Number(), freedBytes: Type.Number() }),
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    hosts: ["mcp"],
+    execute: async (ctx, params) => {
+      const result = await requireCleanup(ctx).apply(params.plan_id);
+      ctx.poller.updateBadge();
+      return { text: formatResult(result), details: { deleted: result.deleted.length, skipped: result.skipped.length, freedBytes: result.freedBytes } };
     },
   }),
 

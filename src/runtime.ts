@@ -12,6 +12,7 @@ import { OpenRouterBatchClient } from "./openrouter/client.js";
 import { BatchService } from "./service.js";
 import { isChatJob, type JobManifest } from "./types.js";
 import { ChatService } from "./chat/service.js";
+import { CleanupService } from "./cleanup.js";
 import { CHAT_ENTRY_TYPE, ChatSession, type ChatEntryData } from "./chat/session.js";
 import { ThreadStore } from "./chat/store.js";
 import { BatchWebServer } from "./web/server.js";
@@ -31,6 +32,7 @@ export class BatchRuntime {
   public service: BatchService | null = null;
   public artifacts: ArtifactService | null = null;
   public chat: ChatService | null = null;
+  public cleanup: CleanupService | null = null;
   /** Session model catalog (shared by the service, chat and web); null with no workspace. Kept across config reloads. */
   public catalog: ModelCatalog | null = null;
   public chatSession: ChatSession | null = null;
@@ -86,6 +88,7 @@ export class BatchRuntime {
       this.service = null;
       this.artifacts = null;
       this.chat = null;
+      this.cleanup = null;
       this.chatStore = null;
       this.catalog = null;
       this.catalogFile = null;
@@ -117,6 +120,7 @@ export class BatchRuntime {
       store: new ArtifactStore(path.join(storage, "artifacts")),
     });
     this.chatStore = new ThreadStore(path.join(storage, "threads"));
+    this.cleanup = new CleanupService({ registry: this.service.registry, threads: this.chatStore, remoteDelete: (job) => this.service!.deleteProviderBatch(job) });
     this.chat = new ChatService({
       store: this.chatStore,
       batch: this.service,
@@ -145,6 +149,11 @@ export class BatchRuntime {
   public requireChatStore(): ThreadStore {
     if (!this.chatStore) throw new Error("No active Pi session/workspace; chat storage is unavailable.");
     return this.chatStore;
+  }
+
+  public requireCleanup(): CleanupService {
+    if (!this.cleanup) throw new Error("No active Pi session/workspace; chat and batch storage is unavailable.");
+    return this.cleanup;
   }
 
   public requireChat(): ChatService {

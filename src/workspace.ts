@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { ArtifactService } from "./artifacts/service.js";
 import { ArtifactStore } from "./artifacts/store.js";
 import { ChatService } from "./chat/service.js";
+import { CleanupService } from "./cleanup.js";
 import { ThreadStore } from "./chat/store.js";
 import type { ThreadState } from "./chat/types.js";
 import { loadConfig, readPrivacyConfig, type BatchConfig, type LoadedConfig } from "./config.js";
@@ -88,6 +89,7 @@ export interface WorkspaceServices {
   service: BatchService;
   chat: ChatService;
   chatStore: ThreadStore;
+  cleanup: CleanupService;
   artifacts: ArtifactService;
   poller: BatchPoller;
   catalog: ModelCatalog;
@@ -170,6 +172,7 @@ export function createWorkspaceServices(workspaceRoot: string, opts: WorkspaceSe
     service,
     chat,
     chatStore,
+    cleanup: new CleanupService({ registry: service.registry, threads: chatStore, remoteDelete: (job) => service.deleteProviderBatch(job) }),
     artifacts,
     poller,
     catalog,

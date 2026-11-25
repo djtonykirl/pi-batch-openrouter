@@ -10,6 +10,7 @@ import { itemCounts } from "../service.js";
 import { formatIsoShort } from "../time.js";
 import { TOOL_SPECS, visibleToModel, type ToolHostContext } from "../tools.js";
 import { isChatJob, isMetadataWorkflow, type JobManifest } from "../types.js";
+import { formatPlan } from "../cleanup-commands.js";
 import { describeThread, mcpThreads, readThreadView, renderThreadView, resolveThreadRef } from "../chat/mcp-threads.js";
 import { createWorkspaceServices, type WorkspaceServices, type WorkspaceServicesOptions } from "../workspace.js";
 import { mcpWording } from "./wording.js";
@@ -165,6 +166,7 @@ export class BatchMcpServer {
       getConfig: () => this.ws.getConfig(),
       getPrivacy: () => this.ws.service.privacyConfig(),
       chat: { service: this.ws.chat, store: this.ws.chatStore },
+      cleanup: this.ws.cleanup,
     };
   }
 
@@ -240,6 +242,10 @@ export class BatchMcpServer {
 
             if (spec.name === "batch_submit_plan" && this.opts.elicitSubmitConfirmation !== false) {
               const gate = this.checkSubmitElicitation(args as { batch_id: string }, reqCtx);
+              if (gate) return gate;
+            }
+            if (spec.name === "cleanup_apply" && this.opts.elicitSubmitConfirmation !== false) {
+              const gate = this.checkCleanupElicitation(args as { plan_id: string }, reqCtx);
               if (gate) return gate;
             }
             if (spec.name === "chat_start" && this.opts.elicitSubmitConfirmation !== false) {
@@ -329,6 +335,20 @@ export class BatchMcpServer {
       `• Privacy level: ${this.ws.service.privacyConfig().level}\n` +
       `• Replies arrive asynchronously (minutes to 24h)`;
     return this.confirmByElicitation(reqCtx, summary, "Starting the chat thread was cancelled by the user (nothing was created or sent).");
+  }
+
+  private checkCleanupElicitation(args: { plan_id: string }, reqCtx: ServerContext): ReturnType<typeof inputRequired> | CallToolResult | undefined {
+    const caps = this.mcp.server.getClientCapabilities();
+    if (!caps?.elicitation) return undefined;
+    const plan = this.ws.cleanup.peek(args.plan_id);
+    if (!plan || plan.items.length === 0) return undefined; // apply reports the unknown plan, or nothing to delete
+    return this.confirmByElicitation(
+      reqCtx,
+      `Permanently delete ${plan.items.length} chat(s)/batch job(s)? This cannot be undone.
+
+${formatPlan(plan)}`,
+      "The deletion was cancelled by the user (nothing was deleted).",
+    );
   }
 
   /** Undefined once the user has accepted; otherwise the elicitation request, or the cancellation result. */

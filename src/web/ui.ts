@@ -764,7 +764,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
     <aside class="sidebar">
       <div class="sidebar-header">
         <strong>Chat Threads</strong>
-        <button class="btn btn-sm btn-primary" id="newThreadBtn">＋ New Thread</button>
+        <span style="display:flex; gap:6px;"><button class="btn btn-sm" data-action="openCleanupDialog" data-args="[]" title="Delete old finished chats and batch jobs">🧹 Clean up…</button><button class="btn btn-sm btn-primary" id="newThreadBtn">＋ New Thread</button></span>
       </div>
       <div style="padding: 8px 12px 0;">
         <input type="text" id="threadSearchInput" aria-label="Filter threads" placeholder="Filter threads…" style="width: 100%;">
@@ -777,6 +777,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
           <strong id="chatThreadTitle" style="font-size:15px;"></strong>
           <button class="btn btn-sm" id="renameThreadBtn" title="Rename thread">✏️</button>
+          <button class="btn btn-sm btn-danger" id="deleteThreadBtn" title="Delete this chat and its batch jobs">🗑 Delete…</button>
           <span style="font-family:var(--mono); font-size:11px; color:var(--text-muted);" id="chatThreadId"></span>
         </div>
         <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
@@ -854,6 +855,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
     <aside class="sidebar" style="width: 350px;">
       <div class="sidebar-header">
         <strong>Batch Jobs (.pi/batches)</strong>
+        <button class="btn btn-sm" data-action="openCleanupDialog" data-args="[]" title="Delete old finished chats and batch jobs">🧹 Clean up…</button>
         <select id="jobStatusFilter" aria-label="Filter jobs by status" style="font-size:12px; padding:3px 6px;">
           <option value="all">All Jobs</option>
           <option value="active">Active</option>
@@ -1008,6 +1010,32 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
       </div>
       <div class="modal-footer">
         <button class="btn" data-close="workspacePickerModal">Done</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== MODAL: DELETE / CLEAN UP ==================== -->
+  <div class="modal-backdrop" id="cleanupModal">
+    <div class="modal">
+      <div class="modal-header">
+        <strong id="cleanupTitle">Delete</strong>
+        <button class="btn btn-sm" data-close="cleanupModal" aria-label="Close">✕</button>
+      </div>
+      <div class="modal-body">
+        <div id="cleanupOptions" style="display:none; gap:12px; flex-wrap:wrap; margin-bottom:10px;">
+          <label style="font-size:12px;">Older than
+            <select id="cleanupAge"><option value="7d">7 days</option><option value="30d">30 days</option><option value="0">Everything finished</option></select>
+          </label>
+          <label style="font-size:12px;">Include
+            <select id="cleanupInclude"><option value="all">Chats and jobs</option><option value="jobs">Jobs only</option><option value="chats">Chats only</option></select>
+          </label>
+        </div>
+        <label style="font-size:12px; display:block; margin-bottom:10px;"><input type="checkbox" id="cleanupRemote"> Also delete the OpenRouter copy of each job (best effort)</label>
+        <div id="cleanupList" aria-live="polite" style="font-size:12px; max-height:340px; overflow:auto;"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn" data-close="cleanupModal">Cancel</button>
+        <button class="btn btn-danger" id="cleanupConfirmBtn" disabled>Delete</button>
       </div>
     </div>
   </div>
@@ -1268,7 +1296,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
       "submitPreviewedJob", "cancelBatchJob", "retryBatchJob", "synthesizeBatchJob", "setJobSubTab",
       "writeMetadataReview", "writeMetadataApproved", "validateMetadataApproved",
       "importMetadataBundle", "confirmMetadataBundleOverwrite", "cancelMetadataBundleOverwrite", "downloadMetadataApproved",
-      "openCompactForm", "submitCompact", "cancelCompact",
+      "openCompactForm", "submitCompact", "cancelCompact", "openCleanupDialog",
     ]);
     function act(name, ...args) {
       return 'data-action="' + escapeHtml(name) + '" data-args="' + escapeHtml(JSON.stringify(args)) + '"';
@@ -2583,6 +2611,7 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         (isActive ? '<button class="btn btn-sm" ' + act("pollSingleJob", j.localId) + '>🔄 Poll Now</button>' : "") +
         (isActive || isPreviewed ? '<button class="btn btn-sm btn-danger" ' + act("cancelBatchJob", j.localId) + '>Cancel</button>' : "") +
         (isTerminal && !isChat ? '<button class="btn btn-sm" ' + act("retryBatchJob", j.localId, false) + '>🔁 Retry All</button>' : "") +
+        (isTerminal && !isChat ? '<button class="btn btn-sm btn-danger" ' + act("openCleanupDialog", j.localId) + '>🗑 Delete…</button>' : "") +
         // Also for a one-request job with an unusable item, which refusals point at ("Retry Failed Items button").
         (isTerminal && !isChat && (j.requestCount > 1 || (j.items || []).some((it) => ["failed", "corrupt", "missing"].includes(it.status))) ? '<button class="btn btn-sm" ' + act("retryBatchJob", j.localId, true) + '>🔁 Retry Failed Items</button>' : "") +
         ((j.localStatus === "ready" || j.localStatus === "partial") && !isChat && j.requestCount > 1 && j.kind !== "synthesis"
@@ -2895,6 +2924,80 @@ export function renderWebUiHtml(opts: { csrfToken: string; workspaceRoot: string
         showToast(err.message, "error");
       }
     };
+
+    // ---------------- Delete / clean up ----------------
+    // The dialog shows the server's plan (the exact list) and one button deletes exactly that list.
+    const cleanup = { planId: null, refs: [] };
+    async function planCleanup() {
+      const list = document.getElementById("cleanupList");
+      const btn = document.getElementById("cleanupConfirmBtn");
+      btn.disabled = true;
+      btn.textContent = "Delete";
+      cleanup.planId = null;
+      list.textContent = "Planning…";
+      try {
+        const body = { remote: document.getElementById("cleanupRemote").checked };
+        if (cleanup.refs.length) body.refs = cleanup.refs;
+        else {
+          body.olderThan = document.getElementById("cleanupAge").value;
+          body.include = document.getElementById("cleanupInclude").value;
+        }
+        const plan = await api("/api/cleanup/plan", { method: "POST", body });
+        let html = "";
+        for (const i of plan.items) {
+          html += '<div style="padding:3px 0; border-bottom:1px solid var(--border);"><strong>' + (i.kind === "thread" ? "chat" : "job") + "</strong> " +
+            '<span style="font-family:var(--mono);">' + escapeHtml(i.id) + "</span> " + escapeHtml(i.label) +
+            ' <span style="color:var(--text-muted);">[' + escapeHtml(i.status) + ", " + i.ageDays + "d old, " + formatBytes(i.bytes) + "]" +
+            (i.viaClosure ? " (with " + escapeHtml(i.viaClosure) + ")" : "") + "</span></div>";
+        }
+        if (plan.skipped.length) {
+          html += '<div style="margin-top:8px; color:var(--text-muted);"><strong>Not deleted</strong></div>';
+          for (const k of plan.skipped) html += "<div>" + escapeHtml(k.id) + ": " + escapeHtml(k.reason) + "</div>";
+        }
+        list.innerHTML = html || "Nothing to delete.";
+        if (plan.items.length) {
+          cleanup.planId = plan.planId;
+          btn.disabled = false;
+          btn.textContent = "Delete " + plan.items.length + " item" + (plan.items.length === 1 ? "" : "s") + " (" + formatBytes(plan.totalBytes) + ")";
+        }
+      } catch (err) {
+        list.textContent = err.message;
+      }
+    }
+
+    window.openCleanupDialog = async (ref) => {
+      cleanup.refs = ref ? [ref] : [];
+      document.getElementById("cleanupTitle").textContent = ref ? "Delete " + ref : "Clean up finished chats and batch jobs";
+      document.getElementById("cleanupOptions").style.display = ref ? "none" : "flex";
+      document.getElementById("cleanupRemote").checked = false;
+      openModal("cleanupModal");
+      await planCleanup();
+    };
+
+    for (const id of ["cleanupAge", "cleanupInclude", "cleanupRemote"]) document.getElementById(id).addEventListener("change", planCleanup);
+
+    document.getElementById("deleteThreadBtn").addEventListener("click", () => {
+      if (state.activeThreadId) window.openCleanupDialog(state.activeThreadId);
+    });
+
+    document.getElementById("cleanupConfirmBtn").addEventListener("click", async () => {
+      if (!cleanup.planId) return;
+      const btn = document.getElementById("cleanupConfirmBtn");
+      btn.disabled = true;
+      try {
+        const res = await api("/api/cleanup/apply", { method: "POST", body: { planId: cleanup.planId } });
+        document.getElementById("cleanupModal").classList.remove("open");
+        const gone = new Set(res.deleted.map((d) => d.id));
+        if (gone.has(state.activeThreadId)) state.activeThreadId = null;
+        if (gone.has(state.selectedJobId)) state.selectedJobId = null;
+        showToast(res.deleted.length + " deleted, " + res.skipped.length + " skipped, " + formatBytes(res.freedBytes) + " freed" +
+          (res.skipped.length ? ": " + res.skipped.map((k) => k.id + " " + k.reason).join("; ") : ""), res.skipped.length ? "error" : "info");
+        await bootstrap();
+      } catch (err) {
+        showToast(err.message, "error");
+        await planCleanup();
+      }
+    });
 
     window.cancelBatchJob = async (jobId) => {
       try {

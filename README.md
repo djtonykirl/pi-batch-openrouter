@@ -1186,6 +1186,42 @@ The metadata preview shows the effective pin, the privacy level and the account-
 - The secret scanning is **basic protection against accidental leakage**. It is not a DLP or compliance control. It cannot recognise confidential business content, personal data, or secrets in formats it doesn't know.
 - Local configuration (exclusions, `blockOnSecret`, `allowOutsideWorkspace`) controls what this tool will send. It is not a policy decision on your organisation's behalf.
 
+## Deleting chats and batches
+
+Finished work piles up in `.pi/batches/`. Two commands clear it, and both show the exact list first and ask **once** for
+the whole list:
+
+```
+/batch delete <job-or-chat>... [--remote] [--yes]
+/batch clean [--older-than 7d|12h|0] [--chats | --jobs] [--remote] [--yes]
+```
+
+- `delete` takes job ids or unique id suffixes, chat ids or titles, or a description such as `latest` or `the failed
+  audit` (finished jobs only; an ambiguous description is refused and lists the candidates). A **chat** takes the batch jobs
+  of its turns with it; a **job** takes its linked retries and synthesis jobs. Deleting a retry or a synthesis alone
+  leaves the source.
+- `clean` selects every **finished** job and **idle** chat older than the cutoff (default `7d`, `0` means everything
+  finished). A chat turn's job is removed with its chat, never on its own.
+- `--yes` skips the question; without an interactive session `--yes` is required.
+- **Never deleted:** a job that is still running, a chat with a turn or compaction in progress, and anything linked to
+  one of those. A job that becomes active between the list and your confirmation is skipped and reported.
+- **Local files only** by default. `--remote` also deletes the batch at OpenRouter for jobs that reached it (best
+  effort: a failure is reported and the local delete stands).
+- Files you wrote elsewhere (`metadata/` drafts, `artifacts/`, exports you saved outside a job folder) are left alone.
+- A folder is renamed to `.deleting-<id>` before it is removed, so an interrupted delete leaves nothing half-visible;
+  the next `clean` sweeps leftovers.
+
+The MCP server exposes the same flow as `cleanup_plan` then `cleanup_apply` (see the tool table).
+
+**In the web UI** (`/batch web`): a **🗑 Delete…** button in a finished job's detail and in a chat's header, and a
+**🧹 Clean up…** button above the chat and job lists. The dialog shows the exact list (with sizes and anything that is
+skipped, and why); one **Delete N items** button deletes exactly that list. The clean-up dialog has the age cutoff
+(7 days, 30 days, everything finished), what to include, and the OpenRouter-copy checkbox; changing an option re-plans.
+
+**In the TUI dashboard** (`/batch view`): `d` deletes the selected job (with what is linked to it) and `x` cleans every
+finished job older than 7 days, `X` every finished job whatever its age. Either shows the list (first 10, then a count) and waits for `y`; any other key cancels.
+The dashboard lists jobs only, so a chat's turn jobs are removed with the chat, from the web UI or `/batch delete`.
+
 ## Storage
 
 Everything is project-local in `.pi/batches/`. A `.gitignore` containing `*` is created there so job state isn't committed by accident.
@@ -1558,6 +1594,8 @@ Only threads started with `chat_start` are visible to these tools. Threads you o
 | | `batch_get_items` | Read-only | Per-item status, source file/row, and combined coverage with linked retry jobs (`batch_id`). |
 | | `batch_read_result` | Read-only | Bring a finished result into chat (`batch_id`, `mode`: `"summary"` (default bounded excerpt) \| `"full"` \| `"item"` (with `item`) \| `"synthesis"`). |
 | **Control** | `batch_cancel` | Destructive | Cancel a previewed or active job (`batch_id`). |
+| | `cleanup_plan` | Read-only (local) | List what deleting chats/batches would remove, without deleting: `refs` (job or chat references) or an age clean-up (`older_than`, default `7d`; `include`: `all`\|`jobs`\|`chats`; `remote`). Returns a `plan_id`. |
+| | `cleanup_apply` | Destructive | Delete exactly the items of a `cleanup_plan` (`plan_id`). Asks the client for confirmation when it supports elicitation. |
 | **Workflows** | `batch_list_workflows` | Read-only | List built-in and `.pi/batch-workflows/*.yaml` definitions and their validity. |
 | | `batch_validate_workflow` | Read-only | Validate a workflow by `name` or workspace `file` path and report diagnostics with locations. |
 | **Exports & Artifacts** | `batch_export` | Writes file | Export finished per-item results + provenance to `jsonl` or `csv` (`batch_id`, `format`, optional `out`, `overwrite`, `job_only`). |
