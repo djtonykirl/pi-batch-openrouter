@@ -3,7 +3,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { acquireLock, appendJsonl, atomicWriteFile, atomicWriteJson, readJsonl, tryAcquireLock, type FileLock } from "./fsutil.js";
 import { isLocalJobId, newLocalJobId } from "./ids.js";
-import { assertTransition, isLocalStatus, type LocalStatus } from "./state.js";
+import { removeDirRobust, DELETING_PREFIX } from "./removal.js";
+import { ACTIVE_STATUSES, assertTransition, isLocalStatus, type LocalStatus } from "./state.js";
 import { nowIso } from "./time.js";
 import type { JobEvent, JobManifest } from "./types.js";
 
@@ -252,6 +253,43 @@ export class JobRegistry {
     }
     result.jobs.sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : b.localId.localeCompare(a.localId)));
     return result;
+  }
+
+  /**
+   * Deletes a job's folder. Under the job lock it re-reads the status and refuses an active job, then renames the
+   * folder to `.deleting-<id>` (so a crash mid-removal never leaves a half-visible job) and removes it.
+   * `force` skips the status read, for an explicitly named job whose manifest is corrupt.
+   */
+  public async removeJob(localId: string, opts: { force?: boolean } = {}): Promise<void> {
+    const dir = this.jobDir(localId);
+    if (!fs.existsSync(dir)) return;
+    const lock = this.lock(localId);
+    const parked = path.join(this.root, `${DELETING_PREFIX}${localId}`);
+    try {
+      if (!opts.force && ACTIVE_STATUSES.has(this.read(localId).localStatus)) throw new Error(`Job ${localId} is active and was not removed.`);
+      lock.release();
+      fs.renameSync(dir, parked);
+    } catch (err) {
+      lock.release();
+      throw err;
+    }
+    await removeDirRobust(parked);
+  }
+
+  /** Removes folders left behind by an interrupted `removeJob`. Returns how many were removed. */
+  public sweepDeleting(): number {
+    if (!fs.existsSync(this.root)) return 0;
+    let n = 0;
+    for (const entry of fs.readdirSync(this.root, { withFileTypes: true })) {
+      if (!entry.isDirectory() || !entry.name.startsWith(DELETING_PREFIX)) continue;
+      try {
+        fs.rmSync(path.join(this.root, entry.name), { recursive: true, force: true });
+        n++;
+      } catch {
+        /* still locked: the next sweep retries */
+      }
+    }
+    return n;
   }
 
   /** Accepts a full ID or a unique case-insensitive suffix/prefix (e.g. "A7C2"). */

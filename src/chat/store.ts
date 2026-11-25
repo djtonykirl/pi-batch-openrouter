@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { acquireLock, appendJsonl, LockTimeoutError, atomicWriteJson, readJsonl } from "../fsutil.js";
 import { isThreadId, newThreadId } from "../ids.js";
 import type { ProviderPin } from "../openrouter/types.js";
+import { DELETING_PREFIX, removeDirRobust } from "../removal.js";
 import { nowIso } from "../time.js";
 import type { ThreadState, TranscriptEntry, TranscriptEntryInput } from "./types.js";
 
@@ -102,6 +103,49 @@ export class ThreadStore {
       lock.release();
     }
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+
+  /**
+   * Deletes a thread of any age (unlike `remove`, which is only for a just-created one). Refuses a thread with a
+   * pending turn or a compaction in flight. The folder is renamed to `.deleting-<id>` before it is removed.
+   */
+  public async removeThread(id: string, waitMs = 3000): Promise<void> {
+    const dir = this.dir(id);
+    if (!fs.existsSync(path.join(dir, FILES.state))) return;
+    let lock;
+    try {
+      lock = acquireLock(path.join(dir, FILES.lock), waitMs);
+    } catch (err) {
+      if (err instanceof LockTimeoutError) throw new ThreadBusyError(id);
+      throw err;
+    }
+    const parked = path.join(this.root, `${DELETING_PREFIX}${id}`);
+    try {
+      const t = this.read(id);
+      if (t.pending || t.compacting) throw new Error(`Thread ${id} is in use and was not removed.`);
+      lock.release();
+      fs.renameSync(dir, parked);
+    } catch (err) {
+      lock.release();
+      throw err;
+    }
+    await removeDirRobust(parked);
+  }
+
+  /** Removes folders left behind by an interrupted `removeThread`. Returns how many were removed. */
+  public sweepDeleting(): number {
+    if (!fs.existsSync(this.root)) return 0;
+    let n = 0;
+    for (const entry of fs.readdirSync(this.root, { withFileTypes: true })) {
+      if (!entry.isDirectory() || !entry.name.startsWith(DELETING_PREFIX)) continue;
+      try {
+        fs.rmSync(path.join(this.root, entry.name), { recursive: true, force: true });
+        n++;
+      } catch {
+        /* still locked: the next sweep retries */
+      }
+    }
+    return n;
   }
 
   /** Most recently updated first. Unreadable threads are skipped. */
