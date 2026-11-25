@@ -6,6 +6,8 @@ import { PROPOSAL_SCHEMA_V2, promptEvidence, proposalProblems, type TableEvidenc
 import { portableSchema, renderMetadataPrompt } from "../src/metadata/plan.js";
 import {
   columnCommentProblems,
+  RETIRED_TAG_KEYS,
+  withoutRetiredTags,
   columnTagProblems,
   columnTagsFromProposal,
   deriveTableTags,
@@ -35,7 +37,7 @@ const DESCRIPTION_33 =
 const COMMENT_33 =
   "Unique Core Data View (CDV) identifier for the manufacturing or bottling location.\nTYPE: Key.\nVALUES: Positive integer facility identifier (or '-1' in reporting views for the default unmapped row).\nSYNONYMS: LOC_ID, LocationCDVID, Facility_ID, cdvid.\nJOIN: Joins to PNPT_plant_mpg_data.pk_loc_id, PNPT_location_data_history.LocationCDVID, and 3CXX_SP_list_dairy_plants.cdvid.\nNULL MEANS: Not nullable (enforced uniqueness check in PinpointBronzeToSilver).";
 const ADDRESS_COMMENT = "First line of the facility street address.\nTYPE: Dimension.\nVALUES: Free text street address.\nSYNONYMS: address_line_1, street.\nNULL MEANS: Address not recorded.";
-const APPROVED_TAGS_33 = { classification: "internal", data_domain: "pinpoint", uc_prefix: "PNPT_", medallion_layer: "gold", pii: "false" };
+const APPROVED_TAGS_33 = { classification: "internal", data_domain: "pinpoint", uc_prefix: "PNPT_", medallion_layer: "gold" };
 
 const evidence = (table = PNPT): TableEvidence => ({
   table,
@@ -255,28 +257,42 @@ test("format checks: order, length, column TYPE values and PII-looking text", ()
 
 // ------------------------------------------------------------------ tags
 
-test("deriveTableTags: equals the §3.3 table approved_tags, key order included", () => {
-  const tags = deriveTableTags("internal", STANDARDS, "gold", false);
+test("deriveTableTags: equals the §3.3 table approved_tags, key order included, and never emits pii", () => {
+  const tags = deriveTableTags("internal", STANDARDS, "gold");
   assert.deepEqual(tags, APPROVED_TAGS_33);
   assert.equal(JSON.stringify(tags), JSON.stringify(APPROVED_TAGS_33));
-  assert.equal(deriveTableTags("restricted", STANDARDS, "bronze", true).pii, "true");
+  assert.equal("pii" in deriveTableTags("restricted", STANDARDS, "bronze"), false);
   assert.deepEqual(tableTagProblems(APPROVED_TAGS_33, { ...STANDARDS, layer: "gold" }, false), []);
-  assert.match(tableTagProblems(APPROVED_TAGS_33, { ...STANDARDS, layer: "gold" }, true).join(), /pii/);
+  // PII status is the classification: a PII column alone does not change a non-public table's tags.
+  assert.deepEqual(tableTagProblems(APPROVED_TAGS_33, { ...STANDARDS, layer: "gold" }, true), []);
+  assert.match(tableTagProblems({ ...APPROVED_TAGS_33, classification: "public" }, { ...STANDARDS, layer: "gold" }, true).join(), /public/);
+  assert.deepEqual(tableTagProblems({ ...APPROVED_TAGS_33, classification: "public" }, { ...STANDARDS, layer: "gold" }, false), []);
   assert.match(tableTagProblems({ ...APPROVED_TAGS_33, owner: "x" }, { ...STANDARDS, layer: "gold" }, false).join(), /owner/);
   assert.match(tableTagProblems({ ...APPROVED_TAGS_33, medallion_layer: "silver" }, { ...STANDARDS, layer: "gold" }, false).join(), /medallion_layer/);
-  const { pii: _omit, ...missing } = APPROVED_TAGS_33;
-  assert.match(tableTagProblems(missing, { ...STANDARDS, layer: "gold" }, false).join(), /pii/);
+  const { uc_prefix: _omit, ...missing } = APPROVED_TAGS_33;
+  assert.match(tableTagProblems(missing, { ...STANDARDS, layer: "gold" }, false).join(), /uc_prefix/);
 });
 
-test("column tags: sparse PII only, key order, pii false never emitted", () => {
+test("retired pii key: a table or column map that still carries it fails as an unknown key; withoutRetiredTags drops it", () => {
+  assert.deepEqual(RETIRED_TAG_KEYS, ["pii"]);
+  for (const value of ["true", "false"]) {
+    assert.match(tableTagProblems({ ...APPROVED_TAGS_33, pii: value }, { ...STANDARDS, layer: "gold" }, false).join(), /unknown key "pii"/);
+  }
+  const t = columnTagsFromProposal({ requires_masking: "true", sensitivity: "high", pii_type: "email" });
+  assert.match(columnTagProblems({ pii: "true", ...t }).join(), /unknown key "pii"/);
+  assert.match(columnTagProblems({ pii: "false" }).join(), /unknown key "pii"/);
+  assert.deepEqual(withoutRetiredTags({ pii: "true", ...t }), t);
+  assert.deepEqual(withoutRetiredTags(undefined), {});
+});
+
+test("column tags: sparse PII only, key order, no pii key", () => {
   assert.deepEqual(columnTagsFromProposal(null), {});
   const t = columnTagsFromProposal({ requires_masking: "true", sensitivity: "high", pii_type: "email" });
-  assert.equal(JSON.stringify(t), JSON.stringify({ pii: "true", pii_type: "email", sensitivity: "high", requires_masking: "true" }));
+  assert.equal(JSON.stringify(t), JSON.stringify({ pii_type: "email", sensitivity: "high", requires_masking: "true" }));
   assert.deepEqual(columnTagProblems({}), []);
   assert.deepEqual(columnTagProblems(t), []);
-  assert.match(columnTagProblems({ pii: "false" }).join(), /pii/);
   assert.match(columnTagProblems({ ...t, pii_type: "postcode" }).join(), /pii_type/);
-  assert.match(columnTagProblems({ pii: "true", pii_type: "email" }).join(), /sensitivity/);
+  assert.match(columnTagProblems({ pii_type: "email" }).join(), /sensitivity/);
 });
 
 // ------------------------------------------------------------------ R7 and lifecycle

@@ -1,5 +1,7 @@
 # Privacy Levels, Free Models and UC Metadata Enrichment Implementation Plan
 
+> **Superseded in part (2026-11-25):** the `pii` tag key described below (table `pii` true/false, column `pii: "true"`) is retired, matching the Lighthouse contract. A column is PII when it carries `pii_type` (with `sensitivity` and `requires_masking`); a non-PII column carries `{}`; a table's PII status is its classification. See the README "Tags" section. The rest of this plan is unchanged.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Every request honours a per-project privacy level (`standard` / `no-training` / `zdr`). Free models become available in batch-chat threads through an immediate route. There is a fresh model catalog each session and full web UI support.

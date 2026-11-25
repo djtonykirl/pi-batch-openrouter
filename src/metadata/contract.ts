@@ -304,7 +304,7 @@ const piiTagsProp = {
 /**
  * Standards mode (workflow version 2): v1 plus the table `classification` and each
  * column's `pii_tags`. The model never proposes data_domain, uc_prefix,
- * medallion_layer or the table pii tag; Pi derives those (standards.ts).
+ * medallion_layer; Pi derives those (standards.ts).
  */
 export const PROPOSAL_SCHEMA_V2 = {
   type: "object",

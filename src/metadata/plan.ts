@@ -55,7 +55,7 @@ export const METADATA_STANDARDS_INSTRUCTIONS = [
   'Set "pii_tags" only for a column that holds personal data (pii_type, sensitivity and requires_masking); otherwise null.',
   '"pii_tags" belongs only on each entry of "columns"; never put it in "table_description". "classification" is a top-level field of the response object, next to "table", not inside "table_description".',
   "Never copy sample values that look personal (names, email addresses, phone numbers, identification numbers, addresses) into any description or comment.",
-  "Do not propose data_domain, uc_prefix, medallion_layer or a table-level pii tag: they are derived outside this request.",
+  "Do not propose data_domain, uc_prefix or medallion_layer: they are derived outside this request.",
 ];
 
 /**

@@ -106,7 +106,9 @@ const AUDIT_ONLY = "c.lighthouse_silver.pnpt_audit_only"; // lowercase, as UC in
 const PLANT = "uc_dev.lighthouse_bronze.PNPT_plant";
 const CONTACT = "uc_dev.lighthouse_silver.PNPT_contact";
 const PUBLIC_T = "uc_dev.lighthouse_gold.PNPT_public_contact";
-const EMAIL_TAGS = { pii: "true", pii_type: "email", sensitivity: "high", requires_masking: "true" };
+const EMAIL_TAGS = { pii_type: "email", sensitivity: "high", requires_masking: "true" };
+// Evidence exported before the pii key was retired: the legacy key rides along with the PII tags.
+const LEGACY_EMAIL_TAGS = { pii: "true", ...EMAIL_TAGS };
 const EMAIL_COMMENT = "Email address of the facility contact person.\nTYPE: Dimension.\nVALUES: Email address.\nSYNONYMS: contact_email.\nNULL MEANS: No contact recorded.";
 
 const SP_TABLES: TableEvidence[] = [
@@ -141,7 +143,7 @@ const SP_TABLES: TableEvidence[] = [
     table: CONTACT,
     existing_description: null,
     existing_tags: {},
-    columns: [{ name: "contact_email", data_type: "STRING", nullable: true, existing_comment: null, existing_tags: EMAIL_TAGS }],
+    columns: [{ name: "contact_email", data_type: "STRING", nullable: true, existing_comment: null, existing_tags: LEGACY_EMAIL_TAGS }],
   },
   {
     table: PUBLIC_T,
@@ -230,7 +232,7 @@ test("standards validate: a reviewer reverting to the legacy comment gets a TYPE
     assert.doesNotMatch(v.problems.join("\n"), /Location id/);
   }, spFiles));
 
-test("standards draft tags: key order, sparse column PII, table pii derived from the columns", () =>
+test("standards draft tags: key order, sparse column PII, no pii key anywhere", () =>
   withWorkspace(async (_root, service, fake) => {
     const rows = parseRows(toApprovedJsonl(approvedDraftRows(await standardsJob(service, fake))));
     for (const r of rows) {
@@ -238,15 +240,19 @@ test("standards draft tags: key order, sparse column PII, table pii derived from
       for (const c of r.columns as Row[]) assert.deepEqual(Object.keys(c), ["name", "existing_comment", "approved_comment", "existing_tags", "approved_tags"]);
     }
     // All non-PII.
-    assert.equal(JSON.stringify(rows[2]!.approved_tags), JSON.stringify({ classification: "confidential", data_domain: "pinpoint", uc_prefix: "PNPT_", medallion_layer: "bronze", pii: "false" }));
+    assert.equal(JSON.stringify(rows[2]!.approved_tags), JSON.stringify({ classification: "confidential", data_domain: "pinpoint", uc_prefix: "PNPT_", medallion_layer: "bronze" }));
     assert.deepEqual((rows[2]!.columns as Row[]).map((c) => c.approved_tags), [{}, {}]);
     assert.deepEqual(rows[2]!.existing_tags, { owner: "legacy" });
     assert.deepEqual(col(rows[2]!, "plant_nm").existing_tags, { note: "x" });
     // One PII column.
-    assert.equal(JSON.stringify(col(rows[0]!, "Address1_ds").approved_tags), JSON.stringify({ pii: "true", pii_type: "address", sensitivity: "medium", requires_masking: "true" }));
+    assert.equal(JSON.stringify(col(rows[0]!, "Address1_ds").approved_tags), JSON.stringify({ pii_type: "address", sensitivity: "medium", requires_masking: "true" }));
     assert.deepEqual(col(rows[0]!, "Address1_ds").existing_tags, {});
     assert.deepEqual(col(rows[0]!, "pk_loc_id").approved_tags, {});
-    assert.equal(rows[0]!.approved_tags.pii, "true");
+    // The retired pii key is never emitted: a table is PII through its classification, a column through pii_type.
+    for (const row of rows) {
+      assert.equal("pii" in (row.approved_tags as object), false);
+      for (const c of row.columns as Row[]) assert.equal("pii" in (c.approved_tags as object), false);
+    }
     assert.equal(rows[0]!.approved_tags.medallion_layer, "gold");
   }, spFiles));
 
@@ -258,10 +264,15 @@ test("standards validate: hand-edited tags, public on a PII table, altered exist
       m(r);
       return validateApprovedText(joinRows(r), service).problems.join("\n");
     };
-    assert.match(v((r) => (col(r[2]!, "plant_id").approved_tags = { pii: "false" })), /line 3: column "plant_id" approved_tags: column tags pii "false" is never emitted/);
+    assert.match(v((r) => (col(r[2]!, "plant_id").approved_tags = { pii: "false" })), /line 3: column "plant_id" approved_tags: column tags has an unknown key "pii"/);
+    assert.match(v((r) => (col(r[0]!, "Address1_ds").approved_tags = { pii: "true", ...PII_ADDRESS })), /line 1: column "Address1_ds" approved_tags: column tags has an unknown key "pii"/);
     assert.match(v((r) => delete r[0]!.approved_tags.uc_prefix), /line 1: approved_tags: table tags is missing the uc_prefix key/);
     assert.match(v((r) => (r[0]!.approved_tags.classification = "public")), /line 1: approved_tags: .*public/);
-    assert.match(v((r) => (r[0]!.approved_tags.pii = "false")), /line 1: approved_tags: table tags pii must be "true"/);
+    // The retired key fails as an unknown key, whatever its value; it is never required either.
+    assert.match(v((r) => (r[0]!.approved_tags.pii = "true")), /line 1: approved_tags: table tags has an unknown key "pii"/);
+    assert.match(v((r) => (r[2]!.approved_tags.pii = "false")), /line 3: approved_tags: table tags has an unknown key "pii"/);
+    // public with a pii_type column is still rejected, and the message does not depend on a pii key.
+    assert.match(v((r) => (r[0]!.approved_tags.classification = "public")), /line 1: approved_tags: table tags classification "public" is not allowed on a table with PII/);
     assert.match(v((r) => (r[2]!.existing_tags = {})), /line 3: existing_tags differs from the evidence/);
     assert.match(v((r) => (col(r[2]!, "plant_nm").existing_tags = {})), /line 3: existing_tags of "plant_nm" differs from the evidence/);
     assert.match(v((r) => delete r[0]!.approved_tags), /line 1: .*required property 'approved_tags'/);
@@ -270,9 +281,9 @@ test("standards validate: hand-edited tags, public on a PII table, altered exist
     assert.match(pii, /line 1: approved_description: .*GRAIN:/);
     assert.match(pii, /line 1: approved_description: .*email/);
     assert.doesNotMatch(pii, /jane@example\.com/);
-    // Carried from Task 10: public together with pii "true" is a table tag problem in itself.
-    assert.match(tableTagProblems({ classification: "public", data_domain: "pinpoint", uc_prefix: "PNPT_", medallion_layer: "gold", pii: "true" }, { ...STANDARDS, layer: "gold" }, true).join(), /public/);
-    assert.deepEqual(tableTagProblems({ classification: "public", data_domain: "pinpoint", uc_prefix: "PNPT_", medallion_layer: "gold", pii: "false" }, { ...STANDARDS, layer: "gold" }, false), []);
+    // Carried from Task 10: public together with a pii_type column is a table tag problem in itself.
+    assert.match(tableTagProblems({ classification: "public", data_domain: "pinpoint", uc_prefix: "PNPT_", medallion_layer: "gold" }, { ...STANDARDS, layer: "gold" }, true).join(), /public/);
+    assert.deepEqual(tableTagProblems({ classification: "public", data_domain: "pinpoint", uc_prefix: "PNPT_", medallion_layer: "gold" }, { ...STANDARDS, layer: "gold" }, false), []);
   }, spFiles));
 
 test("standards audit columns: locked to their existing values and tags (problems name the column, not the value); an all-audit table passes", () =>
@@ -286,7 +297,6 @@ test("standards audit columns: locked to their existing values and tags (problem
       ["pipeline_timestamp", null, {}, {}],
     ]);
     assert.equal(rows[1]!.approved_description, DESCRIPTION_33);
-    assert.equal(rows[1]!.approved_tags.pii, "false");
     assert.equal(rows[1]!.approved_tags.medallion_layer, "silver");
     assert.deepEqual(validateApprovedText(draft, service).problems, []);
     // Audit columns are locked to their existing values; problems name the column, never the value.
@@ -317,7 +327,7 @@ test("standards partial: --allow-partial withholds non-standard existing text of
     assert.equal(plant.approved_description, null, '"Plants." is not standard: withheld, so the live value is left unchanged');
     assert.ok(res.validation.nullValues?.includes(`${PLANT} description`));
     // Tags stay taxonomy-valid: derived facts, pii_scan_required for a non-taxonomy classification, invalid tags dropped.
-    assert.equal(JSON.stringify(plant.approved_tags), JSON.stringify({ classification: "pii_scan_required", data_domain: "pinpoint", uc_prefix: "PNPT_", medallion_layer: "bronze", pii: "false" }));
+    assert.equal(JSON.stringify(plant.approved_tags), JSON.stringify({ classification: "pii_scan_required", data_domain: "pinpoint", uc_prefix: "PNPT_", medallion_layer: "bronze" }));
     assert.deepEqual((plant.columns as Row[]).map((c) => [c.approved_comment, c.approved_tags]), [[PLANT_COMMENT, {}], [null, {}]]);
     const md = metadataReviewMarkdown(o);
     assert.match(md, /_non-taxonomy tags dropped_ \(table, column plant_nm\)/);
@@ -353,24 +363,28 @@ test("standards partial: a non-standard existing column comment of a table witho
 test("standards review: tags line, PII column, audit rows and the non-standard replacement marker", () =>
   withWorkspace(async (_root, service, fake) => {
     const md = metadataReviewMarkdown(await standardsJob(service, fake));
-    assert.match(md, /\*\*Tags:\*\* _tags changed: none → `classification=internal, data_domain=pinpoint, uc_prefix=PNPT_, medallion_layer=gold, pii=true`_/);
+    assert.match(md, /\*\*Tags:\*\* _tags changed: none → `classification=internal, data_domain=pinpoint, uc_prefix=PNPT_, medallion_layer=gold`_/);
     assert.match(md, /\*\*Tags:\*\* _tags changed: `owner=legacy` → `classification=confidential/);
     assert.match(md, /_non-taxonomy tags dropped_ \(table, column plant_nm\)/);
     assert.match(md, /\| Column \| Type \| Existing \| Proposed \| Confidence \| PII \|/);
     assert.match(md, /\| pk_loc_id \| STRING \| Location id \| Unique Core .* _replaces a non-standard existing value_ \| high \| — \|/);
-    assert.match(md, /\| Address1_ds \| STRING \| — \| First line .* \| medium \| address \(medium, masking true\) _tags changed: none → `pii=true, pii_type=address, sensitivity=medium, requires_masking=true`_ \|/);
+    assert.match(md, /\| Address1_ds \| STRING \| — \| First line .* \| medium \| address \(medium, masking true\) _tags changed: none → `pii_type=address, sensitivity=medium, requires_masking=true`_ \|/);
+    // The legacy pii key on contact_email is reported once (CONTACT table only), never as a tag change.
+    assert.equal((md.match(/_retired `pii` tag dropped_ \(column contact_email\)/g) ?? []).length, 1);
     assert.match(md, /\| contact_email \| STRING \| — \| Email address .* \| medium \| email \(high, masking true\) _kept existing PII tag \(model proposed none\)_ \|/);
     assert.match(md, /\| fw_ingestdate \| TIMESTAMP \| Ingest date \| — \| audit column \(not sent\) \| — \|/);
     assert.match(md, /CLASSIFICATION: Confidential\.\n\n_replaces a non-standard existing value_/);
   }, spFiles));
 
-test("standards R4 for tags: a valid existing PII tag is kept when the model proposes none; the table pii follows it", () =>
+test("standards R4 for tags: a valid existing PII tag is kept when the model proposes none, a legacy pii key riding along is dropped", () =>
   withWorkspace(async (_root, service, fake) => {
     const draft = toApprovedJsonl(approvedDraftRows(await standardsJob(service, fake)));
     const contact = parseRows(draft)[3]!;
     assert.equal(contact.table, CONTACT);
+    // The evidence carries the retired pii key next to the PII tags: the key is dropped, the PII tags stay.
+    assert.deepEqual(col(contact, "contact_email").existing_tags, LEGACY_EMAIL_TAGS);
     assert.equal(JSON.stringify(col(contact, "contact_email").approved_tags), JSON.stringify(EMAIL_TAGS));
-    assert.equal(contact.approved_tags.pii, "true");
+    assert.equal("pii" in (contact.approved_tags as object), false);
     assert.equal(contact.approved_tags.classification, "internal");
     assert.deepEqual(validateApprovedText(draft, service).problems, []);
   }, spFiles));
@@ -384,7 +398,7 @@ test("standards: a proposed public description that conflicts with a kept PII ta
     assert.equal(row.table, PUBLIC_T);
     // Proposal said public; the kept email tag makes the table PII, so the taxonomy's holding value applies.
     assert.equal(row.approved_tags.classification, "pii_scan_required");
-    assert.equal(row.approved_tags.pii, "true");
+    assert.equal("pii" in (row.approved_tags as object), false);
     assert.equal(JSON.stringify(col(row, "contact_email").approved_tags), JSON.stringify(EMAIL_TAGS));
     assert.equal(row.approved_description, null);
     assert.ok(res.validation.nullValues!.includes(`${PUBLIC_T} description`));

@@ -37,10 +37,17 @@ export const FRAMEWORK_AUDIT_COLUMNS = ["fw_pipelinerowchecksum", "fw_ingestdate
 
 export type Classification = (typeof CLASSIFICATIONS)[number];
 export type MedallionLayer = (typeof MEDALLION_LAYERS)[number];
-export const TABLE_TAG_KEYS = ["classification", "data_domain", "uc_prefix", "medallion_layer", "pii"] as const;
-export const COLUMN_TAG_KEYS = ["pii", "pii_type", "sensitivity", "requires_masking"] as const;
+export const TABLE_TAG_KEYS = ["classification", "data_domain", "uc_prefix", "medallion_layer"] as const;
+export const COLUMN_TAG_KEYS = ["pii_type", "sensitivity", "requires_masking"] as const;
+/**
+ * Retired 2026-11-25 (owner decision, matching the Lighthouse contract): the workspace's governed `pii` tag only
+ * allows its own values, so pii=true/false could never be applied. A column is PII when it carries pii_type; a
+ * table's PII status is its classification. The key is never written or required; a map that still carries it
+ * fails as an unknown key, and existing tags that carry it are dropped (see withoutRetiredTags).
+ */
+export const RETIRED_TAG_KEYS = ["pii"] as const;
 
-/** What the model proposes for a PII column (Pi adds `pii: "true"`). */
+/** What the model proposes for a PII column . */
 export interface PiiTags {
   pii_type: string;
   sensitivity: string;
@@ -161,38 +168,39 @@ const keyProblems = (tags: TagMap, keys: readonly string[], what: string): strin
 const enumProblem = (tags: TagMap, key: string, allowed: readonly string[], what: string): string[] =>
   key in tags && !allowed.includes(tags[key]!) ? [`${what} ${key} must be one of ${allowed.join(", ")}`] : [];
 
-/** Table tags: exactly the five keys, the derived facts as expected, `pii` true iff some column is PII. */
+/** Table tags: exactly the four keys and the derived facts as expected; `public` is never allowed when a column carries pii_type. */
 export function tableTagProblems(tags: TagMap, expected: { domain: string; ucPrefix: string; layer: string | null }, anyColumnPii: boolean): string[] {
   const what = "table tags";
   const problems = keyProblems(tags, TABLE_TAG_KEYS, what);
-  problems.push(...enumProblem(tags, "classification", CLASSIFICATIONS, what), ...enumProblem(tags, "medallion_layer", MEDALLION_LAYERS, what), ...enumProblem(tags, "pii", BOOLEAN_TAG, what));
+  problems.push(...enumProblem(tags, "classification", CLASSIFICATIONS, what), ...enumProblem(tags, "medallion_layer", MEDALLION_LAYERS, what));
   if ("data_domain" in tags && tags.data_domain !== expected.domain) problems.push(`${what} data_domain must be "${expected.domain}"`);
   if ("uc_prefix" in tags && tags.uc_prefix !== expected.ucPrefix) problems.push(`${what} uc_prefix must be "${expected.ucPrefix}"`);
   if ("medallion_layer" in tags && expected.layer !== null && tags.medallion_layer !== expected.layer) problems.push(`${what} medallion_layer must be "${expected.layer}" (from the schema name)`);
-  const pii = anyColumnPii ? "true" : "false";
-  if ("pii" in tags && tags.pii !== pii) problems.push(`${what} pii must be "${pii}" (${anyColumnPii ? "a column is tagged PII" : "no column is tagged PII"})`);
-  if (tags.classification === "public" && (anyColumnPii || tags.pii === "true")) problems.push(`${what} classification "public" is not allowed on a table with PII; use a stricter classification`);
+  if (tags.classification === "public" && anyColumnPii) problems.push(`${what} classification "public" is not allowed on a table with PII; use a stricter classification`);
   return problems;
 }
 
-/** Column tags: `{}` for a non-PII column, or exactly pii "true" with pii_type, sensitivity and requires_masking. */
+/** Column tags: `{}` for a non-PII column, or exactly pii_type, sensitivity and requires_masking. */
 export function columnTagProblems(tags: TagMap): string[] {
   if (Object.keys(tags).length === 0) return [];
   const what = "column tags";
-  if (tags.pii === "false") return [`${what} pii "false" is never emitted on a column; a non-PII column has no tags ({})`];
   const problems = keyProblems(tags, COLUMN_TAG_KEYS, what);
-  if ("pii" in tags && tags.pii !== "true") problems.push(`${what} pii must be "true"`);
   problems.push(...enumProblem(tags, "pii_type", PII_TYPES, what), ...enumProblem(tags, "sensitivity", SENSITIVITIES, what), ...enumProblem(tags, "requires_masking", BOOLEAN_TAG, what));
   return problems;
 }
 
+/** A copy of an existing tag map without the retired keys (they are dropped, never carried forward). */
+export function withoutRetiredTags(tags: TagMap | undefined): TagMap {
+  return Object.fromEntries(Object.entries(tags ?? {}).filter(([k]) => !(RETIRED_TAG_KEYS as readonly string[]).includes(k)));
+}
+
 /** The table tags in their fixed key order (handoff rows are compared byte for byte). */
-export function deriveTableTags(classification: string, standards: MetadataStandards, layer: string, anyColumnPii: boolean): TagMap {
-  return { classification, data_domain: standards.domain, uc_prefix: standards.ucPrefix, medallion_layer: layer, pii: anyColumnPii ? "true" : "false" };
+export function deriveTableTags(classification: string, standards: MetadataStandards, layer: string): TagMap {
+  return { classification, data_domain: standards.domain, uc_prefix: standards.ucPrefix, medallion_layer: layer };
 }
 
 /** A column's tags from its proposed `pii_tags`, in fixed key order; `{}` when not PII. */
 export function columnTagsFromProposal(piiTags: PiiTags | null): TagMap {
   if (!piiTags) return {};
-  return { pii: "true", pii_type: piiTags.pii_type, sensitivity: piiTags.sensitivity, requires_masking: piiTags.requires_masking };
+  return { pii_type: piiTags.pii_type, sensitivity: piiTags.sensitivity, requires_masking: piiTags.requires_masking };
 }
