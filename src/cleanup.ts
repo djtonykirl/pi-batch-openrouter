@@ -200,6 +200,12 @@ export class CleanupService {
     return plan;
   }
 
+  /** The stored plan (for a confirmation prompt), or undefined when unknown or expired. */
+  public peek(planId: string): CleanupPlan | undefined {
+    const stored = this.plans.get(planId);
+    return stored && this.now().getTime() - stored.createdAt <= PLAN_TTL_MS ? stored.plan : undefined;
+  }
+
   public async apply(planId: string): Promise<CleanupResult> {
     const stored = this.plans.get(planId);
     this.plans.delete(planId); // a plan is single-use
