@@ -172,7 +172,7 @@ export function createWorkspaceServices(workspaceRoot: string, opts: WorkspaceSe
     service,
     chat,
     chatStore,
-    cleanup: new CleanupService({ registry: service.registry, threads: chatStore }),
+    cleanup: new CleanupService({ registry: service.registry, threads: chatStore, remoteDelete: (job) => service.deleteProviderBatch(job) }),
     artifacts,
     poller,
     catalog,

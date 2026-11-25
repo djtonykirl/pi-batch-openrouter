@@ -1735,6 +1735,23 @@ export class BatchService {
   }
 
   /**
+   * One-off deletion of a finished job's batch at OpenRouter (used by `/batch delete --remote`). Throws when there is
+   * no API key or OpenRouter says the batch is not finished; a batch that is already gone counts as deleted.
+   */
+  public async deleteProviderBatch(job: JobManifest): Promise<void> {
+    if (!job.providerBatchId) return;
+    let apiKey = "";
+    try {
+      apiKey = await this.deps.resolveApiKey(job.account);
+    } catch (err) {
+      throw new Error(`no API key available for account "${job.account}" (${(err as Error).message})`);
+    }
+    if (!apiKey) throw new Error(`no API key available for account "${job.account}"`);
+    const res = await this.client(apiKey).deleteBatch(job.providerBatchId);
+    if (!res.deleted) throw new Error(res.detail ? `not finished yet: ${res.detail}` : "not finished yet (HTTP 409)");
+  }
+
+  /**
    * Deletes ended batches at OpenRouter for jobs marked pending (strict levels only). Never changes localStatus; each
    * attempt is an event. A failed attempt is retried with exponential backoff (`nextAttemptAt`: 30 s x 2^n, capped at
    * 1 h); 24 hours after the first attempt the deletion is given up as `failed`, which needs the user's attention. A

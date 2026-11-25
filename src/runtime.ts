@@ -120,7 +120,7 @@ export class BatchRuntime {
       store: new ArtifactStore(path.join(storage, "artifacts")),
     });
     this.chatStore = new ThreadStore(path.join(storage, "threads"));
-    this.cleanup = new CleanupService({ registry: this.service.registry, threads: this.chatStore });
+    this.cleanup = new CleanupService({ registry: this.service.registry, threads: this.chatStore, remoteDelete: (job) => this.service!.deleteProviderBatch(job) });
     this.chat = new ChatService({
       store: this.chatStore,
       batch: this.service,

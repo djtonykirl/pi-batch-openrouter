@@ -243,7 +243,7 @@ export class CleanupService {
     if (stored.plan.remote && this.deps.remoteDelete) {
       for (const item of deleted.filter((d) => d.kind === "job")) {
         const job = stored.manifests.get(item.id);
-        if (!job?.providerBatchId || !TERMINAL_STATUSES.has(job.localStatus) || neverReachedOpenRouter(job)) continue;
+        if (!job?.providerBatchId || job.route === "immediate" || !TERMINAL_STATUSES.has(job.localStatus) || neverReachedOpenRouter(job)) continue;
         try {
           await this.deps.remoteDelete(job);
           remote.push({ id: item.id, ok: true });

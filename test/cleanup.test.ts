@@ -236,3 +236,39 @@ test("parseOlderThan", () => {
   assert.equal(parseOlderThan("0"), 0);
   assert.throws(() => parseOlderThan("soon"), /older-than/);
 });
+
+test("remote: a finished job with a provider batch is deleted there once; a failure never undoes the local delete", async () => {
+  const calls: string[] = [];
+  const { ws, registry, svc, exists } = setup({
+    remoteDelete: async (job) => {
+      calls.push(job.localId);
+      if (job.providerBatchId === "batch-bad") throw new Error("HTTP 500");
+    },
+  });
+  try {
+    const ok = mkJob(registry, { providerBatchId: "batch-ok" });
+    const bad = mkJob(registry, { providerBatchId: "batch-bad" });
+    const res = await svc.apply(svc.plan({ refs: [ok.localId, bad.localId] }, { remote: true }).planId);
+    assert.deepEqual(calls.sort(), [ok.localId, bad.localId].sort());
+    assert.equal(exists(ok.localId) || exists(bad.localId), false);
+    assert.deepEqual(res.remote.map((r) => [r.id, r.ok]).sort(), [[ok.localId, true], [bad.localId, false]].sort());
+    assert.match(res.remote.find((r) => !r.ok)!.error!, /HTTP 500/);
+  } finally {
+    rm(ws);
+  }
+});
+
+test("remote: jobs that never reached OpenRouter are not sent, and nothing is called without remote", async () => {
+  const calls: string[] = [];
+  const { ws, registry, svc } = setup({ remoteDelete: async (job) => void calls.push(job.localId) });
+  try {
+    const never = mkJob(registry, { status: "failed" }); // no providerBatchId: never reached OpenRouter
+    const reached = mkJob(registry, { providerBatchId: "batch-1" });
+    await svc.apply(svc.plan({ refs: [never.localId], }, { remote: true }).planId);
+    assert.deepEqual(calls, []);
+    await svc.apply(svc.plan({ refs: [reached.localId] }).planId); // remote not requested
+    assert.deepEqual(calls, []);
+  } finally {
+    rm(ws);
+  }
+});
