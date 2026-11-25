@@ -1038,7 +1038,7 @@ guidance can appear in one prompt. Audit columns are left out with their profile
 - **The `pii` tag key is retired** (2026-11-25, matching the Lighthouse contract): the workspace's governed `pii` tag
   only allows its own values, so `pii=true|false` could never be applied. Pi never writes or requires it; an approved
   row that still carries it fails `validate-approved` as an unknown key, and existing tags that carry it are dropped
-  from the draft without showing as a change.
+  from the draft without showing as a change; the review notes them with `retired `pii` tag dropped`.
 
 **Audit columns.** `fw_pipelinerowchecksum`, `fw_ingestdate` and `pipeline_timestamp` (any case) are never sent to the
 model, and their approved values are their existing values. The Lighthouse applier assigns their standard definitions.

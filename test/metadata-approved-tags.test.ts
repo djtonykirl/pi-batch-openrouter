@@ -369,6 +369,8 @@ test("standards review: tags line, PII column, audit rows and the non-standard r
     assert.match(md, /\| Column \| Type \| Existing \| Proposed \| Confidence \| PII \|/);
     assert.match(md, /\| pk_loc_id \| STRING \| Location id \| Unique Core .* _replaces a non-standard existing value_ \| high \| — \|/);
     assert.match(md, /\| Address1_ds \| STRING \| — \| First line .* \| medium \| address \(medium, masking true\) _tags changed: none → `pii_type=address, sensitivity=medium, requires_masking=true`_ \|/);
+    // The legacy pii key on contact_email is reported once (CONTACT table only), never as a tag change.
+    assert.equal((md.match(/_retired `pii` tag dropped_ \(column contact_email\)/g) ?? []).length, 1);
     assert.match(md, /\| contact_email \| STRING \| — \| Email address .* \| medium \| email \(high, masking true\) _kept existing PII tag \(model proposed none\)_ \|/);
     assert.match(md, /\| fw_ingestdate \| TIMESTAMP \| Ingest date \| — \| audit column \(not sent\) \| — \|/);
     assert.match(md, /CLASSIFICATION: Confidential\.\n\n_replaces a non-standard existing value_/);

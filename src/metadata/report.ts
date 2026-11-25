@@ -161,6 +161,8 @@ const block = (s: string | null) => (s === null ? "_none_" : s);
 const REPLACES_MARK = "_replaces a non-standard existing value_";
 const KEPT_PII_MARK = "_kept existing PII tag (model proposed none)_";
 const DROPPED_MARK = "_non-taxonomy tags dropped_";
+const RETIRED_DROPPED_MARK = "_retired `pii` tag dropped_";
+const carriesRetired = (t: TagMap | undefined) => Object.keys(t ?? {}).some((k) => (RETIRED_TAG_KEYS as readonly string[]).includes(k));
 const WITHHELD_MARK = "_description withheld: its CLASSIFICATION line conflicts with the table's tags; rewrite it_";
 const NONSTANDARD_WITHHELD_MARK = "_non-standard existing text withheld (approved value null, so the live value is left unchanged); rewrite it to the standard to approve it_";
 const tagsChangedMark = (existing: TagMap | undefined, approved: TagMap | undefined) => `_tags changed: ${fmtTags(existing)} → ${fmtTags(approved)}_`;
@@ -172,6 +174,9 @@ function reviewTagLines(row: ApprovedRow): string[] {
   if (Object.keys(row.existing_tags ?? {}).some((k) => !(TABLE_TAG_KEYS as readonly string[]).includes(k) && !(RETIRED_TAG_KEYS as readonly string[]).includes(k))) dropped.push("table");
   for (const c of row.columns) if (!isAuditColumn(c.name) && Object.keys(c.existing_tags ?? {}).length && columnTagProblems(withoutRetiredTags(c.existing_tags)).length) dropped.push(`column ${cell(c.name)}`);
   if (dropped.length) lines.push("", `${DROPPED_MARK} (${dropped.join(", ")})`);
+  // A retired pii key is not a change, but the reviewer is told it was seen and will not be written.
+  const retired = [...(carriesRetired(row.existing_tags) ? ["table"] : []), ...row.columns.filter((c) => !isAuditColumn(c.name) && carriesRetired(c.existing_tags)).map((c) => `column ${cell(c.name)}`)];
+  if (retired.length) lines.push("", `${RETIRED_DROPPED_MARK} (${retired.join(", ")})`);
   return [...lines, ""];
 }
 
