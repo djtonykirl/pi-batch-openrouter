@@ -6,7 +6,7 @@ import type { PrivacyLevel } from "./privacy/policy.js";
 import { ArtifactError } from "./artifacts/service.js";
 import { TextViewerComponent } from "./dashboard.js";
 import { writeApprovedDraft, writeMetadataReview } from "./metadata/outputs.js";
-import { metadataOutcome, metadataSummary, validateApprovedText } from "./metadata/report.js";
+import { identifierFindingLines, metadataOutcome, metadataSummary, validateApprovedText } from "./metadata/report.js";
 import type { BatchRuntime } from "./runtime.js";
 import { SubmissionBlockedError, type PreparedMetadataRun } from "./service.js";
 import { resolveWorkspaceInput } from "./workspace-paths.js";
@@ -101,7 +101,7 @@ export async function cmdMetadata(rt: BatchRuntime, rest: string[], ctx: Extensi
       if (parsed.errors.length) throw new Error(`/batch metadata approved: ${parsed.errors.join("; ")}`);
       const id = parsed.positionals[0];
       if (!id || !parsed.values.out) throw new Error("Usage: /batch metadata approved <job> --out <approved.jsonl> [--overwrite] [--allow-partial]");
-      const { manifest: m, validation, outcome } = await writeApprovedDraft(service, rt.requireArtifacts(), id, { out: parsed.values.out, overwrite: parsed.booleans.has("overwrite"), allowPartial: parsed.booleans.has("allow-partial") });
+      const { manifest: m, validation, outcome, identifierFindings } = await writeApprovedDraft(service, rt.requireArtifacts(), id, { out: parsed.values.out, overwrite: parsed.booleans.has("overwrite"), allowPartial: parsed.booleans.has("allow-partial") });
       const c = validation.counts;
       const draftNote = outcome.standards
         ? `   ${c.replacedNonStandard ?? 0} non-standard existing value(s) replaced by proposals\n` +
@@ -111,6 +111,7 @@ export async function cmdMetadata(rt: BatchRuntime, rest: string[], ctx: Extensi
         `✅ Draft handoff written: ${m.output!.path} (artifact ${m.artifactId}, sha256 ${m.output!.sha256})\n` +
           `   ${outcome.tables.length} table(s); values: ${c.keptExisting} existing kept, ${c.fromProposal} from proposals, ${c.nullApproved} null (insufficient evidence or no proposal)\n` +
           draftNote +
+          (Object.keys(identifierFindings).length ? `   Identifier guard reverted text to its existing value:\n${identifierFindingLines(identifierFindings).map((l) => `     - ${l}`).join("\n")}\n` : "") +
           `   Nothing has been applied to Databricks.`,
         validation.problems.length ? "warning" : "info",
       );

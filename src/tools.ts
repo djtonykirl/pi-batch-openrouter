@@ -19,7 +19,7 @@ import type { ThreadStore } from "./chat/store.js";
 import { describeThread, readThreadView, renderThreadView, resolveThreadRef } from "./chat/mcp-threads.js";
 import { locateMetadataFile, missingContextMessage } from "./metadata/locate.js";
 import { writeApprovedDraft, writeMetadataReview } from "./metadata/outputs.js";
-import { metadataOutcome, metadataSummary, validateApprovedText } from "./metadata/report.js";
+import { identifierFindingLines, metadataOutcome, metadataSummary, validateApprovedText } from "./metadata/report.js";
 import type { ModelCatalog } from "./models/catalog.js";
 import { formatRoutingPolicy } from "./openrouter/routing.js";
 import type { BatchPoller } from "./poller.js";
@@ -1563,7 +1563,7 @@ plan_id: ${plan.planId} (valid for 10 minutes). Nothing has been deleted yet.` :
     execute: async (ctx, params) => {
       const service = ctx.requireService();
       const found = findJob(ctx, params.batch_id, "metadata");
-      const { manifest: m, validation, outcome } = await writeApprovedDraft(service, ctx.requireArtifacts(), found.id, { out: params.out, overwrite: params.overwrite, allowPartial: params.allow_partial });
+      const { manifest: m, validation, outcome, identifierFindings } = await writeApprovedDraft(service, ctx.requireArtifacts(), found.id, { out: params.out, overwrite: params.overwrite, allowPartial: params.allow_partial });
       const c = validation.counts;
       const outPath = m.output!.path;
       const absOut = path.resolve(ctx.workspaceRoot, outPath);
@@ -1573,6 +1573,7 @@ plan_id: ${plan.planId} (valid for 10 minutes). Nothing has been deleted yet.` :
           `Draft handoff for ${plural(outcome.tables.length, "table")} written to ${outPath} (artifact ${m.artifactId}).\n` +
             `Values: ${c.keptExisting} existing kept, ${c.fromProposal} taken from proposals, ${c.nullApproved} left null (insufficient evidence or no proposal)` +
             (outcome.standards ? `; ${c.replacedNonStandard ?? 0} non-standard existing value(s) replaced by proposals.\n` : ".\n") +
+            (Object.keys(identifierFindings).length ? `Identifier guard (disclosed values of user or account identifier columns must not appear in text):\n${identifierFindingLines(identifierFindings).map((l) => `  - ${l}`).join("\n")}\n` : "") +
             (validation.problems.length ? `Problems found in the written file:\n${validation.problems.map((p) => `  - ${p}`).join("\n")}\n` : "") +
             `This is a DRAFT for a human reviewer to edit, not an approval. After it is edited, check it with metadata_validate_approved (file: "${outPath}"). Nothing has been applied to Databricks.`,
         ),

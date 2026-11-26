@@ -5,7 +5,7 @@ import type { ArtifactManifest } from "../artifacts/store.js";
 import type { BatchService } from "../service.js";
 import { SubmissionBlockedError } from "../service.js";
 import { TERMINAL_STATUSES } from "../state.js";
-import { approvedDraftRows, metadataOutcome, metadataReviewMarkdown, toApprovedJsonl, validateApprovedText, type ApprovedValidation, type MetadataOutcome } from "./report.js";
+import { guardedDraft, metadataOutcome, metadataReviewMarkdown, toApprovedJsonl, validateApprovedText, type ApprovedValidation, type IdentifierFindings, type MetadataOutcome } from "./report.js";
 
 /**
  * The two files a metadata job produces on explicit request, both written through
@@ -51,7 +51,7 @@ export async function writeApprovedDraft(
   art: ArtifactService,
   jobRef: string,
   opts: { out: string; overwrite?: boolean; allowPartial?: boolean },
-): Promise<{ manifest: ArtifactManifest; validation: ApprovedValidation; outcome: MetadataOutcome }> {
+): Promise<{ manifest: ArtifactManifest; validation: ApprovedValidation; outcome: MetadataOutcome; identifierFindings: IdentifierFindings }> {
   if (!/\.jsonl$/i.test(opts.out)) throw new SubmissionBlockedError("The approved handoff is JSON Lines: use a .jsonl destination.");
   const o = metadataOutcome(service, jobRef);
   finished(o);
@@ -59,7 +59,8 @@ export async function writeApprovedDraft(
   if (gaps.length && !opts.allowPartial) {
     throw new SubmissionBlockedError(approvedGapsMessage(gaps.map((g) => g.table), o.tables.length, o.job.localId));
   }
-  const content = toApprovedJsonl(approvedDraftRows(o));
+  const guarded = guardedDraft(o);
+  const content = toApprovedJsonl(guarded.rows);
   const pre = validateApprovedText(content, service, o.job.localId);
   if (pre.problems.length) throw new Error(`Internal check of the generated handoff failed; nothing was written:\n- ${pre.problems.join("\n- ")}`);
   const manifest = art.execute(
@@ -76,5 +77,5 @@ export async function writeApprovedDraft(
   );
   // Validate what was actually written, not what was meant to be written.
   const written = fs.readFileSync(path.join(service.workspaceRoot, ...manifest.output!.path.split("/")), "utf8");
-  return { manifest, validation: validateApprovedText(written, service, o.job.localId), outcome: o };
+  return { manifest, validation: validateApprovedText(written, service, o.job.localId), outcome: o, identifierFindings: guarded.findings };
 }

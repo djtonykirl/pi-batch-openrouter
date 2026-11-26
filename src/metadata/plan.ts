@@ -42,7 +42,11 @@ export const METADATA_INSTRUCTIONS = [
   "Do not invent business meaning. If the evidence does not establish it, return a null comment with confidence \"insufficient\" and say what is missing in the reason.",
   "Preserve established terminology from the domain context.",
   "Existing descriptions and comments are evidence: keep their meaning; propose a change only when the evidence supports a clear improvement, and say why in the reason.",
-  "Sample values are illustrative; do not copy them into comments unless a value is a documented code.",
+  "A column's sample_values are disclosed reference values, each seen in many rows and checked for personal data. " +
+    "When they look like the column's full set of values (a short list of codes, names or statuses), list them in " +
+    "VALUES:; when the column has more values than were disclosed, give two or three as examples and say they are " +
+    "examples. Never invent a value, never list values for a column that has no sample_values, and do not state " +
+    "what a code means unless the evidence says so.",
   "Return every input column exactly once, with its name exactly as given, and no other columns.",
 ];
 
