@@ -21,7 +21,7 @@ import { jobItems, sourceLabel } from "../items.js";
 import { formatMetadataPreview } from "../metadata-commands.js";
 import { writeApprovedDraft, writeMetadataReview } from "../metadata/outputs.js";
 import { webWording, webWordingPayload } from "./wording.js";
-import { validateApprovedText } from "../metadata/report.js";
+import { identifierFindingLines, validateApprovedText } from "../metadata/report.js";
 import { FileLogger } from "../logger.js";
 import { fetchCatalogData, immediateRouteAllowed, immediateRouteRefusal, ModelCatalog, type CatalogData } from "../models/catalog.js";
 import { normalizeBatchModelSlug } from "../models.js";
@@ -1405,9 +1405,9 @@ export class BatchWebServer {
         }
         const body = await this.readJson<{ out?: string; overwrite?: boolean; allowPartial?: boolean }>(req);
         if (!body.out?.trim()) throw new Error("out is required: the approved handoff is written to an explicit .jsonl path");
-        const { manifest, validation, outcome } = await writeApprovedDraft(this.deps.service, this.deps.artifacts, jobRef, { out: body.out, overwrite: body.overwrite === true, allowPartial: body.allowPartial === true });
+        const { manifest, validation, outcome, identifierFindings } = await writeApprovedDraft(this.deps.service, this.deps.artifacts, jobRef, { out: body.out, overwrite: body.overwrite === true, allowPartial: body.allowPartial === true });
         this.broadcast({ type: "artifact_created", artifactId: manifest.artifactId });
-        this.sendJson(res, 200, { path: manifest.output!.path, artifactId: manifest.artifactId, sha256: manifest.output!.sha256, tables: outcome.tables.length, counts: validation.counts, problems: validation.problems });
+        this.sendJson(res, 200, { path: manifest.output!.path, artifactId: manifest.artifactId, sha256: manifest.output!.sha256, tables: outcome.tables.length, counts: validation.counts, problems: validation.problems, identifierReverted: identifierFindingLines(identifierFindings) });
         return;
       }
 

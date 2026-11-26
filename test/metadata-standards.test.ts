@@ -73,18 +73,18 @@ const proposal = (): Proposal => ({
 // ------------------------------------------------------------------ v1 unchanged
 
 /**
- * Captured from HEAD b9e1f96 (before standards mode) with the existing beverage
+ * Captured from HEAD b9e1f96 (before standards mode), re-pinned when the sample_values prompt rule changed, with the existing beverage
  * fixtures and the default test config, through BatchService.planMetadata.
  */
 const V1_BASELINE = {
-  planSha256: "0a839136f9938f697bd56d897e75b33cb4c1c75613f8233d12673f5fe151db97",
-  contentSha256: "88be1041b5d30cb6d301a705d9f36072044ca7da731de280f5a7c978a57d63d3",
+  planSha256: "141b497632cc5e0358abe0f051e0e3787e55ee06b37f60b7c93a21bc62e9a1de",
+  contentSha256: "3b560f151588f911283bccfe933c56b69cedfaf480daae72c818f482e3ba78ed",
   requests: [
-    "9bd88288620189bc23104df122c692fd979f1d59432870fba499a46a8b39cad1",
-    "823d227d0588024a6fdd13da8e9c2d028804a4255c48e54130312ee085bc65f1",
-    "a0bbde9746b9d048de0c0fc820c9b7be3cd84de664ff6a44bd71dcdfe1de9ac1",
+    "c9569be72b63289c56540d14c05beae80721d8ccd18631ad5bb68f6e6516f2b4",
+    "257fa6fa3beff00f67474cd75f66ceae1ff6ea17017c92694e4023cd04b98b58",
+    "f54b701a403fc982fad54ee955db5cf8597ddc25853aaf8442bfb56e94273642",
   ],
-  bodies: "cf8144d1fcaaf7b372bfd659d0e463e715d17ef9d415c43c288f8ddc2ffdc57a",
+  bodies: "2a1cd861814ee04d033c1a0f3b3ed114b224800b74229cae27961ef2ab1346bb",
   inputs: [
     "1fcdbd3050cd340c72ced3a686f9ba5d4136e1154cb92385940486434dad106e",
     "d6d52dce32b07ad29329e2398a90b25300cb17cdf43184f724403a9d54362df4",

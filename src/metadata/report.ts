@@ -3,6 +3,7 @@ import { canonicalJson, sha256Hex } from "../fsutil.js";
 import { combinedCoverage } from "../items.js";
 import type { BatchService } from "../service.js";
 import { isMetadataWorkflow, type JobManifest } from "../types.js";
+import { forbiddenValuesOf, leaks } from "./identifier-guard.js";
 import { approvedRowProblems, evidenceHash, identityKey, type ApprovedColumn, type ApprovedRow, type Confidence, type TableEvidence, type TableProposal, type TagMap } from "./contract.js";
 import {
   CLASSIFICATIONS,
@@ -283,6 +284,46 @@ export function metadataReviewMarkdown(o: MetadataOutcome): string {
  * validate-approved.
  */
 export function approvedDraftRows(o: MetadataOutcome): ApprovedRow[] {
+  return guardedDraft(o).rows;
+}
+
+/** Table -> field ("(table)" or a column name) -> identifier columns whose disclosed values the draft text contained. Names only. */
+export type IdentifierFindings = Record<string, Record<string, string[]>>;
+
+/**
+ * The draft with the identifier guard applied: text that contains a disclosed value of an identifier-like column
+ * goes back to its existing value (in standards mode null when that value is not standard, so the draft still
+ * passes its own check), never forward. Findings name the table and column, never the value.
+ */
+export function guardedDraft(o: MetadataOutcome): { rows: ApprovedRow[]; findings: IdentifierFindings } {
+  const rows = draftRowsUnguarded(o);
+  const forbidden = forbiddenValuesOf(o.tables.map((t) => t.evidence));
+  const findings: IdentifierFindings = {};
+  if (forbidden.size === 0) return { rows, findings };
+  for (const row of rows) {
+    const standards = row.approved_tags !== undefined;
+    const hits = row.approved_description !== row.existing_description ? leaks(row.approved_description, forbidden) : [];
+    if (hits.length) {
+      const keep = row.existing_description;
+      row.approved_description = standards && keep !== null && !descriptionIsStandard(keep, row.approved_tags?.classification) ? null : keep;
+      (findings[row.table] ??= {})["(table)"] = hits;
+    }
+    for (const c of row.columns) {
+      const colHits = c.approved_comment !== c.existing_comment ? leaks(c.approved_comment, forbidden) : [];
+      if (!colHits.length) continue;
+      c.approved_comment = standards && c.existing_comment !== null && !commentIsStandard(c.existing_comment) ? null : c.existing_comment;
+      (findings[row.table] ??= {})[c.name] = colHits;
+    }
+  }
+  return { rows, findings };
+}
+
+/** One line per finding for a report (table and column, never the value). */
+export function identifierFindingLines(findings: IdentifierFindings): string[] {
+  return Object.entries(findings).flatMap(([table, fields]) => Object.entries(fields).map(([field, cols]) => `${table} ${field === "(table)" ? "description" : `column ${field}`}: contained a disclosed value of identifier column(s) ${cols.join(", ")}; reverted to the existing value`));
+}
+
+function draftRowsUnguarded(o: MetadataOutcome): ApprovedRow[] {
   return o.tables.map((t) => {
     if (o.standards) return standardsDraftRow(o, t, o.standards);
     const byName = new Map((t.proposal?.columns ?? []).map((c) => [c.name, c]));
@@ -446,6 +487,7 @@ export function validateApprovedText(text: string, service: BatchService, jobOve
     res.nullValues = [];
   }
   const byTable = new Map(o.tables.map((t) => [t.table, t]));
+  const forbidden = forbiddenValuesOf(o.tables.map((t) => t.evidence));
   const seen = new Set<string>();
   for (const { line, row } of rows) {
     const t = byTable.get(row.table);
@@ -480,6 +522,15 @@ export function validateApprovedText(text: string, service: BatchService, jobOve
       else if (proposal !== undefined && approved === proposal) res.counts.fromProposal++;
       else res.counts.edited++;
     };
+    if (row.approved_description !== row.existing_description) {
+      const hits = leaks(row.approved_description, forbidden);
+      if (hits.length) res.problems.push(`line ${line}: approved_description of ${row.table} contains a disclosed value of identifier column(s): ${hits.join(", ")}`);
+    }
+    for (const c of row.columns) {
+      if (!evCols.has(c.name) || c.approved_comment === c.existing_comment) continue;
+      const hits = leaks(c.approved_comment, forbidden);
+      if (hits.length) res.problems.push(`line ${line}: approved_comment of ${JSON.stringify(c.name)} contains a disclosed value of identifier column(s): ${hits.join(", ")}`);
+    }
     classify(row.approved_description, row.existing_description, t.proposal?.table_description.comment);
     for (const c of row.columns) if (evCols.has(c.name)) classify(c.approved_comment, c.existing_comment, proposed.get(c.name));
     if (std) res.problems.push(...standardsRowProblems(line, row, t, std, res));
