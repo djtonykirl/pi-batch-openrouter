@@ -1,7 +1,7 @@
 import { Ajv } from "ajv";
 import { canonicalJson, sha256Hex } from "../fsutil.js";
 import { formatErrors } from "../workflows/structured.js";
-import { BOOLEAN_TAG, CLASSIFICATIONS, PII_TYPES, SENSITIVITIES, columnCommentProblems, descriptionProblems, isAuditColumn, piiTextProblems, type MetadataStandards, type PiiTags } from "./standards.js";
+import { BOOLEAN_TAG, CLASSIFICATIONS, PII_TYPES, SENSITIVITIES, columnCommentProblems, descriptionProblems, isAuditColumn, isSystemAuditName, piiTextProblems, type MetadataStandards, type PiiTags } from "./standards.js";
 
 /**
  * Databricks metadata enrichment: the data contracts.
@@ -449,7 +449,8 @@ export function proposalProblems(value: unknown, expected: TableEvidence, standa
     p.columns.forEach((c, i) => {
       if (c.comment !== null) problems.push(...[...columnCommentProblems(c.comment), ...piiTextProblems(c.comment)].map((m) => `/columns/${i}/comment: ${m}`));
     });
-    const piiColumns = p.columns.filter((c) => c.pii_tags).length;
+    // A Dataverse system audit name (createdbyname, ...) is a business-context name and does not count on its own.
+    const piiColumns = p.columns.filter((c) => c.pii_tags && !isSystemAuditName(c.name)).length;
     if (p.classification === "public" && piiColumns > 0) problems.push(`/classification: "public" is not allowed when a column has pii_tags (${piiColumns} column(s)); use a stricter classification`);
   }
   return problems;

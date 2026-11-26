@@ -142,7 +142,8 @@ const SP_TABLES: TableEvidence[] = [
   {
     table: CONTACT,
     existing_description: null,
-    existing_tags: {},
+    // A steward-set data category (rule R1): Pi keeps it and never calls it a non-taxonomy tag.
+    existing_tags: { data_category: "Customer Data" },
     columns: [{ name: "contact_email", data_type: "STRING", nullable: true, existing_comment: null, existing_tags: LEGACY_EMAIL_TAGS }],
   },
   {
@@ -387,6 +388,23 @@ test("standards R4 for tags: a valid existing PII tag is kept when the model pro
     assert.equal("pii" in (contact.approved_tags as object), false);
     assert.equal(contact.approved_tags.classification, "internal");
     assert.deepEqual(validateApprovedText(draft, service).problems, []);
+  }, spFiles));
+
+test("standards: an existing data_category is kept as the last table tag, validates, and is not reported as dropped", () =>
+  withWorkspace(async (_root, service, fake) => {
+    const o = await standardsJob(service, fake);
+    const draft = toApprovedJsonl(approvedDraftRows(o));
+    const contact = parseRows(draft)[3]!;
+    assert.equal(contact.table, CONTACT);
+    assert.deepEqual(Object.keys(contact.approved_tags), ["classification", "data_domain", "uc_prefix", "medallion_layer", "data_category"]);
+    assert.equal(contact.approved_tags.data_category, "Customer Data");
+    assert.deepEqual(validateApprovedText(draft, service).problems, []);
+    const md = metadataReviewMarkdown(o);
+    assert.equal((md.match(/_non-taxonomy tags dropped_/g) ?? []).length, 1, "only the plant table has non-taxonomy tags");
+    // A blank category is a problem the reviewer sees, without the value.
+    const rows = parseRows(draft);
+    rows[3]!.approved_tags.data_category = "  ";
+    assert.match(validateApprovedText(joinRows(rows), service).problems.join(" | "), /line 4: approved_tags: table tags data_category is empty/);
   }, spFiles));
 
 test("standards: a proposed public description that conflicts with a kept PII tag is withheld; the draft is still written", () =>

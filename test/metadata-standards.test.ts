@@ -13,6 +13,8 @@ import {
   deriveTableTags,
   descriptionProblems,
   isAuditColumn,
+  isSystemAuditName,
+  OPTIONAL_TABLE_TAG_KEYS,
   medallionLayer,
   piiTextProblems,
   tableTagProblems,
@@ -293,6 +295,53 @@ test("column tags: sparse PII only, key order, no pii key", () => {
   assert.deepEqual(columnTagProblems(t), []);
   assert.match(columnTagProblems({ ...t, pii_type: "postcode" }).join(), /pii_type/);
   assert.match(columnTagProblems({ pii_type: "email" }).join(), /sensitivity/);
+});
+
+test("data_category: an optional table tag; never missing, never unknown, empty is reported without repeating a value", () => {
+  assert.deepEqual(OPTIONAL_TABLE_TAG_KEYS, ["data_category"]);
+  const expected = { ...STANDARDS, layer: "gold" };
+  const withCategory = { ...APPROVED_TAGS_33, data_category: "Compliance Reporting Data" };
+  assert.deepEqual(tableTagProblems(withCategory, expected, true), []);
+  assert.deepEqual(tableTagProblems(APPROVED_TAGS_33, expected, false), [], "a row may omit it");
+  assert.deepEqual(tableTagProblems({ ...APPROVED_TAGS_33, data_category: "   " }, expected, false), ["table tags data_category is empty"]);
+  assert.deepEqual(tableTagProblems({ ...APPROVED_TAGS_33, data_category: "" }, expected, false), ["table tags data_category is empty"]);
+  // It does not excuse an unknown key, and no problem string ever carries the value.
+  assert.match(tableTagProblems({ ...withCategory, owner: "x" }, expected, false).join(), /owner/);
+  const bad = tableTagProblems({ ...withCategory, classification: "secret", data_domain: "other" }, expected, false).join(" | ");
+  assert.doesNotMatch(bad, /Compliance Reporting Data/);
+  // public with a PII column stays forbidden, with or without the category.
+  assert.match(tableTagProblems({ ...withCategory, classification: "public" }, expected, true).join(), /public/);
+  // deriveTableTags keeps a steward-set category as the last key and ignores an empty one.
+  assert.equal(JSON.stringify(deriveTableTags("internal", STANDARDS, "gold", "Compliance Reporting Data")), JSON.stringify(withCategory === undefined ? {} : { ...APPROVED_TAGS_33, data_category: "Compliance Reporting Data" }));
+  assert.equal("data_category" in deriveTableTags("internal", STANDARDS, "gold", "  "), false);
+  assert.equal("data_category" in deriveTableTags("internal", STANDARDS, "gold"), false);
+});
+
+test("Dataverse system audit names: exactly ten, case-insensitive, exact match; they never make a table personal data alone", () => {
+  const names = ["createdbyname", "createdbyyominame", "createdonbehalfbyname", "createdonbehalfbyyominame", "modifiedbyname", "modifiedbyyominame", "modifiedonbehalfbyname", "modifiedonbehalfbyyominame", "owneridname", "owneridyominame"];
+  assert.equal(names.length, 10);
+  for (const n of names) assert.ok(isSystemAuditName(n) && isSystemAuditName(n.toUpperCase()), n);
+  for (const n of ["createdby", "ownerid", "contact_name", "createdbyname2", "xcreatedbyname", "owneridnames", ""]) assert.equal(isSystemAuditName(n), false, n);
+
+  const ev = evidence();
+  ev.columns.push({ ...ev.columns[0]!, name: "CreatedByName" });
+  const reduced = promptEvidence(ev, STANDARDS);
+  const nameTags = { pii_type: "name", sensitivity: "medium", requires_masking: "true" };
+  const publicProposal = (auditTags: typeof nameTags | null, otherTags: typeof nameTags | null) => {
+    const p = proposal();
+    p.classification = "public";
+    p.table_description.comment = DESCRIPTION_33.replace("CLASSIFICATION: Internal.", "CLASSIFICATION: Public.");
+    p.columns.push({ name: "CreatedByName", comment: COMMENT_33, confidence: "low", reason: "Dataverse audit name.", pii_tags: auditTags });
+    p.columns[1]!.pii_tags = otherTags;
+    return proposalProblems(p, reduced, STANDARDS).join(" | ");
+  };
+  assert.equal(publicProposal(nameTags, null), "", "an audit name alone does not block public");
+  assert.match(publicProposal(nameTags, { pii_type: "address", sensitivity: "medium", requires_masking: "true" }), /public/, "a real PII column still does");
+});
+
+test("the standards prompt carries the audit-name exception next to the PII classification rule", () => {
+  const prompt = renderMetadataPrompt("# Pinpoint", evidence(), STANDARDS);
+  assert.match(prompt, /Never use public when any column has pii_tags\. The Dataverse system audit names \(createdbyname, modifiedbyname, owneridname, their onbehalfby and yominame forms\) are names in a business context and do not count on their own\./);
 });
 
 // ------------------------------------------------------------------ R7 and lifecycle

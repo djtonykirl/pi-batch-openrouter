@@ -1028,9 +1028,19 @@ guidance can appear in one prompt. Audit columns are left out with their profile
 
 **Tags.**
 - Table tags are exactly `classification` (`public|internal|confidential|restricted|pii_scan_required`), `data_domain`,
-  `uc_prefix` and `medallion_layer` (`bronze|silver|gold`). A table's PII status is its classification.
+  `uc_prefix` and `medallion_layer` (`bronze|silver|gold`), plus an **optional** `data_category` (the PepsiCo data
+  category the steward chose in Databricks PII triage). A table's PII status is its classification.
 - The model proposes **only** `classification` and the column PII tags. Pi derives `data_domain`, `uc_prefix` and
-  `medallion_layer` (from the schema name).
+  `medallion_layer` (from the schema name). Pi never proposes `data_category`: a row may omit it, a non-empty one is
+  accepted (and an existing one is kept in the draft), and an empty one fails `validate-approved`.
+- **Classification is the steward's call.** The policy is: PII is Confidential by default; Restricted only for a
+  national ID, health or card number combined with a personal name, biometrics, or credentials; names in a business
+  context are Internal. Pi does not decide the final classification (the steward does, in Databricks PII triage), so
+  it never pushes a table to Restricted on PII alone: a draft turns a `public` classification on a table with a PII
+  column into `pii_scan_required`, and a proposal that says `public` there is refused.
+- **Dataverse system audit names** (`createdbyname`, `modifiedbyname`, `owneridname`, `createdonbehalfbyname`,
+  `modifiedonbehalfbyname` and their `yominame` forms; exact names, any case) are names in a business context: on their
+  own they do not make a table personal data, so a PII tag on one of them does not block `public`. The prompt says so.
 - **Sparse PII column tags.** A column is PII when it carries `pii_type` (`email`, `phone`, `ssn`, `name`, `address`,
   `dob`, `ip_address`, `device_id`, `financial`, `health`, `biometric`, `location`) together with `sensitivity`
   (`low|medium|high`) and `requires_masking` (`true|false`); a non-PII column carries `{}`. A PII column in a `public`

@@ -38,6 +38,11 @@ export const FRAMEWORK_AUDIT_COLUMNS = ["fw_pipelinerowchecksum", "fw_ingestdate
 export type Classification = (typeof CLASSIFICATIONS)[number];
 export type MedallionLayer = (typeof MEDALLION_LAYERS)[number];
 export const TABLE_TAG_KEYS = ["classification", "data_domain", "uc_prefix", "medallion_layer"] as const;
+/**
+ * Table tag keys a row may carry but need not (rule R1, 2026-11-26): `data_category` is the PepsiCo data category the
+ * steward chose in Databricks PII triage. Pi never proposes or derives it; it accepts a non-empty one.
+ */
+export const OPTIONAL_TABLE_TAG_KEYS = ["data_category"] as const;
 export const COLUMN_TAG_KEYS = ["pii_type", "sensitivity", "requires_masking"] as const;
 /**
  * Retired 2026-11-25 (owner decision, matching the Lighthouse contract): the workspace's governed `pii` tag only
@@ -62,6 +67,19 @@ export function standardsFromOptions(domain: string | undefined, ucPrefix: strin
   if (!DOMAIN_PATTERN.test(domain)) errors.push("--domain (domain) must be a lowercase slug matching ^[a-z][a-z0-9_]*$");
   if (!UC_PREFIX_PATTERN.test(ucPrefix)) errors.push("--uc-prefix (ucPrefix) must match ^[A-Z0-9]+_$, e.g. PNPT_");
   return errors.length ? { error: errors.join("; ") } : { standards: { domain, ucPrefix } };
+}
+
+/**
+ * Dataverse who-created/modified/owns name fields: names in a business context, Internal on their own (rule R4), so a
+ * column with one of these names never makes a table "personal data" by itself. Exact names, case-insensitive.
+ * Mirrors SYSTEM_AUDIT_NAME_COLUMNS in the Lighthouse triage module.
+ */
+export const SYSTEM_AUDIT_NAME_COLUMNS: ReadonlySet<string> = new Set(
+  ["createdby", "createdonbehalfby", "modifiedby", "modifiedonbehalfby", "ownerid"].flatMap((who) => [`${who}name`, `${who}yominame`]),
+);
+
+export function isSystemAuditName(name: string): boolean {
+  return SYSTEM_AUDIT_NAME_COLUMNS.has(String(name ?? "").toLowerCase());
 }
 
 export function isAuditColumn(name: string): boolean {
@@ -159,19 +177,21 @@ export function piiTextProblems(text: string): string[] {
   return problems;
 }
 
-const keyProblems = (tags: TagMap, keys: readonly string[], what: string): string[] => {
+const keyProblems = (tags: TagMap, keys: readonly string[], what: string, optional: readonly string[] = []): string[] => {
   const problems: string[] = [];
-  for (const k of Object.keys(tags)) if (!keys.includes(k)) problems.push(`${what} has an unknown key ${JSON.stringify(k)} (allowed: ${keys.join(", ")})`);
+  for (const k of Object.keys(tags)) if (!keys.includes(k) && !optional.includes(k)) problems.push(`${what} has an unknown key ${JSON.stringify(k)} (allowed: ${[...keys, ...optional].join(", ")})`);
   for (const k of keys) if (!(k in tags)) problems.push(`${what} is missing the ${k} key`);
   return problems;
 };
 const enumProblem = (tags: TagMap, key: string, allowed: readonly string[], what: string): string[] =>
   key in tags && !allowed.includes(tags[key]!) ? [`${what} ${key} must be one of ${allowed.join(", ")}`] : [];
 
-/** Table tags: exactly the four keys and the derived facts as expected; `public` is never allowed when a column carries pii_type. */
+/** Table tags: the four keys (plus an optional non-empty `data_category`) and the derived facts as expected; `public` is never allowed when a column carries pii_type. */
 export function tableTagProblems(tags: TagMap, expected: { domain: string; ucPrefix: string; layer: string | null }, anyColumnPii: boolean): string[] {
   const what = "table tags";
-  const problems = keyProblems(tags, TABLE_TAG_KEYS, what);
+  const problems = keyProblems(tags, TABLE_TAG_KEYS, what, OPTIONAL_TABLE_TAG_KEYS);
+  // Never repeats the value: only the key name, which is vocabulary.
+  if ("data_category" in tags && !String(tags.data_category ?? "").trim()) problems.push(`${what} data_category is empty`);
   problems.push(...enumProblem(tags, "classification", CLASSIFICATIONS, what), ...enumProblem(tags, "medallion_layer", MEDALLION_LAYERS, what));
   if ("data_domain" in tags && tags.data_domain !== expected.domain) problems.push(`${what} data_domain must be "${expected.domain}"`);
   if ("uc_prefix" in tags && tags.uc_prefix !== expected.ucPrefix) problems.push(`${what} uc_prefix must be "${expected.ucPrefix}"`);
@@ -195,8 +215,11 @@ export function withoutRetiredTags(tags: TagMap | undefined): TagMap {
 }
 
 /** The table tags in their fixed key order (handoff rows are compared byte for byte). */
-export function deriveTableTags(classification: string, standards: MetadataStandards, layer: string): TagMap {
-  return { classification, data_domain: standards.domain, uc_prefix: standards.ucPrefix, medallion_layer: layer };
+export function deriveTableTags(classification: string, standards: MetadataStandards, layer: string, dataCategory?: string): TagMap {
+  const tags: TagMap = { classification, data_domain: standards.domain, uc_prefix: standards.ucPrefix, medallion_layer: layer };
+  // A steward-set data category is kept, never invented: Pi does not decide it.
+  if (dataCategory !== undefined && dataCategory.trim()) tags.data_category = dataCategory;
+  return tags;
 }
 
 /** A column's tags from its proposed `pii_tags`, in fixed key order; `{}` when not PII. */
