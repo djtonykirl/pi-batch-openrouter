@@ -82,6 +82,28 @@ export function isSystemAuditName(name: string): boolean {
   return SYSTEM_AUDIT_NAME_COLUMNS.has(String(name ?? "").toLowerCase());
 }
 
+/**
+ * Table-name words that make an address-type PII hit a business address, not personal data (owner decision D3,
+ * 2026-11-25). Mirrors BUSINESS_LOCATION_TABLE_WORDS in the Lighthouse triage module.
+ */
+export const BUSINESS_LOCATION_TABLE_WORDS = ["facility", "plant", "warehouse", "legalowner", "site", "location"] as const;
+
+/** True when the table's own name (not its schema) names a business-location entity. */
+export function isBusinessLocationTable(table: string): boolean {
+  const name = String(table ?? "").split(".").pop()!.toLowerCase();
+  return BUSINESS_LOCATION_TABLE_WORDS.some((w) => name.includes(w));
+}
+
+/**
+ * Whether a column tagged PII makes its table too sensitive for `internal`. A Dataverse system audit name never does
+ * on its own, and neither does a business address on a business-location table. Mirrors Lighthouse's
+ * `pii_signal_columns`; `public` is stricter and counts every tagged column except the audit names.
+ */
+export function makesTableNonInternal(table: string, columnName: string, piiType: string | undefined): boolean {
+  if (piiType === undefined || isSystemAuditName(columnName)) return false;
+  return !(piiType === "address" && isBusinessLocationTable(table));
+}
+
 export function isAuditColumn(name: string): boolean {
   return (FRAMEWORK_AUDIT_COLUMNS as readonly string[]).includes(name.toLowerCase());
 }

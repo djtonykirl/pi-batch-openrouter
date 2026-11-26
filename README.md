@@ -1037,7 +1037,11 @@ guidance can appear in one prompt. Audit columns are left out with their profile
   national ID, health or card number combined with a personal name, biometrics, or credentials; names in a business
   context are Internal. Pi does not decide the final classification (the steward does, in Databricks PII triage), so
   it never pushes a table to Restricted on PII alone: a draft turns a `public` classification on a table with a PII
-  column into `pii_scan_required`, and a proposal that says `public` there is refused.
+  column into `pii_scan_required`, and a proposal that says `public` there is refused. A proposal that says
+  `internal` while tagging a column as personal data is refused too (the prompt asks for `confidential`, or
+  `pii_scan_required` when unsure), except for a business address on a facility, plant, warehouse, site, location or
+  legal-owner table (owner decision D3) and the audit names below. `validate-approved` does not refuse `internal`: a
+  steward may set it after triage (for example for names in a business context).
 - **Dataverse system audit names** (`createdbyname`, `modifiedbyname`, `owneridname`, `createdonbehalfbyname`,
   `modifiedonbehalfbyname` and their `yominame` forms; exact names, any case) are names in a business context: on their
   own they do not make a table personal data, so a PII tag on one of them does not block `public`. The prompt says so.

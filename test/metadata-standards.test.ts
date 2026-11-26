@@ -13,6 +13,7 @@ import {
   deriveTableTags,
   descriptionProblems,
   isAuditColumn,
+  isBusinessLocationTable,
   isSystemAuditName,
   OPTIONAL_TABLE_TAG_KEYS,
   medallionLayer,
@@ -339,9 +340,41 @@ test("Dataverse system audit names: exactly ten, case-insensitive, exact match; 
   assert.match(publicProposal(nameTags, { pii_type: "address", sensitivity: "medium", requires_masking: "true" }), /public/, "a real PII column still does");
 });
 
+test("internal is refused when a column holds personal data, except audit names and a business address on a location table", () => {
+  assert.ok(isBusinessLocationTable(PNPT) && isBusinessLocationTable("c.s.regi_SatelliteWarehouseList") && isBusinessLocationTable("c.s.x_legalowner"));
+  assert.ok(!isBusinessLocationTable("uc.location_schema.PNPT_contact"), "the schema name does not count, only the table name");
+  const nameTags = { pii_type: "name", sensitivity: "medium", requires_masking: "true" };
+  const addressTags = { pii_type: "address", sensitivity: "medium", requires_masking: "true" };
+  const check = (table: string, classification: string, tags: typeof nameTags | null, columnName = "Address1_ds") => {
+    const ev = evidence(table);
+    ev.columns[1]!.name = columnName;
+    const p = proposal();
+    p.table = table;
+    p.classification = classification;
+    p.columns[1]!.name = columnName;
+    p.columns[1]!.pii_tags = tags;
+    return proposalProblems(p, promptEvidence(ev, STANDARDS), STANDARDS).filter((m) => /not allowed/.test(m)).join(" | ");
+  };
+  const CONTACT_T = "uc.silver.PNPT_contact";
+  // A personal name (or any non-address type) on an internal table is refused; confidential is fine.
+  assert.match(check(CONTACT_T, "internal", nameTags), /"internal" is not allowed when a column holds personal data/);
+  assert.equal(check(CONTACT_T, "confidential", nameTags), "");
+  assert.equal(check(CONTACT_T, "pii_scan_required", nameTags), "");
+  assert.equal(check(CONTACT_T, "internal", null), "");
+  // A business address on a facility/plant/warehouse/site/location table is not personal data (owner decision D3)...
+  assert.equal(check(PNPT, "internal", addressTags), "");
+  // ...but an address on any other table still is, and public stays refused everywhere a column is tagged.
+  assert.match(check(CONTACT_T, "internal", addressTags), /"internal" is not allowed/);
+  assert.match(check(PNPT, "public", addressTags), /"public" is not allowed/);
+  // The Dataverse audit names never count on their own.
+  assert.equal(check(CONTACT_T, "internal", nameTags, "CreatedByName"), "");
+  // restricted is never forced: Pi accepts it but never asks for it on PII alone.
+  assert.equal(check(CONTACT_T, "restricted", nameTags), "");
+});
+
 test("the standards prompt carries the audit-name exception next to the PII classification rule", () => {
   const prompt = renderMetadataPrompt("# Pinpoint", evidence(), STANDARDS);
-  assert.match(prompt, /Never use public when any column has pii_tags\. The Dataverse system audit names \(createdbyname, modifiedbyname, owneridname, their onbehalfby and yominame forms\) are names in a business context and do not count on their own\./);
+  assert.match(prompt, /Never use public when any column has pii_tags, and do not use internal for personal data: use confidential \(restricted only for a national ID, health or card number combined with a personal name, biometrics or credentials; pii_scan_required when unsure\)\. A business address in a facility, plant, warehouse, site or location table is not personal data\. The Dataverse system audit names \(createdbyname, modifiedbyname, owneridname, their onbehalfby and yominame forms\) are names in a business context and do not count on their own\./);
 });
 
 // ------------------------------------------------------------------ R7 and lifecycle
