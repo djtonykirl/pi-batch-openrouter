@@ -13,6 +13,9 @@ import {
   deriveTableTags,
   descriptionProblems,
   isAuditColumn,
+  isBusinessLocationTable,
+  isSystemAuditName,
+  OPTIONAL_TABLE_TAG_KEYS,
   medallionLayer,
   piiTextProblems,
   tableTagProblems,
@@ -293,6 +296,85 @@ test("column tags: sparse PII only, key order, no pii key", () => {
   assert.deepEqual(columnTagProblems(t), []);
   assert.match(columnTagProblems({ ...t, pii_type: "postcode" }).join(), /pii_type/);
   assert.match(columnTagProblems({ pii_type: "email" }).join(), /sensitivity/);
+});
+
+test("data_category: an optional table tag; never missing, never unknown, empty is reported without repeating a value", () => {
+  assert.deepEqual(OPTIONAL_TABLE_TAG_KEYS, ["data_category"]);
+  const expected = { ...STANDARDS, layer: "gold" };
+  const withCategory = { ...APPROVED_TAGS_33, data_category: "Compliance Reporting Data" };
+  assert.deepEqual(tableTagProblems(withCategory, expected, true), []);
+  assert.deepEqual(tableTagProblems(APPROVED_TAGS_33, expected, false), [], "a row may omit it");
+  assert.deepEqual(tableTagProblems({ ...APPROVED_TAGS_33, data_category: "   " }, expected, false), ["table tags data_category is empty"]);
+  assert.deepEqual(tableTagProblems({ ...APPROVED_TAGS_33, data_category: "" }, expected, false), ["table tags data_category is empty"]);
+  // It does not excuse an unknown key, and no problem string ever carries the value.
+  assert.match(tableTagProblems({ ...withCategory, owner: "x" }, expected, false).join(), /owner/);
+  const bad = tableTagProblems({ ...withCategory, classification: "secret", data_domain: "other" }, expected, false).join(" | ");
+  assert.doesNotMatch(bad, /Compliance Reporting Data/);
+  // public with a PII column stays forbidden, with or without the category.
+  assert.match(tableTagProblems({ ...withCategory, classification: "public" }, expected, true).join(), /public/);
+  // deriveTableTags keeps a steward-set category as the last key and ignores an empty one.
+  assert.equal(JSON.stringify(deriveTableTags("internal", STANDARDS, "gold", "Compliance Reporting Data")), JSON.stringify(withCategory === undefined ? {} : { ...APPROVED_TAGS_33, data_category: "Compliance Reporting Data" }));
+  assert.equal("data_category" in deriveTableTags("internal", STANDARDS, "gold", "  "), false);
+  assert.equal("data_category" in deriveTableTags("internal", STANDARDS, "gold"), false);
+});
+
+test("Dataverse system audit names: exactly ten, case-insensitive, exact match; they never make a table personal data alone", () => {
+  const names = ["createdbyname", "createdbyyominame", "createdonbehalfbyname", "createdonbehalfbyyominame", "modifiedbyname", "modifiedbyyominame", "modifiedonbehalfbyname", "modifiedonbehalfbyyominame", "owneridname", "owneridyominame"];
+  assert.equal(names.length, 10);
+  for (const n of names) assert.ok(isSystemAuditName(n) && isSystemAuditName(n.toUpperCase()), n);
+  for (const n of ["createdby", "ownerid", "contact_name", "createdbyname2", "xcreatedbyname", "owneridnames", ""]) assert.equal(isSystemAuditName(n), false, n);
+
+  const ev = evidence();
+  ev.columns.push({ ...ev.columns[0]!, name: "CreatedByName" });
+  const reduced = promptEvidence(ev, STANDARDS);
+  const nameTags = { pii_type: "name", sensitivity: "medium", requires_masking: "true" };
+  const publicProposal = (auditTags: typeof nameTags | null, otherTags: typeof nameTags | null) => {
+    const p = proposal();
+    p.classification = "public";
+    p.table_description.comment = DESCRIPTION_33.replace("CLASSIFICATION: Internal.", "CLASSIFICATION: Public.");
+    p.columns.push({ name: "CreatedByName", comment: COMMENT_33, confidence: "low", reason: "Dataverse audit name.", pii_tags: auditTags });
+    p.columns[1]!.pii_tags = otherTags;
+    return proposalProblems(p, reduced, STANDARDS).join(" | ");
+  };
+  assert.equal(publicProposal(nameTags, null), "", "an audit name alone does not block public");
+  assert.match(publicProposal(nameTags, { pii_type: "address", sensitivity: "medium", requires_masking: "true" }), /public/, "a real PII column still does");
+});
+
+test("internal is refused when a column holds personal data, except audit names and a business address on a location table", () => {
+  assert.ok(isBusinessLocationTable(PNPT) && isBusinessLocationTable("c.s.regi_SatelliteWarehouseList") && isBusinessLocationTable("c.s.x_legalowner"));
+  assert.ok(!isBusinessLocationTable("uc.location_schema.PNPT_contact"), "the schema name does not count, only the table name");
+  const nameTags = { pii_type: "name", sensitivity: "medium", requires_masking: "true" };
+  const addressTags = { pii_type: "address", sensitivity: "medium", requires_masking: "true" };
+  const check = (table: string, classification: string, tags: typeof nameTags | null, columnName = "Address1_ds") => {
+    const ev = evidence(table);
+    ev.columns[1]!.name = columnName;
+    const p = proposal();
+    p.table = table;
+    p.classification = classification;
+    p.columns[1]!.name = columnName;
+    p.columns[1]!.pii_tags = tags;
+    return proposalProblems(p, promptEvidence(ev, STANDARDS), STANDARDS).filter((m) => /not allowed/.test(m)).join(" | ");
+  };
+  const CONTACT_T = "uc.silver.PNPT_contact";
+  // A personal name (or any non-address type) on an internal table is refused; confidential is fine.
+  assert.match(check(CONTACT_T, "internal", nameTags), /"internal" is not allowed when a column holds personal data/);
+  assert.equal(check(CONTACT_T, "confidential", nameTags), "");
+  assert.equal(check(CONTACT_T, "pii_scan_required", nameTags), "");
+  assert.equal(check(CONTACT_T, "internal", null), "");
+  // A business address on a facility/plant/warehouse/site/location table is not personal data (owner decision D3)...
+  assert.equal(check(PNPT, "internal", addressTags), "");
+  // ...but an address on any other table still is, and public stays refused everywhere a column is tagged.
+  assert.match(check(CONTACT_T, "internal", addressTags), /"internal" is not allowed/);
+  assert.match(check(PNPT, "public", addressTags), /"public" is not allowed/);
+  // The Dataverse audit names never count on their own.
+  assert.equal(check(CONTACT_T, "internal", nameTags, "CreatedByName"), "");
+  // restricted is never forced: Pi accepts it but never asks for it on PII alone.
+  assert.equal(check(CONTACT_T, "restricted", nameTags), "");
+});
+
+test("the standards prompt carries the audit-name exception next to the PII classification rule", () => {
+  const prompt = renderMetadataPrompt("# Pinpoint", evidence(), STANDARDS);
+  assert.match(prompt, /Never use public when any column has pii_tags, and do not use internal for personal data: use confidential \(restricted only for a national ID, health or card number combined with a personal name, biometrics or credentials; pii_scan_required when unsure\)\. A business address in a facility, plant, warehouse, site or location table is not personal data\. The Dataverse system audit names \(createdbyname, modifiedbyname, owneridname, their onbehalfby and yominame forms\) are names in a business context and do not count on their own\./);
 });
 
 // ------------------------------------------------------------------ R7 and lifecycle

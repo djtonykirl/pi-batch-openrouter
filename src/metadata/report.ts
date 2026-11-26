@@ -7,6 +7,7 @@ import { approvedRowProblems, evidenceHash, identityKey, type ApprovedColumn, ty
 import {
   CLASSIFICATIONS,
   RETIRED_TAG_KEYS,
+  OPTIONAL_TABLE_TAG_KEYS,
   TABLE_TAG_KEYS,
   columnCommentProblems,
   columnTagProblems,
@@ -15,6 +16,7 @@ import {
   descriptionProblems,
   evidenceLayer,
   isAuditColumn,
+  isSystemAuditName,
   piiTextProblems,
   tableTagProblems,
   withoutRetiredTags,
@@ -171,7 +173,7 @@ const tagsChangedMark = (existing: TagMap | undefined, approved: TagMap | undefi
 function reviewTagLines(row: ApprovedRow): string[] {
   const lines = [sameTagsIgnoringRetired(row.existing_tags, row.approved_tags) ? `**Tags:** ${fmtTags(row.approved_tags)} _(unchanged)_` : `**Tags:** ${tagsChangedMark(withoutRetiredTags(row.existing_tags), row.approved_tags)}`];
   const dropped: string[] = [];
-  if (Object.keys(row.existing_tags ?? {}).some((k) => !(TABLE_TAG_KEYS as readonly string[]).includes(k) && !(RETIRED_TAG_KEYS as readonly string[]).includes(k))) dropped.push("table");
+  if (Object.keys(row.existing_tags ?? {}).some((k) => !(TABLE_TAG_KEYS as readonly string[]).includes(k) && !(OPTIONAL_TABLE_TAG_KEYS as readonly string[]).includes(k) && !(RETIRED_TAG_KEYS as readonly string[]).includes(k))) dropped.push("table");
   for (const c of row.columns) if (!isAuditColumn(c.name) && Object.keys(c.existing_tags ?? {}).length && columnTagProblems(withoutRetiredTags(c.existing_tags)).length) dropped.push(`column ${cell(c.name)}`);
   if (dropped.length) lines.push("", `${DROPPED_MARK} (${dropped.join(", ")})`);
   // A retired pii key is not a change, but the reviewer is told it was seen and will not be written.
@@ -332,7 +334,7 @@ function standardsDraftRow(o: MetadataOutcome, t: TableOutcome, standards: Metad
     const approvedComment = pc ? standardsDraftValue(c.existing_comment, pc.comment, commentIsStandard) : existingComment;
     return { name: c.name, existing_comment: c.existing_comment, approved_comment: approvedComment, existing_tags: existing, approved_tags: approvedTags };
   });
-  const anyColumnPii = columns.some((c) => !isAuditColumn(c.name) && c.approved_tags?.pii_type !== undefined);
+  const anyColumnPii = columns.some((c) => !isAuditColumn(c.name) && !isSystemAuditName(c.name) && c.approved_tags?.pii_type !== undefined);
   const existingClass = existingTags.classification;
   const base = p ? (p.classification ?? "") : existingClass !== undefined && (CLASSIFICATIONS as readonly string[]).includes(existingClass) ? existingClass : "pii_scan_required";
   // A kept PII tag never sits under "public" (tableTagProblems rejects it).
@@ -347,7 +349,7 @@ function standardsDraftRow(o: MetadataOutcome, t: TableOutcome, standards: Metad
     existing_description: ev.existing_description,
     approved_description: description,
     existing_tags: existingTags,
-    approved_tags: deriveTableTags(classification, standards, evidenceLayer(ev) ?? ""),
+    approved_tags: deriveTableTags(classification, standards, evidenceLayer(ev) ?? "", existingTags.data_category),
     columns,
     provenance: draftProvenance(o, t),
   };
@@ -514,7 +516,7 @@ function standardsRowProblems(line: number, row: ApprovedRow, t: TableOutcome, s
     if (!sameTags(c.approved_tags, e.existing_tags)) problems.push(at(`column ${JSON.stringify(c.name)} is a framework audit column: approved_tags must equal existing_tags`));
   }
   const business = known.filter((c) => !isAuditColumn(c.name));
-  const anyColumnPii = business.some((c) => c.approved_tags?.pii_type !== undefined);
+  const anyColumnPii = business.some((c) => !isSystemAuditName(c.name) && c.approved_tags?.pii_type !== undefined);
   const tags = row.approved_tags ?? {};
   problems.push(...tableTagProblems(tags, { ...std, layer: evidenceLayer(ev) }, anyColumnPii).map((m) => at(`approved_tags: ${m}`)));
 
